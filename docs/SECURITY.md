@@ -12,6 +12,7 @@ poolgate is designed against a security audit of a comparable tool (a multi-acco
 - **Egress allowlist** — upstream + OAuth issuer pinned; `Authorization`-bearing requests to non-allowlisted hosts are refused.
 - **Logs carry no secrets** — no token/key material (not even prefixes) in logs; redaction middleware.
 - **No silent auto-update** — releases are signed + checksummed; any update is verified and user-confirmed.
+- **Notifications carry no secrets** — DingTalk / WeCom / custom-webhook alerts reference accounts by label/id only (never tokens, `sk-` keys, or PII); webhook URLs are HTTPS-only and validated; notification egress is separate from the credential-egress allowlist.
 
 ## Audit finding → poolgate mitigation
 

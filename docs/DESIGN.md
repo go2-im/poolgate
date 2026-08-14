@@ -44,7 +44,8 @@ The binary itself never opens outbound tunnels. "Remote" = you put it behind you
 │                                                                │
 │  Shared core packages:                                         │
 │    config · store(SQLite, encrypted secrets) · oauth · usage · │
-│    policy(engine) · proxy(forwarder) · auth(webauthn+keys)     │
+│    policy(engine) · proxy(forwarder) · auth(webauthn+keys) ·   │
+│    notify(dingtalk / wecom / webhook)                          │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -63,6 +64,13 @@ Three entities:
   - `url-test` — periodic health/latency probe; route to lowest-latency healthy member (interval configurable).
   - `best-quota` — route to the member with the most remaining usage (≈ codex-tools `switch --best`).
 - **Endpoint** — a named inbound route bound to one PolicyGroup, surfaced as a distinct URL: `/e/<endpoint>/v1/...`. The caller picks a strategy by choosing the URL. API keys can be scoped to specific endpoints.
+
+**A PolicyGroup _is_ your custom named strategy** — you bind an explicit subset of accounts to a strategy type, and reuse it. This is the primary, flexible/controllable model:
+
+- `policy-1` = `round-robin` (balance) over **{A, B, C}**
+- `policy-2` = `fallback` over **{A, C}**
+
+Each named policy is independent and reusable; the **same account may appear in multiple policies**, and a policy contains only the accounts you choose (not the whole pool). Groups may additionally **nest** (a member can be another group) for advanced composition, but the common case is a flat named policy over a hand-picked account set. Each endpoint URL binds to one such policy, so different URLs = different account-set + strategy combinations.
 
 Composition example:
 ```
@@ -124,10 +132,41 @@ endpoints:
 1. **Core:** `config`, `store` (SQLite + field encryption; encrypt/decrypt round-trip test), `oauth` (login/import/refresh, issuer pinned).
 2. **Policy + proxy:** `policy` engine (strategies + nesting + cycle check + health), `proxy` server (`/e/<ep>/v1`, sk- auth, SSE, egress allowlist).
 3. **Admin API + passkey:** WebAuthn register/login (bootstrap token, multiple passkeys, recovery codes, `admin reset-auth` CLI), session + CSRF, CRUD for accounts/groups/endpoints/keys.
+   - **`notify`**: channel CRUD (DingTalk / WeCom / custom webhook) + a "test" button; alert rules wired to policy/proxy events (see §11).
 4. **Web UI:** React pages (login, dashboard/usage, accounts, policy groups w/ composition view, endpoints, keys, settings), `go:embed`.
 5. **Release:** cross-compiled single binary, SHA256SUMS + signature, SLSA provenance, SHA-pinned CI, no silent auto-update, `docs/BUILD.md`.
 6. **Optional:** usage charts, account cooldown tuning, weighted load-balance.
 
 ## 10. Development model
 
-Bare-repo + git worktrees: `poolgate/.bare` is the hub; `poolgate/main` is the main worktree; feature work happens in sibling worktrees (e.g. `poolgate/scaffold` on branch `feat/scaffold`). Remote will be added to `.bare` later.
+Bare-repo + git worktrees: `poolgate/.bare` is the hub; `poolgate/main` is the main worktree; feature work happens in sibling worktrees (e.g. `poolgate/scaffold` on branch `feat/scaffold`). Remote: `git@github.com:go2-im/poolgate.git` (origin on `.bare`).
+
+## 11. Notifications & alerting
+
+A `notify` module delivers alerts to user-configured channels. **Channels:**
+
+- **DingTalk robot** (custom-robot webhook; supports secret/keyword signing).
+- **WeCom / 企业微信 robot** (group-robot webhook key).
+- **Custom webhook** (arbitrary HTTPS endpoint; configurable method/headers/JSON template).
+
+Multiple channels can be enabled at once; each channel has a "send test" action in the UI.
+
+**Alert triggers (events emitted by policy/proxy/oauth):**
+
+| Event | Example |
+|-------|---------|
+| Account expired / refresh failed | a pooled account's token can no longer refresh |
+| Account entered cooldown | repeated 401/429/5xx from an account |
+| Policy has no healthy member | every account in a group is down → that endpoint is failing |
+| Quota low / exhausted | remaining 5h or 1week usage below threshold |
+| Auth anomalies | repeated invalid proxy-key attempts (possible probing) |
+| Startup binding warning | proxy bound to a non-loopback host |
+
+Rules are configurable (which events → which channels, thresholds, dedup/rate-limit window so one flapping account doesn't spam).
+
+**Security rules for notifications (see `docs/SECURITY.md`):**
+
+- **Never include secrets/PII in alert payloads** — no tokens, no `sk-` keys, no `access_token`; reference accounts by label/id only.
+- Notification egress is a **separate, explicitly user-configured outbound channel**, kept distinct from the credential-egress allowlist — credentials are never sent to a notification endpoint, and the credential allowlist is never widened by adding a channel.
+- Webhook URLs must be **HTTPS**; validated on save; delivery has timeout + bounded retries; failures are logged (without payload secrets) and surfaced in the UI.
+

@@ -1,3 +1,3 @@
-module github.com/danny/poolgate
+module github.com/go2-im/poolgate
 
 go 1.23
