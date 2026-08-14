@@ -1,28 +1,50 @@
 # poolgate
 
-**Single-user, self-hostable manager + OpenAI-compatible reverse proxy for a pool of Codex/ChatGPT accounts, with a composable (Surge-style) routing-policy engine and a passkey-protected web admin UI.**
+**Single-user, self-hostable manager and OpenAI-compatible reverse proxy for a pool of Codex/ChatGPT accounts — with a composable routing-policy engine and a passkey-protected web admin UI.**
 
-> Status: 🚧 design + scaffolding. No public release yet. Module path `github.com/danny/poolgate` is a placeholder until the remote is created.
+## What it does
 
-## What it is
-
-- Import multiple Codex/ChatGPT accounts (OAuth login or `~/.codex/auth.json` import), view usage, and expose them as a local **OpenAI-compatible `/v1`** endpoint.
-- **Composable routing policies** inspired by Surge policy groups: `select` / `fallback` / `round-robin` / `load-balance` / `url-test` / `best-quota`, groups can nest.
-- **Multiple named proxy endpoints** — each URL (`/e/<name>/v1`) is bound to a policy group, so you point Codex/Cursor at a specific URL to pick a strategy.
-- **Web admin UI** (React), served by the same Go binary, protected by **passkey (WebAuthn/FIDO2)** login.
+- **Pool multiple Codex/ChatGPT accounts** — import via OAuth or `~/.codex/auth.json`, auto-refresh tokens, and view per-account usage.
+- **Expose them as a local OpenAI-compatible `/v1` endpoint** — a translation gateway to the ChatGPT/Codex backend (rewrites auth per pooled account, forwards streaming responses).
+- **Composable, named routing policies** — `fallback`, `best-quota` (route to the account with the most remaining headroom), and `load-balance`. Each policy is bound to its own endpoint URL (`/e/<name>/v1`), so you pick a strategy simply by choosing which URL your client points at.
+- **Active health probing with auto-recovery** — accounts that hit a rate-limit or exhaust their quota are detected and automatically returned to rotation once they recover.
+- **Passkey-protected web admin UI** — WebAuthn (including phone/QR cross-device sign-in), served by the same binary.
 
 ## Design principles
 
-- **Security-first**, hardened against every issue found auditing a comparable tool — see [`docs/SECURITY.md`](docs/SECURITY.md).
-- **Loopback by default.** Binds `127.0.0.1`; exposing wider is explicit and warned.
-- **No outbound tunnel.** Remote access is via *your own* reverse proxy (Caddy/nginx) + TLS.
-- **Encrypted secrets at rest.** Tokens are field-encrypted in SQLite; master key from OS keychain / keyfile.
-- **Single Go binary** (pure-Go SQLite, embedded web UI), easy to cross-compile and self-host.
+- **Security-first.** Loopback by default; no outbound tunnel (front it with your own reverse proxy + TLS for remote access); account tokens are field-encrypted at rest; upstream host and OAuth issuer are pinned; secrets are never logged. See [`docs/SECURITY.md`](docs/SECURITY.md).
+- **Single Go binary** — pure-Go SQLite and an embedded web UI, so it's trivial to cross-compile and self-host.
+
+## Install
+
+### From source (one command)
+
+```bash
+git clone https://github.com/go2-im/poolgate.git
+cd poolgate
+./scripts/install.sh --init
+```
+
+Requires **Go 1.25+**. This builds the binary, installs it (to `/usr/local/bin`, or `~/.local/bin` without sudo), and — with `--init` — provisions the config/data dir and prints a one-time link to register your first passkey. Run `./scripts/install.sh --help` for options (`--prefix`, `--service`, `--no-build`).
+
+Packaged release builds (Homebrew tap, Docker image, signed binaries) are described in [`docs/DESIGN.md`](docs/DESIGN.md#18-distribution-packaging--release-automation).
+
+## Quick start
+
+```bash
+poolgate init                       # provision config/data dir + master key; prints a first-passkey link
+poolgate import ~/.codex/auth.json  # explicit — accounts are never imported automatically
+poolgate serve                      # start the proxy (127.0.0.1:8787) + admin (127.0.0.1:7070)
+
+# point your Codex/Cursor/OpenAI client at:
+#   http://127.0.0.1:8787/e/<endpoint>/v1
+```
 
 ## Docs
 
-- [`docs/DESIGN.md`](docs/DESIGN.md) — architecture, policy engine, storage, config, build phases.
-- [`docs/SECURITY.md`](docs/SECURITY.md) — threat model + the audit-derived hardening matrix.
+- [`docs/DESIGN.md`](docs/DESIGN.md) — architecture, policy engine, storage, auth, config.
+- [`docs/SECURITY.md`](docs/SECURITY.md) — threat model and hardening.
+- [`docs/RUN.md`](docs/RUN.md) — local run guide.
 
 ## License
 
