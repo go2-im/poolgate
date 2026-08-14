@@ -277,7 +277,7 @@ func TestCmdServeContextCancel(t *testing.T) {
 	t.Setenv(envMasterKey, "")
 	// Bind to an ephemeral port so the fixed default can't collide.
 	if err := os.WriteFile(filepath.Join(dataDir, configFile),
-		[]byte("server:\n  proxy:\n    host: 127.0.0.1\n    port: 0\n"), 0o600); err != nil {
+		[]byte("server:\n  proxy:\n    host: 127.0.0.1\n    port: 0\n  admin:\n    host: 127.0.0.1\n    port: 0\n"), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
 	if err := cmdInit(nil, io.Discard); err != nil {
@@ -366,7 +366,7 @@ func TestRunServeDispatch(t *testing.T) {
 	t.Setenv(envDataDir, dataDir)
 	t.Setenv(envMasterKey, "")
 	if err := os.WriteFile(filepath.Join(dataDir, configFile),
-		[]byte("server:\n  proxy:\n    host: 127.0.0.1\n    port: 0\n"), 0o600); err != nil {
+		[]byte("server:\n  proxy:\n    host: 127.0.0.1\n    port: 0\n  admin:\n    host: 127.0.0.1\n    port: 0\n"), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
 	if err := cmdInit(nil, io.Discard); err != nil {
