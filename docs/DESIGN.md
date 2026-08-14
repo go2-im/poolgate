@@ -19,7 +19,7 @@ Sections 1–27 grew incrementally; where they conflict with this ledger, **this
 
 - **D7 — 3 strategies:** `fallback`, `best-quota`, `load-balance` (round-robin = its default mode; `select` = single-member group; weighted LB later). Define `best-quota` = max over accounts of `min` window `used_percent` headroom vs that plan's caps, deterministic tie-break.
 - **D8 — Flat policy groups in v1** (Endpoint → PolicyGroup → Accounts; no nesting/DAG/cycle-check/tree-UI). Keep polymorphic `group_members` schema for later nesting.
-- **D9 — Trim:** 3 install channels (Release binaries + `install.sh` + Docker); append-only audit log (no hash-chain); no per-key spend budgets (keep rate-limit + scoping); no dual-key grace (multiple keys + manual rotate); keep SHA256SUMS+cosign, drop full SLSA + reproducible-build CI gate; on-demand export (no scheduler); drop `/metrics` from v1 (slog JSON + in-app monitor); single UI language + dark mode (no i18n framework / a11y / mobile program); charts = 3–4 headline counters (no chart suite/rollup); defer match-rule engine (keep model allow-deny), master-key rotation, subpath hosting.
+- **D9 — Trim:** 4 install channels (Release binaries + `install.sh` + Docker + Homebrew tap; Scoop/winget/deb-rpm deferred); append-only audit log (no hash-chain); no per-key spend budgets (keep rate-limit + scoping); no dual-key grace (multiple keys + manual rotate); keep SHA256SUMS+cosign, drop full SLSA + reproducible-build CI gate; on-demand export (no scheduler); drop `/metrics` from v1 (slog JSON + in-app monitor); single UI language + dark mode (no i18n framework / a11y / mobile program); charts = 3–4 headline counters (no chart suite/rollup); defer match-rule engine (keep model allow-deny), master-key rotation, subpath hosting.
 
 **Correctness/robustness fixes (see REVIEW.md §2):** config/policy **hot-reload** via atomic snapshot on admin commit; **auto-recovery gated by `Retry-After`**; **bootstrap token** short-TTL + single-use, not in durable logs; **account-state enum** adds terminal `revoked`/`dead` (no auto-recovery); **WebAuthn RP origin** resolved once at startup from static config only (never per-request forwarded headers); **PKCE** loopback callback with single-use `state` + S256; **memory hygiene** (disable core dumps, mlock master key); **sanitize** client-supplied fields into logs/monitor; **`/readyz`** = migrations applied + ≥1 endpoint has a reachable healthy account; **backup restorability** check (integrity_check + sample decrypt + schema version).
 
@@ -50,7 +50,7 @@ A **single-user**, self-hostable tool that:
 
 The binary **never launches or manages a tunnel itself** — but it is built to run **smoothly behind whatever you put in front of it**: a reverse proxy (Caddy/nginx) *or* an external tunnel you run (cloudflared, ngrok, etc.). See §14 for how (trusted-proxy headers, external origin, streaming pass-through). So "remote" = you front the loopback listener with your own TLS reverse proxy or tunnel.
 
-> WebAuthn passkeys are bound to the RP ID (domain). A passkey registered on `localhost` will not work on `your.domain` and vice-versa — register one per environment (or one roaming/phone passkey usable across them). RP ID / origin are config (and can be derived from trusted forwarded headers, §14). **Cross-device / QR sign-in is supported** — the WebAuthn config allows platform, cross-platform, and hybrid (caBLE) authenticators, so the browser can show a QR code to authenticate with a passkey on your phone (§16).
+> WebAuthn passkeys are bound to the RP ID (domain). A passkey registered on `localhost` will not work on `your.domain` and vice-versa — register one per environment (or one roaming/phone passkey usable across them). RP ID / origin are config, **resolved once at startup from static config only** (`external_origin` / `rp_id`); they are **never derived from per-request forwarded headers** (see §14, §0 fixes). **Cross-device / QR sign-in is supported** — the WebAuthn config allows platform, cross-platform, and hybrid (caBLE) authenticators, so the browser can show a QR code to authenticate with a passkey on your phone (§16).
 
 ## 3. Architecture — one Go binary, two listeners
 
@@ -80,36 +80,42 @@ The binary **never launches or manages a tunnel itself** — but it is built to 
 
 Splitting Admin and Proxy into separate listeners lets you expose the proxy to your LAN/reverse-proxy while keeping the admin surface loopback-only.
 
+The `proxy` package is a **translation gateway, not a transparent reverse proxy** (§0 D1): the OpenAI-compatible surface is **inbound only**, while upstream it rewrites `Authorization` **and** `ChatGPT-Account-ID` **together** per pooled account, preserves Codex identity headers (`originator` default `codex_cli_rs`, `User-Agent`, `OpenAI-Beta`, `x-codex-turn-state`), and forces streaming (see §6).
+
+**Config/policy hot-reload:** admin edits are persisted to SQLite and then published to the running proxy as an **atomic in-memory snapshot rebuilt on each admin commit** (§7) — routing, keys and policies update without a restart and without stale-routing / key-revocation lag.
+
 ## 4. Policy engine (Surge-inspired)
 
 Three entities:
 
-- **Account** — a pooled Codex/ChatGPT credential (the leaf "proxy"). Carries a **state** (`ok` / `cooldown` / `quota_exhausted` / `expired` / `unknown`), last usage snapshot (5h / 1week windows, plan), and measured latency. State is maintained both passively (from real proxy traffic) and actively by the **health probe engine** (§12), which auto-recovers accounts when their quota/rate-limit clears. Also carries **management metadata** — **subscription type** (Free / Plus / Pro / Team / Enterprise / …, auto-detected from the plan endpoint where possible, editable), **subscription region/zone**, a human **label**, and free-form **tags/category** — used by the admin UI for grouping, search and sort (§13), and usable as account selectors when composing policies (e.g. "a policy over all Pro accounts in region US").
-- **PolicyGroup** — named, has a `type` (strategy) and an **ordered member list**; each member is an Account **or another PolicyGroup** (nesting → a DAG; cycles rejected). Strategies:
-  - `select` — manually pinned member.
+- **Account** — a pooled Codex/ChatGPT credential (the leaf "proxy"). Carries a **state** (`ok` / `cooldown` / `quota_exhausted` / `expired` / `unknown`, plus terminal `revoked` / `dead` which are **not** auto-recovered — see §12/§23.6), last usage snapshot (generic percent-usage windows + `plan_type`; e.g. a 5h and a weekly window shown as display labels — see §0 D4), and measured latency. State is maintained both passively (from real proxy traffic) and actively by the **health probe engine** (§12), which auto-recovers accounts when their quota/rate-limit clears. Also carries **management metadata** — **subscription type** (Free / Plus / Pro / Team / Enterprise / …, auto-detected from the plan endpoint where possible, editable), **subscription region/zone**, a human **label**, and free-form **tags/category** — used by the admin UI for grouping, search and sort (§13), and usable as account selectors when composing policies (e.g. "a policy over all Pro accounts in region US").
+- **PolicyGroup** — named, has a `type` (strategy) and an **ordered member list**. **v1 is flat** (Endpoint → PolicyGroup → Accounts): members are Accounts. The polymorphic `group_members` schema still permits a member to be another PolicyGroup, but **nesting / DAG / cycle-check / composition-tree UI are deferred** (v1: deferred — see §0 D8). Strategies (**3 in v1** — see §0 D7):
   - `fallback` — first healthy in order; on 401/429/5xx/timeout advance + cooldown the failed member.
-  - `round-robin` — rotate across healthy members.
-  - `load-balance` — distribute (round-robin or weighted).
-  - `url-test` — periodic health/latency probe; route to lowest-latency healthy member (interval configurable).
-  - `best-quota` — route to the member with the most remaining usage (≈ codex-tools `switch --best`).
+  - `best-quota` — route to the account with the most remaining headroom. **Metric:** the `max` over accounts of that account's headroom, where an account's headroom = the `min` over its usage windows of `(100 − used_percent)`; **deterministic tie-break = lowest account id** (≈ codex-tools `switch --best`).
+  - `load-balance` — distribute across healthy members; **round-robin is its default mode** (weighted LB is a later addition). `select` (a manually pinned member) is expressed as a **single-member group**.
+  - `url-test` *(optional, low-priority)* — periodic health/latency probe; route to lowest-latency healthy member (interval configurable). Kept but **coupled to the health engine** (§12) — see §0 D7.
 - **Endpoint** — a named inbound route bound to one PolicyGroup, surfaced as a distinct URL: `/e/<endpoint>/v1/...`. The caller picks a strategy by choosing the URL. API keys can be scoped to specific endpoints.
 
 **A PolicyGroup _is_ your custom named strategy** — you bind an explicit subset of accounts to a strategy type, and reuse it. This is the primary, flexible/controllable model:
 
-- `policy-1` = `round-robin` (balance) over **{A, B, C}**
+- `policy-1` = `load-balance` (round-robin mode) over **{A, B, C}**
 - `policy-2` = `fallback` over **{A, C}**
 
-Each named policy is independent and reusable; the **same account may appear in multiple policies**, and a policy contains only the accounts you choose (not the whole pool). Groups may additionally **nest** (a member can be another group) for advanced composition, but the common case is a flat named policy over a hand-picked account set. Each endpoint URL binds to one such policy, so different URLs = different account-set + strategy combinations.
+Each named policy is independent and reusable; the **same account may appear in multiple policies**, and a policy contains only the accounts you choose (not the whole pool). In v1 a policy is a **flat** set of accounts; group nesting for advanced composition is deferred (v1: deferred — see §0 D8). Each endpoint URL binds to one such policy, so different URLs = different account-set + strategy combinations.
 
-Composition example:
+Composition example (**nesting is deferred — v1 is flat, see §0 D8**; the nested form below illustrates the later-phase model):
 ```
+# v1 (flat): endpoint -> one policy group -> accounts
+endpoint "prod"  -> group "balanced"    (load-balance): acct1, acct2, acct3
+endpoint "fast"  -> group "low-latency" (url-test):     acct1, acct3, acct5
+
+# later phase (nested groups):
 endpoint "prod"  -> group "balanced" (load-balance)
                        ├─ group "teamA" (fallback): acct1 -> acct2
                        └─ group "teamB" (fallback): acct3 -> acct4
-endpoint "fast"  -> group "low-latency" (url-test): acct1, acct3, acct5
 ```
 
-Request flow: inbound key auth → resolve endpoint → group → engine selects an Account (skipping unhealthy) → attach `Authorization: Bearer <access_token>` + `ChatGPT-Account-Id` → forward to the pinned upstream (see §6) → on failure, engine may re-select per strategy. SSE/streaming responses are relayed with per-chunk flush.
+Request flow: inbound key auth → resolve endpoint → group → engine selects an Account (skipping unhealthy) → the **translation gateway** rewrites `Authorization: Bearer <access_token>` **and** `ChatGPT-Account-ID` **together** for that pooled account (never one alone) and preserves Codex identity headers (`originator` default `codex_cli_rs`, `User-Agent`, `OpenAI-Beta`, `x-codex-turn-state`) → forward to the pinned upstream with **streaming forced** (see §6) → on failure, engine may re-select per strategy. SSE/streaming responses are relayed with per-chunk flush.
 
 ## 5. Storage — SQLite (pure-Go), encrypted secrets
 
@@ -117,17 +123,18 @@ Request flow: inbound key auth → resolve endpoint → group → engine selects
 - **Why a DB, not just JSON:** config data (accounts/groups/endpoints/keys/passkeys) is small, but **request/usage logs + per-key/per-account stats grow** and need indexed aggregation for the UI; the policy engine's health updates and admin edits need transactional consistency under concurrent proxy load.
 - **Encryption at rest:** secret columns (access/refresh tokens, etc.) are **field-encrypted** with `nacl/secretbox` (or `age`) before insert — SQLCipher would require CGO, so we do app-level field encryption instead. Master key from **OS keychain** (macOS Keychain / Windows DPAPI) preferred, else keyfile / env; never stored in plaintext next to the DB.
 - **Retention:** request/usage log tables are periodically pruned; keeps the DB small even under heavy use.
-- **Tables (initial):** `accounts` (incl. `subscription_type`, `region`/`zone`, `tags`, `label`, state, usage snapshot, latency), `policy_groups`, `group_members`, `endpoints`, `api_keys`, `key_scopes`, `webauthn_credentials`, `usage_snapshots`, `health_checks`, `request_logs` (time, api_key_id, session_id, endpoint, policy, account_id, model, status, latency_ms, tokens_in/out), `audit_log`, `settings`.
+- **Tables (initial):** `accounts` (incl. `subscription_type`, `region`/`zone`, `tags`, `label`, state, usage snapshot, latency), `policy_groups`, `group_members`, `endpoints`, `api_keys`, `key_scopes`, `webauthn_credentials`, `usage_snapshots` (generic percent-usage windows: `plan_type` + N rows each `{used_percent, window_seconds, resets_at}` — **not** fixed 5h/1week token columns; see §0 D4), `health_checks`, `request_logs` (time, api_key_id, session_id, endpoint, policy, account_id, model, status, latency_ms, tokens_in/out), `audit_log`, `settings`.
 
 ## 6. Egress hardening
 
+- **Translation gateway, not a transparent reverse proxy** (§0 D1). The OpenAI-compatible surface is **inbound only**; the upstream leg is non-transparent — per pooled account poolgate rewrites `Authorization` **and** `ChatGPT-Account-ID` **together** (never one alone), preserves Codex identity headers (`originator` default `codex_cli_rs`, `User-Agent`, `OpenAI-Beta`, `x-codex-turn-state`), and forces streaming (`stream:true` + `Accept: text/event-stream`).
 - **Upstream pinned** to `chatgpt.com` / `api.openai.com` by default; any override is an explicit poolgate config value validated against a **host allowlist** (never read silently from an external file).
 - **OAuth issuer pinned** to `https://auth.openai.com`; the `iss` claim inside imported tokens is **ignored** for building the refresh URL.
 - Any outbound request carrying `Authorization` whose host is not on the allowlist is refused.
 
 ## 7. Config (YAML) — seed & export
 
-The UI is the source of truth (writes to SQLite); YAML is used to seed on first run and to export/back up. Sketch:
+The UI is the source of truth (writes to SQLite); YAML is used to seed on first run and to export/back up. **Config/policy changes hot-reload** into the running proxy via an **atomic in-memory snapshot rebuilt on each admin commit** (§3) — no restart, no stale routing or key-revocation lag. Sketch:
 
 ```yaml
 server:
@@ -154,21 +161,21 @@ endpoints:
 - SQLite: `modernc.org/sqlite`.
 - WebAuthn: `github.com/go-webauthn/webauthn` (allow platform + cross-platform + hybrid/caBLE authenticators → QR / phone cross-device sign-in).
 - Crypto: `nacl/secretbox` (field encryption), `argon2id` (only if a password fallback is ever added — default is passkey-only + recovery codes).
-- Reverse proxy: `net/http/httputil.ReverseProxy` (FlushInterval=-1 for SSE) or manual relay.
+- Translation gateway (not a transparent reverse proxy): `net/http/httputil.ReverseProxy` (FlushInterval=-1 for SSE) or manual relay — rewriting `Authorization` + `ChatGPT-Account-ID` together and preserving Codex identity headers (see §0 D1 / §6).
 - Frontend: **React** (Vite), built to static assets, embedded via `go:embed`.
 - Config: **YAML**.
-- Release/dist: **GoReleaser** (archives, Homebrew tap, Scoop, nfpm deb/rpm, Docker), **cosign** (keyless OIDC signing) + SLSA provenance, **Dependabot/Renovate** + `govulncheck` for dependency automation.
+- Release/dist: **GoReleaser** — v1 ships **4 channels** (GitHub Release binaries + `install.sh` + Docker + Homebrew tap; Scoop/winget/deb-rpm deferred — see §0 D9 / §18), **`SHA256SUMS` + cosign** (keyless OIDC signing); **full SLSA provenance + reproducible-build CI gate are deferred**. **Dependabot/Renovate** + `govulncheck` for dependency automation.
 
 ## 9. Build phases
 
 1. **Core:** `config`, `store` (SQLite + field encryption; encrypt/decrypt round-trip test), `oauth` (login/import/refresh, issuer pinned). Plus **`poolgate init`** auto-provisioning + startup migrations (§17).
-2. **Policy + proxy:** `policy` engine (strategies + nesting + cycle check + health), `proxy` server (`/e/<ep>/v1`, sk- auth, SSE, egress allowlist), **trusted-proxy header handling + streaming pass-through for tunnels/reverse-proxies (§14)**, per-request logging with session/model/tokens (§15).
+2. **Policy + proxy:** `policy` engine (the **3 v1 strategies** + health; **nesting / cycle-check deferred** — v1 flat, see §0 D8), `proxy` server (`/e/<ep>/v1`, sk- auth, SSE, egress allowlist), **trusted-proxy header handling + streaming pass-through for tunnels/reverse-proxies (§14)**, per-request logging with session/model/tokens (§15).
    - **`health`**: probe engine + account state machine (usage-poll / auth-check / small live request), adaptive per-state scheduling, auto-recovery, feeds `url-test`/`best-quota` (see §12).
 3. **Admin API + passkey:** WebAuthn register/login (bootstrap token, multiple passkeys, recovery codes, `admin reset-auth` CLI), session + CSRF, CRUD for accounts/groups/endpoints/keys. Accounts list API supports metadata (subscription type / region / tags), filter / search / sort / paginate in SQL (§13).
    - **`notify`**: channel CRUD (DingTalk / WeCom / custom webhook) + a "test" button; alert rules wired to policy/proxy events (see §11).
 4. **Web UI:** React pages (login, dashboard/usage, accounts w/ categorize·search·sort, policy groups w/ composition view, endpoints, keys, **real-time monitor** — live scrolling logs + charts filterable by session/api-key/model (§15), settings), `go:embed`. Admin server exposes an SSE/WS live-events stream.
-5. **Release:** GoReleaser-driven — cross-compiled single binary, `SHA256SUMS` + cosign signature, SLSA provenance, Homebrew tap / Scoop / Docker / deb-rpm, verification-gated `install.sh`, SHA-pinned CI, Dependabot, no silent auto-update, `docs/BUILD.md` (§18).
-6. **Optional:** usage charts, account cooldown tuning, weighted load-balance.
+5. **Release:** GoReleaser-driven — cross-compiled single binary, `SHA256SUMS` + cosign signature, **4 channels** (GitHub Release binaries / verified `install.sh` / Docker / Homebrew tap; Scoop/deb-rpm deferred — see §0 D9), SHA-pinned CI, Dependabot, no silent auto-update, `docs/BUILD.md` (§18). Full SLSA provenance + reproducible-build gate deferred.
+6. **Optional / later (post-v1):** weighted load-balance, account cooldown tuning, expanded usage charts beyond the 3–4 headline counters (see §0 D7/D9), and WS proxying with `x-codex-turn-state` affinity (§0 D2/D3).
 
 ## 10. Development model
 
@@ -192,7 +199,7 @@ Multiple channels can be enabled at once; each channel has a "send test" action 
 | Account entered cooldown | repeated 401/429/5xx from an account |
 | **Account recovered** | a degraded account passed a health probe and returned to `ok` (§12) |
 | Policy has no healthy member | every account in a group is down → that endpoint is failing |
-| Quota low / exhausted | remaining 5h or 1week usage below threshold |
+| Quota low / exhausted | remaining usage in any window below threshold (e.g. the 5h / weekly example windows) |
 | Auth anomalies | repeated invalid proxy-key attempts (possible probing) |
 | Startup binding warning | proxy bound to a non-loopback host |
 
@@ -210,8 +217,8 @@ An active **`health`** engine periodically probes each account so the pool refle
 
 **Probe kinds (cheapest that answers the question):**
 
-1. **Usage poll (zero token spend)** — read the ChatGPT usage endpoint for remaining 5h / 1week windows + plan. Primary signal for quota level and for detecting a reset. Default cadence for all accounts.
-2. **Auth check (no/near-zero spend)** — `GET /v1/models` (or equivalent) to confirm the token is still valid (catches `expired`).
+1. **Usage poll (zero token spend)** — `GET /backend-api/wham/usage` → `plan_type` + N generic rate-limit windows each `{used_percent, window_seconds, resets_at}` (the 5h / weekly windows are just example display labels — see §0 D4). Primary signal for quota level and for detecting a reset. Default cadence for all accounts.
+2. **Auth check (zero token spend)** — authenticated `GET {base}/models?client_version=<v>` (**200 = valid, 401/403 = invalid**) to confirm the token is still valid (catches `expired`) — see §0 D5.
 3. **Small live request (minimal spend)** — a tiny real completion (e.g. `max_tokens: 1`) to confirm the account actually serves traffic (catches rate-limit/quota state the usage endpoint may not reflect, and confirms recovery). Used mainly to re-test degraded accounts and to confirm recovery; opt-in cadence for healthy accounts to keep spend near zero.
 
 **Account state machine:**
@@ -229,12 +236,13 @@ An active **`health`** engine periodically probes each account so the pool refle
 
 - Real proxy traffic transitions passively (401→try refresh→`expired`; 429/5xx→`cooldown`; quota=0→`quota_exhausted`).
 - The probe engine transitions actively **and drives recovery**: degraded accounts (`cooldown` / `quota_exhausted`) are re-probed on a **shorter, backing-off interval** so recovery is discovered quickly; `ok` accounts are polled on a longer interval. On a successful probe, the account returns to `ok` and re-enters policy rotation automatically.
+- **Terminal states** `revoked` / `dead` (§23.6) are **never auto-recovered** by the probe engine — they require re-import / re-auth and are excluded from probing.
 
 **Scheduling & cost control (all configurable):**
 
-- Per-state intervals: e.g. `ok` usage-poll every N min; `cooldown`/`quota_exhausted` re-probe every M min with exponential backoff up to a cap; `expired` retried rarely (needs re-auth).
-- Global mode switch: **usage-poll-only** (zero token spend) vs **allow small live requests** for degraded/recovery checks. Per-account override.
-- Jittered schedules to avoid synchronized bursts; single-flight per account (no overlapping probes); probe results also feed the `url-test` (latency) and `best-quota` (remaining quota) policy strategies.
+- Per-state intervals: e.g. `ok` usage-poll every N min; `cooldown`/`quota_exhausted` re-probe every M min with exponential backoff up to a cap, but **never before the upstream `Retry-After` (or a conservative default) elapses** — auto-recovery is gated on `Retry-After`; `expired` retried rarely (needs re-auth); terminal `revoked`/`dead` are not probed.
+- Global mode switch: **usage-poll-only (zero token spend — the default)** vs **allow small live requests** for degraded/recovery checks, bounded by a **per-account daily live-probe budget**. Per-account override.
+- Jittered schedules to avoid synchronized bursts; one **per-account single-flight primitive shared with the proxy hot path** (§19.3) — no overlapping probes and no concurrent token refresh, with atomic (temp+rename), interprocess-safe persistence of any rotated `refresh_token` (see §0 D6); probe results also feed the `url-test` (latency) and `best-quota` (remaining quota) policy strategies.
 
 **Persistence & UI:** latest state + usage + latency per account in `accounts`; probe history in a `health_checks` table (pruned). The admin UI shows live per-account state, remaining quota bars, last-probe time, and a manual "probe now" button.
 
@@ -246,7 +254,7 @@ Each account carries management metadata (see §4): **subscription type**, **reg
 
 - **Categorize / group by:** subscription type, region/zone, tag/category, or state.
 - **Search / filter:** free-text over label/tags + faceted filters (type, region, state, quota range, "in policy X", "healthy only").
-- **Sort:** by label, subscription type, region, state, remaining 5h/1week quota, latency, last-probe time, created/updated.
+- **Sort:** by label, subscription type, region, state, remaining quota (min headroom across windows; the 5h/weekly windows are example labels — see §0 D4), latency, last-probe time, created/updated.
 - **Bulk actions:** tag, set region/type, enable/disable, "probe now", add-to-policy.
 - Subscription type is auto-detected from the plan endpoint where possible and stays editable; region/zone is a user-selected value (dropdown, config-defined list) — since it may not be reliably detectable.
 
@@ -257,9 +265,10 @@ Backed by indexed columns in `accounts`; the list API takes `filter` / `q` / `so
 Ports are fully configurable, and poolgate is designed to sit behind whatever fronting you choose (you run it; poolgate does not).
 
 - **Configurable listeners:** `server.admin.{host,port}` and `server.proxy.{host,port}`; both default to loopback and can be changed freely.
-- **Trusted proxies:** `server.trusted_proxies` (CIDR list). Only when the peer is a trusted proxy does poolgate honor `X-Forwarded-For` / `-Proto` / `-Host` (real client IP for logs/rate-limit, external scheme/host for URL/RP-origin). Untrusted peers' forwarded headers are ignored → no IP/host spoofing.
+- **Trusted proxies:** `server.trusted_proxies` (CIDR list). Only when the peer is a trusted proxy does poolgate honor `X-Forwarded-For` / `-Proto` / `-Host` (real client IP for logs/rate-limit, external scheme/host for the proxy URLs shown in the UI). Untrusted peers' forwarded headers are ignored → no IP/host spoofing. **The WebAuthn RP origin is NOT taken from forwarded headers** — it is resolved **once at startup from static config** (`external_origin` / `rp_id`) only (see §2, §0 fixes).
 - **External origin:** `server.external_origin` (e.g. `https://poolgate.example.com`) sets the canonical scheme+host used for WebAuthn RP origin, cookie flags, and the proxy URLs shown in the UI to copy into Codex/Cursor — so behind a cloudflared/ngrok URL the UI shows the *public* endpoint, not `127.0.0.1`.
-- **Streaming through tunnels:** SSE and WebSocket (`/v1/responses`, chat streaming) pass through with immediate per-chunk flush, `Cache-Control: no-transform`, no response buffering, and keep-alives tuned so cloudflared/ngrok/nginx don't buffer or drop long-lived streams. Idle/read timeouts are generous for streaming routes.
+- **Transport (WS-first; v1 forces HTTP fallback):** Codex 0.147.0 first attempts a **WebSocket `/responses` upgrade** (`supports_websockets`, warmup `response.create generate=false`, `OpenAI-Beta: responses_websockets`), with **HTTP POST+SSE as the fallback**. **v1 does NOT accept the WS upgrade → Codex falls back to the stateless HTTP POST+SSE path** (full inline `input`, no `previous_response_id`; see §0 D2). **WS proxying is a later phase** (v1: deferred).
+- **Streaming through tunnels:** SSE streams pass through with immediate per-chunk flush, `Cache-Control: no-transform`, no response buffering, and keep-alives tuned so cloudflared/ngrok/nginx don't buffer or drop long-lived streams. Idle/read timeouts are generous for streaming routes. (When WS proxying lands, the same buffer-free pass-through applies to the WS upgrade.)
 - **Loopback default, LAN allowed:** the tunnel/reverse-proxy connects to the loopback listener, so you don't *have* to bind wider. Binding a LAN addr / `0.0.0.0` is supported for direct intranet use, but fronting with a reverse proxy is recommended even on a LAN (§2 bind policy).
 
 > Security: since a tunnel makes the proxy effectively public, the `sk-` key remains the gate (constant-time). Do **not** expose the *admin* listener through a tunnel unless you intend to — and even then it is passkey-gated. Trusted-proxy parsing is strict to prevent spoofed client IPs. (See `docs/SECURITY.md`.)
@@ -269,39 +278,39 @@ Ports are fully configurable, and poolgate is designed to sit behind whatever fr
 A live observability view in the admin UI, backed by the proxy's per-request records.
 
 - **Live log stream:** the admin server pushes new request records over SSE/WebSocket; the UI shows a **real-time scrolling log** (auto-scroll, pause, tail). Each row: time, endpoint, policy, chosen account (label), model, api-key (label), session, status, latency, tokens (in/out).
-- **Charts / volume:** request rate over time, latency percentiles, token throughput, success vs error, and breakdowns by account / key / model — rolling windows with live update.
+- **Counters / volume:** v1 shows **3–4 headline counters** (e.g. request rate, success vs error, token throughput) with live update; the full chart suite (latency percentiles, per-account/key/model breakdowns) and rollup tables are **deferred** (see §0 D9).
 - **Filters:** by **session**, **api-key**, and **model** (composable), plus endpoint/account/status/time-range. Filtering runs in SQL over `request_logs` for history and is also applied to the live stream.
-- **Session definition:** best-effort grouping — a client-supplied conversation/session id header if present, else derived per (api-key + client) connection; documented so it's predictable.
+- **Session definition:** best-effort grouping — a client-supplied conversation/session id header if present, else derived per (api-key + client) connection; documented so it's predictable. **This session id is for logging/monitoring grouping ONLY — it is never used for routing or affinity** (turn affinity, when WS lands, keys on `x-codex-turn-state`; see §0 D3 / §19.1).
 - **Storage/retention:** `request_logs` (indexed on time, api_key_id, model, session_id, account_id, status) with configurable retention/prune; aggregates can be rolled up to keep charts fast. No secrets in logs.
 
 ## 16. Admin auth details (passkey, QR/cross-device, CLI reset)
 
 - **Passkey primary, no password.** Registration allows **platform** (Touch ID / Windows Hello), **cross-platform** (security keys), and **hybrid/caBLE** authenticators → the browser offers **QR-code sign-in with your phone**. Multiple passkeys can be registered (recommend a phone passkey + a hardware key backup).
 - **Recovery:** one-time recovery codes generated at setup (shown once).
-- **CLI full reset (always available locally):** `poolgate admin reset-auth` **completely resets admin login** — removes **all** registered passkeys, invalidates recovery codes and active sessions, and re-issues a one-time bootstrap registration token (printed to the local console). This is the guaranteed lockout escape hatch; it requires local shell access to the host (which already implies full control), never a network path.
+- **CLI full reset (always available locally):** `poolgate admin reset-auth` **completely resets admin login** — removes **all** registered passkeys, invalidates recovery codes and active sessions, and re-issues a **short-TTL, single-use** bootstrap registration token (printed to the local console, **never written to durable logs** — see §0 fixes). This is the guaranteed lockout escape hatch; it requires local shell access to the host (which already implies full control), never a network path.
 
 ## 17. First-run initialization (auto-provisioning)
 
 Zero-to-running should be one step; setup is guided and idempotent.
 
-- **`poolgate init`** (CLI): creates the config dir + data dir, generates the **master key** into the OS keychain (fallback `master.key`, `0600`), runs SQLite **schema migrations**, writes a default `config.yaml` (loopback defaults), and prints a **one-time admin bootstrap URL/token** to register the first passkey. Idempotent — safe to re-run; missing pieces are filled in.
+- **`poolgate init`** (CLI): creates the config dir + data dir, generates the **master key** into the OS keychain (fallback `master.key`, `0600`), runs SQLite **schema migrations**, writes a default `config.yaml` (loopback defaults), and prints a **short-TTL, single-use admin bootstrap URL/token** (never written to durable logs — see §0 fixes) to register the first passkey. Idempotent — safe to re-run; missing pieces are filled in.
 - **Auto-migrate on startup:** every launch runs pending DB migrations, so upgrades need no manual DB steps.
 - **Web first-run wizard:** if no passkey is registered, the admin UI opens a setup wizard — register first passkey (QR or platform), set `external_origin`/`rp_id`, import the first account(s), and create a starter policy + endpoint.
-- **Docker/headless:** env-var-driven init (`POOLGATE_*`), data on a mounted volume; bootstrap token surfaced in container logs.
+- **Docker/headless:** env-var-driven init (`POOLGATE_*`), data on a mounted volume; the short-TTL single-use bootstrap token is surfaced once in container stdout (rotate/re-issue via `reset-auth` if exposed).
 
 ## 18. Distribution, packaging & release automation
 
 Driven by **GoReleaser** + **GitHub Actions**; every channel ships verifiable artifacts.
 
-**Install channels (Homebrew primary):**
+**Install channels (v1 = 4; see §0 D9):**
 
-- **Homebrew tap** — `brew install go2-im/tap/poolgate` (formula auto-updated on release; macOS + Linux).
-- **Scoop / winget** — Windows (optional).
+- **Homebrew tap** — `brew install go2-im/tap/poolgate` (macOS + Linux; formula auto-updated by GoReleaser on release). Primary path for the operator's own machine.
+- **GitHub Release binaries** — cross-compiled archives (darwin/linux/windows × amd64/arm64) with `SHA256SUMS` + cosign signature attached to each release.
+- **One-line install script** — `install.sh` detects OS/arch, downloads the matching archive from the latest GitHub Release, **verifies `SHA256SUMS` + the cosign signature before installing** (never a blind `curl | sh`). This directly addresses the audited "unverifiable binary / curl-pipe-sh" risk.
 - **Docker image** — `ghcr.io/go2-im/poolgate` (self-host).
-- **deb/rpm** via `nfpm` — Linux servers (optional).
-- **One-line install script** — `install.sh` detects OS/arch, downloads the matching archive from the latest GitHub Release, **verifies `SHA256SUMS` + the cosign signature before installing** (never a blind `curl | sh`; Homebrew is still the recommended path). This directly addresses the audited "unverifiable binary / curl-pipe-sh" risk.
+- *Deferred (v1: not shipped — see §0 D9):* Scoop / winget, deb/rpm via `nfpm`.
 
-**Release CI (`release.yml`, on tag `v*`):** GoReleaser cross-compiles (darwin/linux/windows × amd64/arm64), builds archives + `SHA256SUMS`, **signs with cosign (keyless via GitHub OIDC)**, emits **SLSA provenance / artifact attestations**, publishes the GitHub Release, updates the Homebrew tap, and pushes the Docker image. All third-party Actions are **SHA-pinned**, `permissions` least-privileged, `id-token: write` only where needed — no long-lived signing key or registry token in the job env.
+**Release CI (`release.yml`, on tag `v*`):** GoReleaser cross-compiles (darwin/linux/windows × amd64/arm64), builds archives + `SHA256SUMS`, **signs with cosign (keyless via GitHub OIDC)**, publishes the GitHub Release, updates the Homebrew tap, and pushes the Docker image (**full SLSA provenance + reproducible-build gate deferred** — see §0 D9; Scoop/deb-rpm not published in v1). All third-party Actions are **SHA-pinned**, `permissions` least-privileged, `id-token: write` only where needed — no long-lived signing key or registry token in the job env.
 
 **CI (`ci.yml`, on PR/push):** `go build ./...`, `go vet`, `staticcheck`, unit tests, `govulncheck`, frontend build, and the suspicious-domain lint — all green required to merge.
 
@@ -315,9 +324,9 @@ Driven by **GoReleaser** + **GitHub Actions**; every channel ships verifiable ar
 
 ## 19. Correctness rules (routing & upstream) — MUST
 
-- **19.1 Session affinity (stateful Responses API):** requests carrying `previous_response_id` (or on an endpoint flagged `stateful`) are pinned to the account that produced the prior response, keyed by the §15 session id, with a TTL. If the pinned account is unhealthy, fail over per the group strategy and signal that server-side state may be lost. Stateless requests route normally. **This is the top product-specific trap** — round-robin would otherwise send a follow-up to an account that never saw the conversation.
+- **19.1 Turn affinity (N/A in v1):** v1 forces the **stateless HTTP POST+SSE** path (poolgate does not accept the WS upgrade — §0 D2 / §14), so each request carries its full inline `input` and **no session affinity is needed in v1**. **When WS proxying is added later**, a turn MUST be pinned to one backend keyed on the **`x-codex-turn-state`** token (captured at turn start, resent unchanged within a turn, never reused across turns). This is **not** the §15 monitoring session id and **not** a best-effort optimization — it is turn-scoped **correctness** (see §0 D3). If the pinned backend is unhealthy mid-turn, fail over per the group strategy and signal that server-side (in-memory) turn state may be lost.
 - **19.2 Failover boundary + idempotency:** re-selection happens **only before any byte is written to the client** (upstream error status pre-stream, or connect/timeout before first byte). Once streaming starts, propagate the upstream error in-band and stop — never switch mid-stream. Cross-account POST retries are gated to avoid double execution / double token spend; optional `Idempotency-Key` passthrough.
-- **19.3 Single-flight token refresh + rotation-safe:** on the request path, concurrent 401s for one account coalesce into **one** refresh (per-account single-flight); the rotated `refresh_token` is persisted atomically before waiters proceed. Prevents "concurrent refresh invalidates the account." (Extends §12's probe-only single-flight to the hot path.)
+- **19.3 Single-flight token refresh + rotation-safe:** a **single per-account single-flight primitive is shared by both the proxy hot path and the health probe engine** (§12) — concurrent 401s (and any probe-triggered refresh) for one account coalesce into **one** refresh; the rotated `refresh_token` is persisted **atomically (temp+rename), interprocess-safe**, before waiters proceed. Prevents "concurrent refresh invalidates the account" (a reused `refresh_token` permanently bricks it — see §0 D6).
 - **19.4 OpenAI-compatible error envelope:** poolgate-originated errors return `{"error":{message,type,code,param}}` with distinct types (`poolgate_no_healthy_account`, `poolgate_all_exhausted`, `poolgate_key_unscoped`, …); upstream error bodies pass through preserving their shape.
 
 ## 20. Backup, restore & disaster recovery — MUST
@@ -330,50 +339,50 @@ Driven by **GoReleaser** + **GitHub Actions**; every channel ships verifiable ar
 
 ## 21. Runtime & deployment operations
 
-- **21.1 Health endpoints:** unauthenticated, secret-free `/healthz` (alive) + `/readyz` (DB open + migrations applied + ≥1 endpoint has a healthy policy member), separate from `/e/<ep>/v1`.
+- **21.1 Health endpoints:** unauthenticated, secret-free `/healthz` (alive) + `/readyz` (**migrations applied + ≥1 endpoint has a reachable healthy account**), separate from `/e/<ep>/v1`. `/readyz` is **secret-free and leaks no account ids**.
 - **21.2 Graceful shutdown:** SIGTERM → stop accepting new, **drain in-flight SSE/streams** to a deadline then force-close, flush pending `request_logs`, persist health state.
 - **21.3 Single-instance lock:** flock/PID lock on the data dir; clear "already running" error (no double probe scheduler / port fights).
-- **21.4 Clock alignment:** anchor 5h/1week windows to upstream usage-endpoint timestamps (not host wall clock); monitor/report clock skew.
+- **21.4 Clock alignment:** anchor usage windows (e.g. the 5h / weekly example windows — see §0 D4) to upstream usage-endpoint timestamps (not host wall clock); monitor/report clock skew.
 - **21.5 Docker hardening:** non-root UID, distroless/scratch (CGO-free build), read-only rootfs + tmpfs, HEALTHCHECK, multi-arch (amd64/arm64).
 - **21.6 Recipes:** docker-compose + Caddy/nginx starter configs wiring `external_origin` + `trusted_proxies`; systemd unit sample.
-- **21.7 Config surface:** every config key overridable by env var; `_FILE` convention for secrets; subpath/path-prefix hosting.
+- **21.7 Config surface:** every config key overridable by env var; `_FILE` convention for secrets. Subpath / path-prefix hosting is deferred (v1: deferred — see §0 D9).
 
 ## 22. Security hardening additions
 
 - **22.1 SSRF guard** (webhook + upstream-override egress): resolve-then-connect, **block private/loopback/link-local/`169.254.169.254`/ULA/`::1`**, re-validate at connect time (anti DNS-rebinding), HTTPS only.
-- **22.2 Proxy-key lifecycle:** per-key expiry + rotation with a **dual-key grace window** (zero-downtime); optional per-key IP allowlist; per-key/endpoint **spend & request budgets** per window.
+- **22.2 Proxy-key lifecycle:** per-key expiry + rotation via **multiple active keys + manual rotation** (dual-key grace window dropped); optional per-key IP allowlist; per-key/endpoint **rate-limit + endpoint scoping** (per-key **spend budgets** dropped — see §0 D9).
 - **22.3 Admin sessions:** lifetime + idle timeout, rotate on register/login, **"revoke all sessions"**; same-origin CORS by default.
 - **22.4 Anti-brute-force:** rate-limit + lockout + backoff on recovery-code and bootstrap-token attempts.
-- **22.5 Audit log:** completeness spec (auth, CRUD, key use, config changes) + **append-only / hash-chained** tamper-evidence.
-- **22.6 Master-key rotation:** command to rotate + **bulk re-encrypt** all secret columns.
+- **22.5 Audit log:** completeness spec (auth, CRUD, key use, config changes) + **append-only** (hash-chaining dropped — see §0 D9).
+- **22.6 Master-key rotation:** *deferred (v1: deferred — see §0 D9);* backup/restore (§20) covers key portability. (Later: command to rotate + bulk re-encrypt all secret columns.)
 - **22.7 Request-body logging:** off by default; explicit opt-in with redaction.
 
 ## 23. Routing & account additions
 
-- **23.1 Concurrency:** per-account concurrency cap + **least-in-flight** selection; **bounded queue / backpressure** (429 + Retry-After) when no member is free.
-- **23.2 Match rules:** Surge-style per-endpoint rules (model / header / path → group) + per-endpoint/key **model allow-deny**, beyond flat binding.
+- **23.1 Concurrency:** per-account concurrency cap + **least-in-flight** selection (a refinement within `load-balance`, not a separate strategy — see §0 D7); **bounded queue / backpressure** (429 + Retry-After) when no member is free.
+- **23.2 Match rules:** per-endpoint/key **model allow-deny** in v1. The Surge-style match-rule engine (model / header / path → group) is **deferred** (v1: deferred — see §0 D9).
 - **23.3 Upstream rate limits:** relay upstream rate-limit headers to the client; drive cooldown from `Retry-After`.
 - **23.4 Streamed token accounting:** parse SSE `usage` / `include_usage` to record tokens for streamed responses (feeds §15 + budgets).
-- **23.5 Route matrix + allowlist:** Responses API primary (`/v1/responses`); also `/v1/chat/completions`, synthesized `/v1/models`, `/v1/messages`; **allowlist routes** (no blanket path forwarding to the upstream token).
-- **23.6 Account states & login:** terminal `revoked`/`dead` vs transient `expired`; duplicate dedup by account id on import; archive/soft-delete + **crypto-shred**; interactive **OAuth authorization-code (PKCE) + MFA** login (not just JSON import), headless handoff.
+- **23.5 Route matrix + allowlist:** the **inbound** OpenAI-compatible surface — Responses API primary (`/v1/responses`); also `/v1/chat/completions`, synthesized `/v1/models`, `/v1/messages`; **allowlist routes** (no blanket path forwarding to the upstream token). **Upstream is a translation gateway, not a transparent reverse proxy:** `Authorization` + `ChatGPT-Account-ID` are rewritten **together** and Codex identity headers preserved (see §0 D1 / §6). **Transport:** v1 serves the **stateless HTTP POST+SSE** path — Codex's WS-first upgrade is not accepted; WS proxying deferred (see §0 D2).
+- **23.6 Account states & login:** terminal `revoked`/`dead` (no auto-recovery — §4/§12) vs transient `expired`; duplicate dedup by account id on import; archive/soft-delete + **crypto-shred**; interactive **OAuth authorization-code login with PKCE** — **loopback callback + single-use `state` + S256** (see §0 fixes) + MFA (not just JSON import), headless handoff.
 
 ## 24. Observability & UX additions
 
-- **24.1 Metrics/logs/trace:** Prometheus `/metrics`; structured slog JSON (stdout/file, rotation); per-request routing/failover **decision trace**.
-- **24.2 Quota forecast:** burn-rate from `health_checks` series → "hits 0 at ~HH:MM before reset"; upgrades `best-quota` to route by projected headroom + smarter alerts.
+- **24.1 Logs/trace:** structured **slog JSON** (stdout/file, rotation) + the in-app monitor (§15); per-request routing/failover **decision trace**. Prometheus `/metrics` is **dropped from v1** and OpenTelemetry is **not in scope** (see §0 D9).
+- **24.2 Quota forecast (display-only):** burn-rate over the generic percent-usage windows (`health_checks` series) → "hits 0 at ~HH:MM before reset" as a **display aid only**; `best-quota` routes on **current** headroom (min `(100 − used_percent)` across windows — §4 / §0 D4 / D7), not projected. Shown alongside the 3–4 headline counters (§15); full chart suite deferred (§0 D9).
 - **24.3 Client-config generator:** per-endpoint panel + key picker → copy-ready blocks (Codex `~/.codex/config`, Cursor base_url+key, curl, OpenAI SDK env).
 - **24.4 Test & dry-run:** inline "test this endpoint" + policy **dry-run** ("which account would be picked now").
 - **24.5 Safe destructive ops:** blast-radius confirmation + soft-delete/undo.
-- **24.6 Exports:** usage CSV/JSON + scheduled dump; effective cost-per-token / subscription-value accounting.
-- **24.7 i18n & theme:** bilingual admin (zh/en), locale + TZ formatting; dark mode; mobile-responsive; baseline a11y.
+- **24.6 Exports:** **on-demand** usage CSV/JSON export only (scheduler dropped). Cost-per-token / subscription-value accounting is **cut** (see §0 D9).
+- **24.7 Theme:** **single UI language + dark mode** in v1. i18n framework, accessibility program, and mobile-responsive layout are **deferred** (see §0 D9).
 
 ## 25. Testing & QA plan
 
 - **25.1 Fake upstream:** in-process `httptest` fake (scripted SSE, 401/429/5xx, latency, quota/plan JSON) + **golden contract fixtures** vs real OpenAI/ChatGPT shapes.
 - **25.2 Streaming chaos:** mid-stream account death, client-disconnect → upstream cancellation, failover-boundary (§19.2) correctness.
-- **25.3 Deterministic engine tests:** policy engine (cycle reject, fallback order, RR fairness, weighted LB, best-quota tie-breaks) + health state machine with an **injectable clock**.
+- **25.3 Deterministic engine tests:** policy engine for the **3 v1 strategies** (fallback order, `load-balance` round-robin fairness, `best-quota` headroom + deterministic tie-break) + health state machine with an **injectable clock**. (Cycle-reject / nesting and weighted-LB tests are deferred with those features — see §0 D7/D8.)
 - **25.4 Concurrency/soak:** single-flight refresh under N concurrent 401s (§19.3); SQLite under load.
-- **25.5 CI matrix:** OS seams (keychain/DPAPI, modernc sqlite, migrations); fuzz SSE relay + trusted-proxy parsers; verify reproducible builds.
+- **25.5 CI matrix:** OS seams (keychain/DPAPI, modernc sqlite, migrations); fuzz SSE relay + trusted-proxy parsers. (Reproducible-build verification is deferred with the SLSA/reproducible-build gate — see §0 D9.)
 
 ## 26. Backlog (accepted, later)
 
