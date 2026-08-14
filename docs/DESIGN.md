@@ -19,8 +19,11 @@ A **single-user**, self-hostable tool that:
 |------|------|-----------|-----|
 | **Local** | `127.0.0.1` | passkey (RP ID `localhost`; WebAuthn treats `http://localhost` as a secure context, so no TLS needed) | none |
 | **Remote (self-hosted)** | `127.0.0.1`, fronted by **your** reverse proxy (Caddy/nginx) | passkey (RP ID = your domain) | terminated at the reverse proxy |
+| **Intranet / LAN** | LAN addr or `0.0.0.0` (supported); **reverse-proxy fronting recommended** over direct port access | passkey / `sk-` key | via reverse proxy if used |
 
 **All listener ports are configurable** (admin + proxy), defaults are just defaults.
+
+**Bind policy:** loopback (`127.0.0.1`) is the default. Binding to a LAN address or `0.0.0.0` **is a supported, first-class option** — other machines on your intranet may use poolgate. But the **recommended** way for other machines to reach it is **through a reverse proxy** (one TLS-terminating, access-controlled ingress), not by hitting the raw proxy/admin port directly. A non-loopback bind emits an informational **startup notice** (not a scary warning) that it is network-reachable and suggests reverse-proxy fronting; access stays gated by the `sk-` key (proxy) / passkey (admin) regardless of bind address.
 
 The binary **never launches or manages a tunnel itself** — but it is built to run **smoothly behind whatever you put in front of it**: a reverse proxy (Caddy/nginx) *or* an external tunnel you run (cloudflared, ngrok, etc.). See §14 for how (trusted-proxy headers, external origin, streaming pass-through). So "remote" = you front the loopback listener with your own TLS reverse proxy or tunnel.
 
@@ -234,7 +237,7 @@ Ports are fully configurable, and poolgate is designed to sit behind whatever fr
 - **Trusted proxies:** `server.trusted_proxies` (CIDR list). Only when the peer is a trusted proxy does poolgate honor `X-Forwarded-For` / `-Proto` / `-Host` (real client IP for logs/rate-limit, external scheme/host for URL/RP-origin). Untrusted peers' forwarded headers are ignored → no IP/host spoofing.
 - **External origin:** `server.external_origin` (e.g. `https://poolgate.example.com`) sets the canonical scheme+host used for WebAuthn RP origin, cookie flags, and the proxy URLs shown in the UI to copy into Codex/Cursor — so behind a cloudflared/ngrok URL the UI shows the *public* endpoint, not `127.0.0.1`.
 - **Streaming through tunnels:** SSE and WebSocket (`/v1/responses`, chat streaming) pass through with immediate per-chunk flush, `Cache-Control: no-transform`, no response buffering, and keep-alives tuned so cloudflared/ngrok/nginx don't buffer or drop long-lived streams. Idle/read timeouts are generous for streaming routes.
-- **Still loopback by default:** the tunnel/proxy connects to the loopback listener; you never have to bind `0.0.0.0`.
+- **Loopback default, LAN allowed:** the tunnel/reverse-proxy connects to the loopback listener, so you don't *have* to bind wider. Binding a LAN addr / `0.0.0.0` is supported for direct intranet use, but fronting with a reverse proxy is recommended even on a LAN (§2 bind policy).
 
 > Security: since a tunnel makes the proxy effectively public, the `sk-` key remains the gate (constant-time). Do **not** expose the *admin* listener through a tunnel unless you intend to — and even then it is passkey-gated. Trusted-proxy parsing is strict to prevent spoofed client IPs. (See `docs/SECURITY.md`.)
 
@@ -282,4 +285,78 @@ Driven by **GoReleaser** + **GitHub Actions**; every channel ships verifiable ar
 **Dependency automation:** **Dependabot** (or Renovate) for `gomod`, `github-actions`, and the frontend `npm` ecosystem — grouped, scheduled PRs, gated by `ci.yml` + `govulncheck`.
 
 **App self-update policy:** consistent with §Security — **no silent auto-update**. `poolgate` may *check* and report a newer version, but upgrading is an explicit `brew upgrade` / re-run of the verified installer.
+
+---
+
+# Accepted requirements (v2) — Tiers 1–5
+
+## 19. Correctness rules (routing & upstream) — MUST
+
+- **19.1 Session affinity (stateful Responses API):** requests carrying `previous_response_id` (or on an endpoint flagged `stateful`) are pinned to the account that produced the prior response, keyed by the §15 session id, with a TTL. If the pinned account is unhealthy, fail over per the group strategy and signal that server-side state may be lost. Stateless requests route normally. **This is the top product-specific trap** — round-robin would otherwise send a follow-up to an account that never saw the conversation.
+- **19.2 Failover boundary + idempotency:** re-selection happens **only before any byte is written to the client** (upstream error status pre-stream, or connect/timeout before first byte). Once streaming starts, propagate the upstream error in-band and stop — never switch mid-stream. Cross-account POST retries are gated to avoid double execution / double token spend; optional `Idempotency-Key` passthrough.
+- **19.3 Single-flight token refresh + rotation-safe:** on the request path, concurrent 401s for one account coalesce into **one** refresh (per-account single-flight); the rotated `refresh_token` is persisted atomically before waiters proceed. Prevents "concurrent refresh invalidates the account." (Extends §12's probe-only single-flight to the hot path.)
+- **19.4 OpenAI-compatible error envelope:** poolgate-originated errors return `{"error":{message,type,code,param}}` with distinct types (`poolgate_no_healthy_account`, `poolgate_all_exhausted`, `poolgate_key_unscoped`, …); upstream error bodies pass through preserving their shape.
+
+## 20. Backup, restore & disaster recovery — MUST
+
+- **20.1 Portable encrypted bundle:** `poolgate backup` → one self-describing encrypted bundle (accounts+tokens, policies/endpoints/keys, and the master key **re-wrapped under a user passphrase**, not the machine keychain). `poolgate restore` re-wraps into the new host's keychain and verifies a decrypt round-trip.
+- **20.2 Master-key portability:** restore never relies on the machine-bound keychain/DPAPI key; the passphrase-wrapped key in the bundle is the portable root. Naive file-copy backups are documented as non-portable (they only fail at restore time).
+- **20.3 Consistent hot backup:** SQLite `VACUUM INTO` / online-backup API with WAL checkpoint → consistent snapshots under live load.
+- **20.4 Migration safety:** persisted schema version; **refuse to start** (clear message) when the binary is older than the DB (downgrade guard); **pre-migration auto-snapshot** for rollback; defined seed-from-YAML ↔ DB-of-record reconciliation.
+- **20.5 Scheduled backups (optional):** periodic encrypted snapshots to a configured dir, with retention.
+
+## 21. Runtime & deployment operations
+
+- **21.1 Health endpoints:** unauthenticated, secret-free `/healthz` (alive) + `/readyz` (DB open + migrations applied + ≥1 endpoint has a healthy policy member), separate from `/e/<ep>/v1`.
+- **21.2 Graceful shutdown:** SIGTERM → stop accepting new, **drain in-flight SSE/streams** to a deadline then force-close, flush pending `request_logs`, persist health state.
+- **21.3 Single-instance lock:** flock/PID lock on the data dir; clear "already running" error (no double probe scheduler / port fights).
+- **21.4 Clock alignment:** anchor 5h/1week windows to upstream usage-endpoint timestamps (not host wall clock); monitor/report clock skew.
+- **21.5 Docker hardening:** non-root UID, distroless/scratch (CGO-free build), read-only rootfs + tmpfs, HEALTHCHECK, multi-arch (amd64/arm64).
+- **21.6 Recipes:** docker-compose + Caddy/nginx starter configs wiring `external_origin` + `trusted_proxies`; systemd unit sample.
+- **21.7 Config surface:** every config key overridable by env var; `_FILE` convention for secrets; subpath/path-prefix hosting.
+
+## 22. Security hardening additions
+
+- **22.1 SSRF guard** (webhook + upstream-override egress): resolve-then-connect, **block private/loopback/link-local/`169.254.169.254`/ULA/`::1`**, re-validate at connect time (anti DNS-rebinding), HTTPS only.
+- **22.2 Proxy-key lifecycle:** per-key expiry + rotation with a **dual-key grace window** (zero-downtime); optional per-key IP allowlist; per-key/endpoint **spend & request budgets** per window.
+- **22.3 Admin sessions:** lifetime + idle timeout, rotate on register/login, **"revoke all sessions"**; same-origin CORS by default.
+- **22.4 Anti-brute-force:** rate-limit + lockout + backoff on recovery-code and bootstrap-token attempts.
+- **22.5 Audit log:** completeness spec (auth, CRUD, key use, config changes) + **append-only / hash-chained** tamper-evidence.
+- **22.6 Master-key rotation:** command to rotate + **bulk re-encrypt** all secret columns.
+- **22.7 Request-body logging:** off by default; explicit opt-in with redaction.
+
+## 23. Routing & account additions
+
+- **23.1 Concurrency:** per-account concurrency cap + **least-in-flight** selection; **bounded queue / backpressure** (429 + Retry-After) when no member is free.
+- **23.2 Match rules:** Surge-style per-endpoint rules (model / header / path → group) + per-endpoint/key **model allow-deny**, beyond flat binding.
+- **23.3 Upstream rate limits:** relay upstream rate-limit headers to the client; drive cooldown from `Retry-After`.
+- **23.4 Streamed token accounting:** parse SSE `usage` / `include_usage` to record tokens for streamed responses (feeds §15 + budgets).
+- **23.5 Route matrix + allowlist:** Responses API primary (`/v1/responses`); also `/v1/chat/completions`, synthesized `/v1/models`, `/v1/messages`; **allowlist routes** (no blanket path forwarding to the upstream token).
+- **23.6 Account states & login:** terminal `revoked`/`dead` vs transient `expired`; duplicate dedup by account id on import; archive/soft-delete + **crypto-shred**; interactive **OAuth authorization-code (PKCE) + MFA** login (not just JSON import), headless handoff.
+
+## 24. Observability & UX additions
+
+- **24.1 Metrics/logs/trace:** Prometheus `/metrics`; structured slog JSON (stdout/file, rotation); per-request routing/failover **decision trace**.
+- **24.2 Quota forecast:** burn-rate from `health_checks` series → "hits 0 at ~HH:MM before reset"; upgrades `best-quota` to route by projected headroom + smarter alerts.
+- **24.3 Client-config generator:** per-endpoint panel + key picker → copy-ready blocks (Codex `~/.codex/config`, Cursor base_url+key, curl, OpenAI SDK env).
+- **24.4 Test & dry-run:** inline "test this endpoint" + policy **dry-run** ("which account would be picked now").
+- **24.5 Safe destructive ops:** blast-radius confirmation + soft-delete/undo.
+- **24.6 Exports:** usage CSV/JSON + scheduled dump; effective cost-per-token / subscription-value accounting.
+- **24.7 i18n & theme:** bilingual admin (zh/en), locale + TZ formatting; dark mode; mobile-responsive; baseline a11y.
+
+## 25. Testing & QA plan
+
+- **25.1 Fake upstream:** in-process `httptest` fake (scripted SSE, 401/429/5xx, latency, quota/plan JSON) + **golden contract fixtures** vs real OpenAI/ChatGPT shapes.
+- **25.2 Streaming chaos:** mid-stream account death, client-disconnect → upstream cancellation, failover-boundary (§19.2) correctness.
+- **25.3 Deterministic engine tests:** policy engine (cycle reject, fallback order, RR fairness, weighted LB, best-quota tie-breaks) + health state machine with an **injectable clock**.
+- **25.4 Concurrency/soak:** single-flight refresh under N concurrent 401s (§19.3); SQLite under load.
+- **25.5 CI matrix:** OS seams (keychain/DPAPI, modernc sqlite, migrations); fuzz SSE relay + trusted-proxy parsers; verify reproducible builds.
+
+## 26. Backlog (accepted, later)
+
+Canary/shadow mirroring is **out of scope** for single-user. Remaining niceties (cost accounting, scheduled exports, full data-wipe) are folded above where cheap; implement opportunistically after Phases 1–5.
+
+## 27. Section → phase mapping
+
+§19 + §23 → **Phase 2** (proxy/policy correctness). §20 (+§21.3/.4) → **Phase 1 & 5**. §21 health/drain → **Phase 2**, Docker/recipes/config → **Phase 5**. §22 → **Phase 3**. §24 → **Phase 4** (metrics/trace also Phase 2). §25 → **all phases** (write tests alongside each).
 

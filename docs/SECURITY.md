@@ -21,7 +21,7 @@ poolgate is designed against a security audit of a comparable tool (a multi-acco
 
 | # | Audit finding (sev) | poolgate mitigation | Module / phase |
 |---|---------------------|---------------------|----------------|
-| A | Proxy binds `0.0.0.0` by default (MEDIUM) | Default `127.0.0.1`; wider bind requires explicit flag + startup/UI warning; admin server stays loopback-only; UI shows the **real** bind address | config, proxy server / 2 |
+| A | Proxy binds `0.0.0.0` by default (MEDIUM) | Default `127.0.0.1`; LAN / `0.0.0.0` is a **supported opt-in** (reverse-proxy fronting recommended over direct port access); non-loopback bind emits an informational startup notice; access always gated by `sk-` key / passkey; UI shows the **real** bind address; admin stays loopback unless deliberately fronted | config, proxy server / 2 |
 | B | CSP disabled + broad IPC surface (MEDIUM) | Strict CSP on admin (`default-src 'self'`, no inline/`unsafe-*`), `X-Frame-Options: DENY`, `X-Content-Type-Options`; every admin endpoint behind auth + CSRF | api middleware / 3 |
 | C | Release CI uses mutable action tags while holding signing key + npm token (MEDIUM) | All GitHub Actions **SHA-pinned**; least-priv `permissions`; OIDC short-lived creds; signing job isolated | .github / 5 |
 | D | Tokens stored plaintext + shadow backups (LOW) | **Field-encrypted** secrets in SQLite; encrypted backups; `0600`; OS keychain master key | store / 1 |
