@@ -67,6 +67,19 @@ type Store interface {
 	GetLatestUsage(ctx context.Context, accountID string) (model.UsageSnapshot, error)
 	ListHealthChecks(ctx context.Context, accountID string, limit int) ([]model.HealthCheck, error)
 	SchemaVersion(ctx context.Context) (int, error)
+	// notify channels
+	InsertNotifyChannel(ctx context.Context, ch model.NotifyChannel) (model.NotifyChannel, error)
+	GetNotifyChannel(ctx context.Context, id string) (model.NotifyChannel, error)
+	ListNotifyChannels(ctx context.Context) ([]model.NotifyChannel, error)
+	UpdateNotifyChannel(ctx context.Context, ch model.NotifyChannel) error
+	DeleteNotifyChannel(ctx context.Context, id string) error
+}
+
+// Notifier is the optional notification surface used by the channel "send test"
+// action (DESIGN.md §11). *notify.Engine satisfies it. When no Notifier is wired,
+// the test endpoint returns 503.
+type Notifier interface {
+	Test(ctx context.Context, ch model.NotifyChannel) error
 }
 
 // SessionManager is the admin-auth surface for sessions, CSRF and recovery
@@ -96,6 +109,7 @@ type Server struct {
 	store    Store
 	sessions SessionManager
 	webauthn Ceremonies
+	notifier Notifier
 
 	origin   string // canonical admin origin (scheme://host[:port]) for CORS
 	secure   bool   // set the Secure cookie flag (origin is https)
@@ -146,6 +160,12 @@ func WithRecoveryCodeCount(n int) Option {
 			s.recovery = n
 		}
 	}
+}
+
+// WithNotifier wires the optional notification surface used by the channel "send
+// test" action. When unset, POST …/notify/channels/{id}/test returns 503.
+func WithNotifier(n Notifier) Option {
+	return func(s *Server) { s.notifier = n }
 }
 
 // New builds a Server. All three collaborators must be non-nil. The admin origin
@@ -229,6 +249,13 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /admin/api/usage", s.guard(s.handleUsage))
 	mux.HandleFunc("GET /admin/api/health", s.guard(s.handleHealth))
 	mux.HandleFunc("GET /admin/api/status", s.guard(s.handleStatus))
+
+	mux.HandleFunc("GET /admin/api/notify/channels", s.guard(s.handleNotifyChannelsList))
+	mux.HandleFunc("POST /admin/api/notify/channels", s.guard(s.handleNotifyChannelCreate))
+	mux.HandleFunc("GET /admin/api/notify/channels/{id}", s.guard(s.handleNotifyChannelGet))
+	mux.HandleFunc("PATCH /admin/api/notify/channels/{id}", s.guard(s.handleNotifyChannelPatch))
+	mux.HandleFunc("DELETE /admin/api/notify/channels/{id}", s.guard(s.handleNotifyChannelDelete))
+	mux.HandleFunc("POST /admin/api/notify/channels/{id}/test", s.guard(s.handleNotifyChannelTest))
 }
 
 // ---- origin resolution ----------------------------------------------------

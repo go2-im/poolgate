@@ -42,6 +42,7 @@ import (
 	"errors"
 	"log/slog"
 	"math/rand/v2"
+	"strconv"
 	"time"
 
 	"github.com/go2-im/poolgate/internal/model"
@@ -89,6 +90,15 @@ type LiveProbe interface {
 	Live(ctx context.Context, acct model.Account) (ok bool, retryAfter time.Duration, detail string, err error)
 }
 
+// EventSink receives the secret-free notification events the engine emits on
+// account-state transitions and quota-low observations (DESIGN.md §11 / §12).
+// *notify.Engine satisfies it. It is optional: when nil, no events are emitted.
+// Emit MUST be non-blocking (the notify engine queues) so state transitions are
+// never stalled by notification I/O.
+type EventSink interface {
+	Emit(ev model.NotifyEvent)
+}
+
 // SleepFunc waits for d or until ctx is cancelled; it returns ctx.Err() on
 // cancellation. Injected so Run is testable without wall-clock sleeps.
 type SleepFunc func(ctx context.Context, d time.Duration) error
@@ -109,6 +119,11 @@ type Schedule struct {
 	MaxBackoffLevel int           // cap on the backoff level counter
 	LiveBudget      int           // max small-live-requests per account per rolling 24h
 }
+
+// DefaultQuotaLowThreshold is the default headroom percentage at/below which the
+// engine emits a quota_low notification event (DESIGN.md §11) while an account is
+// still routable.
+const DefaultQuotaLowThreshold = 15.0
 
 // DefaultSchedule returns sane, conservative defaults (usage-poll-only cadence;
 // live probing stays opt-in via AllowLive + a LiveProbe).
@@ -142,6 +157,9 @@ type Engine struct {
 	sched     Schedule
 	allowLive bool // global mode switch; false = usage-poll-only (the default)
 
+	events         EventSink // optional notification sink (DESIGN.md §11)
+	quotaLowPct    float64   // headroom% at/below which a quota_low event is emitted
+
 	now    func() time.Time
 	rnd    func() float64
 	sleep  SleepFunc
@@ -172,6 +190,16 @@ func WithLiveProbe(p LiveProbe) Option { return func(e *Engine) { e.live = p } }
 // per-account daily budget and requires a LiveProbe). Default false.
 func WithAllowLive(v bool) Option { return func(e *Engine) { e.allowLive = v } }
 
+// WithEventSink wires the notification sink (DESIGN.md §11). When set, the engine
+// emits secret-free events on account-state transitions (expired / cooldown /
+// quota_exhausted / recovered) and on quota-low observations.
+func WithEventSink(s EventSink) Option { return func(e *Engine) { e.events = s } }
+
+// WithQuotaLowThreshold sets the headroom percentage at/below which a quota_low
+// event is emitted (while the account is still routable). Default 15; a value <=0
+// disables quota_low emission.
+func WithQuotaLowThreshold(pct float64) Option { return func(e *Engine) { e.quotaLowPct = pct } }
+
 // WithSleep injects the sleep primitive used by Run (default a real timer).
 func WithSleep(fn SleepFunc) Option { return func(e *Engine) { e.sleep = fn } }
 
@@ -181,14 +209,15 @@ func WithLogger(l *slog.Logger) Option { return func(e *Engine) { e.logger = l }
 // New builds an Engine over st using the usage prober and the shared refresher.
 func New(st Store, up UsageProbe, rf Refresher, opts ...Option) *Engine {
 	e := &Engine{
-		store:     st,
-		usage:     up,
-		refresher: rf,
-		sched:     DefaultSchedule(),
-		now:       time.Now,
-		rnd:       rand.Float64,
-		sleep:     realSleep,
-		logger:    slog.Default(),
+		store:       st,
+		usage:       up,
+		refresher:   rf,
+		sched:       DefaultSchedule(),
+		quotaLowPct: DefaultQuotaLowThreshold,
+		now:         time.Now,
+		rnd:         rand.Float64,
+		sleep:       realSleep,
+		logger:      slog.Default(),
 	}
 	for _, o := range opts {
 		o(e)
@@ -384,11 +413,11 @@ func (e *Engine) OnUnauthorized(ctx context.Context, acct model.Account) (model.
 	now := e.now()
 	if rerr != nil {
 		tr := e.applyEvent(acct.State, t, evExpired, eventParams{now: now})
-		_ = e.persist(ctx, acct.ID, acct.State, tr)
+		_ = e.persist(ctx, acct, tr)
 		return acct, rerr
 	}
 	tr := e.applyEvent(acct.State, t, evRefreshed, eventParams{now: now})
-	if err := e.persist(ctx, acct.ID, acct.State, tr); err != nil {
+	if err := e.persist(ctx, acct, tr); err != nil {
 		return refreshed, err
 	}
 	return refreshed, nil
@@ -402,7 +431,7 @@ func (e *Engine) OnRateLimited(ctx context.Context, acct model.Account, retryAft
 		return err
 	}
 	tr := e.applyEvent(acct.State, t, evRateLimited, eventParams{now: e.now(), retryAfter: retryAfter})
-	return e.persist(ctx, acct.ID, acct.State, tr)
+	return e.persist(ctx, acct, tr)
 }
 
 // OnQuotaExhausted handles a real-traffic quota=0 signal: quota_exhausted gated
@@ -413,16 +442,78 @@ func (e *Engine) OnQuotaExhausted(ctx context.Context, acct model.Account, reset
 		return err
 	}
 	tr := e.applyEvent(acct.State, t, evQuotaZero, eventParams{now: e.now(), resetAt: resetAt})
-	return e.persist(ctx, acct.ID, acct.State, tr)
+	return e.persist(ctx, acct, tr)
 }
 
-func (e *Engine) persist(ctx context.Context, id string, oldState model.AccountState, tr Transition) error {
+func (e *Engine) persist(ctx context.Context, acct model.Account, tr Transition) error {
+	oldState := acct.State
 	if tr.State != oldState {
-		if err := e.store.UpdateState(ctx, id, tr.State); err != nil {
+		if err := e.store.UpdateState(ctx, acct.ID, tr.State); err != nil {
 			return err
 		}
 	}
-	return e.store.SetAccountTiming(ctx, id, tr.Timing)
+	if err := e.store.SetAccountTiming(ctx, acct.ID, tr.Timing); err != nil {
+		return err
+	}
+	e.emitTransition(acct, oldState, tr.State)
+	return nil
+}
+
+// emitTransition emits a secret-free notification event when an account changes
+// state (DESIGN.md §11). It references the account by id/label only. A recovery
+// is reported only when the previous state was degraded/expired.
+func (e *Engine) emitTransition(acct model.Account, oldState, newState model.AccountState) {
+	if e.events == nil || oldState == newState {
+		return
+	}
+	var kind model.NotifyEventKind
+	switch newState {
+	case model.StateExpired:
+		kind = model.EventAccountExpired
+	case model.StateCooldown:
+		kind = model.EventAccountCooldown
+	case model.StateQuotaExhausted:
+		kind = model.EventAccountQuotaExhausted
+	case model.StateOK:
+		if oldState != model.StateCooldown && oldState != model.StateQuotaExhausted && oldState != model.StateExpired {
+			return // e.g. unknown -> ok on first probe is not a "recovery"
+		}
+		kind = model.EventAccountRecovered
+	default:
+		return
+	}
+	e.events.Emit(model.NotifyEvent{
+		Kind:         kind,
+		AccountID:    acct.ID,
+		AccountLabel: acct.Label,
+		Message:      transitionMessage(kind, acct),
+		At:           e.now(),
+	})
+}
+
+// formatPct renders a headroom percentage like "12.3%".
+func formatPct(v float64) string {
+	return strconv.FormatFloat(v, 'f', 1, 64) + "%"
+}
+
+// transitionMessage builds a short, secret-free human summary for a transition.
+func transitionMessage(kind model.NotifyEventKind, acct model.Account) string {
+	name := acct.Label
+	if name == "" {
+		name = acct.ID
+	}
+	switch kind {
+	case model.EventAccountExpired:
+		return "poolgate: account " + name + " expired (token invalid, refresh failed)"
+	case model.EventAccountCooldown:
+		return "poolgate: account " + name + " entered cooldown (repeated 429/5xx)"
+	case model.EventAccountQuotaExhausted:
+		return "poolgate: account " + name + " exhausted its quota"
+	case model.EventAccountRecovered:
+		return "poolgate: account " + name + " recovered and is back in rotation"
+	default:
+		return "poolgate: account " + name + " changed state"
+	}
 }
 
 // ---- active probing --------------------------------------------------------
@@ -462,7 +553,7 @@ func (e *Engine) ProbeAccount(ctx context.Context, acct model.Account) (model.He
 
 	now := e.now()
 	tr := e.applyEvent(acct.State, t, ev, eventParams{now: now, retryAfter: retryAfter, resetAt: resetAt})
-	if err := e.persist(ctx, acct.ID, acct.State, tr); err != nil {
+	if err := e.persist(ctx, acct, tr); err != nil {
 		return model.HealthCheck{}, err
 	}
 
@@ -535,10 +626,33 @@ func (e *Engine) runUsagePoll(ctx context.Context, acct model.Account) (eventKin
 		Windows:    u.Windows,
 		CapturedAt: e.now(),
 	})
-	if policy.MinHeadroom(u) <= 0 {
+	h := policy.MinHeadroom(u)
+	if h <= 0 {
 		return evQuotaZero, 0, bindingReset(u), false, "quota exhausted"
 	}
+	e.emitQuotaLow(acct, h)
 	return evProbeHealthy, 0, time.Time{}, true, "usage ok"
+}
+
+// emitQuotaLow emits a secret-free quota_low event when a still-routable account's
+// remaining headroom is at/below the configured threshold (DESIGN.md §11 / §24.2).
+// The notify engine's per-channel dedup suppresses repeats across polls.
+func (e *Engine) emitQuotaLow(acct model.Account, headroom float64) {
+	if e.events == nil || e.quotaLowPct <= 0 || headroom > e.quotaLowPct {
+		return
+	}
+	name := acct.Label
+	if name == "" {
+		name = acct.ID
+	}
+	e.events.Emit(model.NotifyEvent{
+		Kind:         model.EventQuotaLow,
+		AccountID:    acct.ID,
+		AccountLabel: acct.Label,
+		Headroom:     headroom,
+		Message:      "poolgate: account " + name + " is low on quota (headroom " + formatPct(headroom) + ")",
+		At:           e.now(),
+	})
 }
 
 // runAuthCheck performs the zero-spend GET {base}/models auth check. ok → the

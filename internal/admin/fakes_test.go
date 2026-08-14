@@ -181,6 +181,7 @@ type fakeStore struct {
 	groups   map[string]model.PolicyGroup
 	usage    map[string]model.UsageSnapshot
 	checks   map[string][]model.HealthCheck
+	channels map[string]model.NotifyChannel
 	seq      int
 	failList bool // force list operations to error
 }
@@ -193,6 +194,7 @@ func newFakeStore() *fakeStore {
 		groups:   map[string]model.PolicyGroup{},
 		usage:    map[string]model.UsageSnapshot{},
 		checks:   map[string][]model.HealthCheck{},
+		channels: map[string]model.NotifyChannel{},
 	}
 }
 
@@ -478,4 +480,59 @@ type failingHealthRead struct{ Store }
 
 func (failingHealthRead) ListHealthChecks(context.Context, string, int) ([]model.HealthCheck, error) {
 	return nil, errors.New("health read failed")
+}
+
+// ---- fake notify channels -------------------------------------------------
+
+func (f *fakeStore) InsertNotifyChannel(_ context.Context, ch model.NotifyChannel) (model.NotifyChannel, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if ch.ID == "" {
+		ch.ID = f.id("ntf")
+	}
+	f.channels[ch.ID] = ch
+	return ch, nil
+}
+
+func (f *fakeStore) GetNotifyChannel(_ context.Context, id string) (model.NotifyChannel, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ch, ok := f.channels[id]
+	if !ok {
+		return model.NotifyChannel{}, store.ErrNotFound
+	}
+	return ch, nil
+}
+
+func (f *fakeStore) ListNotifyChannels(context.Context) ([]model.NotifyChannel, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failList {
+		return nil, errors.New("list failed")
+	}
+	out := make([]model.NotifyChannel, 0, len(f.channels))
+	for _, ch := range f.channels {
+		out = append(out, ch)
+	}
+	return out, nil
+}
+
+func (f *fakeStore) UpdateNotifyChannel(_ context.Context, ch model.NotifyChannel) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.channels[ch.ID]; !ok {
+		return store.ErrNotFound
+	}
+	f.channels[ch.ID] = ch
+	return nil
+}
+
+func (f *fakeStore) DeleteNotifyChannel(_ context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.channels[id]; !ok {
+		return store.ErrNotFound
+	}
+	delete(f.channels, id)
+	return nil
 }

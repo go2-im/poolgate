@@ -35,6 +35,7 @@ import (
 	"github.com/go2-im/poolgate/internal/gateway"
 	"github.com/go2-im/poolgate/internal/health"
 	"github.com/go2-im/poolgate/internal/model"
+	"github.com/go2-im/poolgate/internal/notify"
 	"github.com/go2-im/poolgate/internal/oauth"
 	"github.com/go2-im/poolgate/internal/store"
 	usagepkg "github.com/go2-im/poolgate/internal/usage"
@@ -410,18 +411,24 @@ func cmdServe(ctx context.Context, _ []string, stdout io.Writer) error {
 
 	logger := slog.New(slog.NewJSONHandler(stdout, nil))
 
+	// Notification engine (DESIGN.md §11): SSRF-guarded egress, holds channel
+	// secrets server-side, dispatches secret-free events asynchronously so the
+	// hot path is never blocked. Shared by the health engine (account-state
+	// transitions), the gateway (no-healthy-member), and the admin "test" action.
+	notifier := notify.New(st, notify.WithLogger(logger))
+
 	// Health engine: reuse the SAME oauth single-flight refresher the gateway hot
 	// path uses (DESIGN.md §19.3), poll usage for zero-spend quota/recovery, and
 	// gate the probe cost by the configured mode (usage-poll-only by default).
 	refresher := oauth.NewRefresher(st, cfg.Issuer)
-	engine := newHealthEngine(st, refresher, cfg.HealthProbeMode, logger)
+	engine := newHealthEngine(st, refresher, cfg.HealthProbeMode, logger, notifier)
 
-	gw := gateway.New(st, cfg, gateway.WithLogger(logger), gateway.WithHealth(engine))
+	gw := gateway.New(st, cfg, gateway.WithLogger(logger), gateway.WithHealth(engine), gateway.WithEventSink(notifier))
 
 	// Admin API handler (loopback listener), wired with the same store so the
 	// bootstrap token issued by `init` / `admin reset-auth` registers the first
 	// passkey through /admin/register/* end-to-end (DESIGN.md §3 / §16 / §17).
-	adminHandler, err := buildAdminHandler(cfg, st, logger)
+	adminHandler, err := buildAdminHandler(cfg, st, logger, notifier)
 	if err != nil {
 		return err
 	}
@@ -434,6 +441,14 @@ func cmdServe(ctx context.Context, _ []string, stdout io.Writer) error {
 		}
 	}()
 
+	// Notification dispatcher goroutine: drains the queue and delivers alerts
+	// until ctx is cancelled (graceful shutdown alongside the listeners).
+	go func() {
+		if err := notifier.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			logger.Warn("notify dispatcher stopped", slog.Any("err", err))
+		}
+	}()
+
 	logger.Info("health scheduler started", slog.String("probe_mode", cfg.HealthProbeMode))
 	return serveBoth(ctx, cfg, gw, adminHandler, logger, nil, nil)
 }
@@ -443,7 +458,7 @@ func cmdServe(ctx context.Context, _ []string, stdout io.Writer) error {
 // (RP resolved once from static admin config, gated by that manager as its
 // authorizer), and the admin HTTP server that mounts them. It returns the fully
 // middleware-wrapped handler (strict security headers + CSP + same-origin CORS).
-func buildAdminHandler(cfg model.Config, st *store.Store, logger *slog.Logger) (http.Handler, error) {
+func buildAdminHandler(cfg model.Config, st *store.Store, logger *slog.Logger, notifier admin.Notifier) (http.Handler, error) {
 	mgr, err := adminauth.New(st)
 	if err != nil {
 		return nil, fmt.Errorf("admin auth: %w", err)
@@ -452,7 +467,7 @@ func buildAdminHandler(cfg model.Config, st *store.Store, logger *slog.Logger) (
 	if err != nil {
 		return nil, fmt.Errorf("webauthn: %w", err)
 	}
-	srv, err := admin.New(cfg, st, mgr, wa)
+	srv, err := admin.New(cfg, st, mgr, wa, admin.WithNotifier(notifier))
 	if err != nil {
 		return nil, fmt.Errorf("admin api: %w", err)
 	}
@@ -551,11 +566,15 @@ func serveListener(ctx context.Context, addr string, handler http.Handler, onRea
 
 // newHealthEngine builds the health probe engine. The zero-spend auth-check is
 // always wired; small-live-requests are opt-in via probeMode == "allow-live"
-// (bounded by the per-account daily budget in the engine).
-func newHealthEngine(st *store.Store, refresher *oauth.Refresher, probeMode string, logger *slog.Logger) *health.Engine {
+// (bounded by the per-account daily budget in the engine). When events is
+// non-nil, the engine emits secret-free notification events on state transitions.
+func newHealthEngine(st *store.Store, refresher *oauth.Refresher, probeMode string, logger *slog.Logger, events health.EventSink) *health.Engine {
 	opts := []health.Option{
 		health.WithLogger(logger),
 		health.WithAuthProbe(health.NewModelsAuthChecker()),
+	}
+	if events != nil {
+		opts = append(opts, health.WithEventSink(events))
 	}
 	if probeMode == "allow-live" {
 		opts = append(opts, health.WithAllowLive(true), health.WithLiveProbe(health.NewLiveRequester()))

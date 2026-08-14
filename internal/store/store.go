@@ -215,6 +215,31 @@ CREATE TABLE bootstrap_tokens (
 );
 `,
 	},
+	{
+		// v4 — notification channels (DESIGN.md §11). One row per configured
+		// DingTalk / WeCom / custom-webhook destination. The `config` column holds
+		// the channel's delivery settings INCLUDING SECRETS (webhook URL, signing
+		// secret) and is FIELD-ENCRYPTED with the crypto cipher before insert,
+		// exactly like accounts.access_token — it is never stored or served in
+		// plaintext (DESIGN.md §5 / SECURITY.md). `events` is a JSON array of
+		// subscribed event kinds (empty = all). Append-only: v1–v3 above are never
+		// edited.
+		version: 4,
+		sql: `
+CREATE TABLE notify_channels (
+	id            TEXT PRIMARY KEY,
+	type          TEXT NOT NULL,
+	name          TEXT NOT NULL DEFAULT '',
+	enabled       INTEGER NOT NULL DEFAULT 1,
+	config        TEXT NOT NULL,
+	events        TEXT NOT NULL DEFAULT '[]',
+	min_headroom  REAL NOT NULL DEFAULT 0,
+	dedup_seconds INTEGER NOT NULL DEFAULT 0,
+	created_at    TEXT NOT NULL,
+	updated_at    TEXT NOT NULL
+);
+`,
+	},
 }
 
 // Migrate applies any migrations whose version is not yet recorded. It is
