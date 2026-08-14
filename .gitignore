@@ -1,0 +1,35 @@
+# ---- Go ----
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+coverage.*
+
+# ---- data & secrets (never commit) ----
+/data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.key
+*.pem
+.env
+.env.*
+poolgate.local.yaml
+config.local.yaml
+master.key
+
+# ---- web frontend ----
+/web/node_modules/
+/web/dist/
+/web/.vite/
+
+# ---- embedded build output (generated at build time) ----
+/internal/webui/dist/
+
+# ---- editor / OS ----
+.DS_Store
+.idea/
+.vscode/
+*.swp
