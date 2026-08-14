@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+
+# Read-only: this job holds no secrets (release signing lives in a separate workflow).
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      # SHA-pinned per docs/SECURITY.md (audit finding C) — actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: build
+        run: go build ./...
+
+      - name: vet
+        run: go vet ./...
+
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@2026.1 ./...
+
+      - name: test (race + coverage)
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -race -covermode=atomic -coverprofile=cover.out ./... | tee test.out
+
+      - name: coverage gate (>=80% per package — DESIGN §25)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Fail if any package that has statements reports < 80% coverage.
+          awk '
+            /coverage:/ {
+              for (i = 1; i <= NF; i++) {
+                if ($i == "coverage:") {
+                  c = $(i+1); sub(/%/, "", c)
+                  if (c + 0 < 80.0) { printf "COVERAGE FAIL: %s\n", $0; fail = 1 }
+                }
+              }
+            }
+            END { if (fail) exit 1; else print "coverage gate: OK (all packages >= 80%)" }
+          ' test.out
+          echo "total: $(go tool cover -func=cover.out | tail -1)"
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+      - name: suspicious-domain lint
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Guard against typosquat domains sneaking into code/config (audit finding K).
+          if grep -RInE 'openrouter\.icu|api\.0penai|chatgqt' --include='*.go' --include='*.yaml' --include='*.yml' --include='*.ts' --include='*.tsx' . ; then
+            echo "suspicious domain found"; exit 1
+          fi
+          echo "domain lint: OK"
