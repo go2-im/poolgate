@@ -23,7 +23,7 @@ Sections 1–27 grew incrementally; where they conflict with this ledger, **this
 
 **Correctness/robustness fixes (see REVIEW.md §2):** config/policy **hot-reload** via atomic snapshot on admin commit; **auto-recovery gated by `Retry-After`**; **bootstrap token** short-TTL + single-use, not in durable logs; **account-state enum** adds terminal `revoked`/`dead` (no auto-recovery); **WebAuthn RP origin** resolved once at startup from static config only (never per-request forwarded headers); **PKCE** loopback callback with single-use `state` + S256; **memory hygiene** (disable core dumps, mlock master key); **sanitize** client-supplied fields into logs/monitor; **`/readyz`** = migrations applied + ≥1 endpoint has a reachable healthy account; **backup restorability** check (integrity_check + sample decrypt + schema version).
 
-**Phase split:** **2a = walking skeleton** (config + store + one imported encrypted account + on-path single-flight refresh + one `sk-` key + one endpoint + `fallback` + translation gateway forcing HTTP+SSE → one account end-to-end); **2b** = remaining strategies + health engine + generic usage model; **later** = WS proxying + `x-codex-turn-state` affinity. §20 backup + §21.4 clock-align move out of Phase 1.
+**Phase split:** **2a = walking skeleton** (config + store + one **manually-imported** encrypted account (explicit `poolgate import`, never auto on first-run) + on-path single-flight refresh + one `sk-` key + one endpoint + `fallback` + translation gateway forcing HTTP+SSE → one account end-to-end); **2b** = remaining strategies + health engine + generic usage model; **later** = WS proxying + `x-codex-turn-state` affinity. §20 backup + §21.4 clock-align move out of Phase 1.
 
 ## 1. Goal & scope
 
@@ -293,9 +293,10 @@ A live observability view in the admin UI, backed by the proxy's per-request rec
 
 Zero-to-running should be one step; setup is guided and idempotent.
 
-- **`poolgate init`** (CLI): creates the config dir + data dir, generates the **master key** into the OS keychain (fallback `master.key`, `0600`), runs SQLite **schema migrations**, writes a default `config.yaml` (loopback defaults), and prints a **short-TTL, single-use admin bootstrap URL/token** (never written to durable logs — see §0 fixes) to register the first passkey. Idempotent — safe to re-run; missing pieces are filled in.
+- **`poolgate init`** (CLI): creates the config dir + data dir, generates the **master key** into the OS keychain (fallback `master.key`, `0600`), runs SQLite **schema migrations**, writes a default `config.yaml` (loopback defaults), and prints a **short-TTL, single-use admin bootstrap URL/token** (never written to durable logs — see §0 fixes) to register the first passkey. **`init` does NOT read or import `~/.codex/auth.json`** — no account is imported automatically. Idempotent — safe to re-run; missing pieces are filled in.
+- **Account import is always explicit (never automatic).** Importing an account is a deliberate user action — `poolgate import <path>` (CLI, defaults to `~/.codex/auth.json` only when a path is given, never scanned implicitly) or an **"Import account"** button in the admin UI. Neither `init` nor first launch ever imports on its own.
 - **Auto-migrate on startup:** every launch runs pending DB migrations, so upgrades need no manual DB steps.
-- **Web first-run wizard:** if no passkey is registered, the admin UI opens a setup wizard — register first passkey (QR or platform), set `external_origin`/`rp_id`, import the first account(s), and create a starter policy + endpoint.
+- **Web first-run wizard:** if no passkey is registered, the admin UI opens a setup wizard — register first passkey (QR or platform), set `external_origin`/`rp_id`, then **offer** (not auto-run) account import + creating a starter policy + endpoint; import happens only on the user's explicit click.
 - **Docker/headless:** env-var-driven init (`POOLGATE_*`), data on a mounted volume; the short-TTL single-use bootstrap token is surfaced once in container stdout (rotate/re-issue via `reset-auth` if exposed).
 
 ## 18. Distribution, packaging & release automation
