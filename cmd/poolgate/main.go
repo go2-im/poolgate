@@ -21,10 +21,14 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
+	"github.com/go2-im/poolgate/internal/admin"
+	"github.com/go2-im/poolgate/internal/adminauth"
 	"github.com/go2-im/poolgate/internal/authimport"
 	"github.com/go2-im/poolgate/internal/config"
 	"github.com/go2-im/poolgate/internal/crypto"
@@ -34,6 +38,7 @@ import (
 	"github.com/go2-im/poolgate/internal/oauth"
 	"github.com/go2-im/poolgate/internal/store"
 	usagepkg "github.com/go2-im/poolgate/internal/usage"
+	"github.com/go2-im/poolgate/internal/webauthnsvc"
 )
 
 // errUsage is a sentinel returned by run for a usage error (unknown/missing
@@ -57,7 +62,10 @@ const (
 )
 
 func main() {
-	ctx := context.Background()
+	// SIGTERM / Ctrl-C cancels the root context so `serve` drains and shuts down
+	// both listeners gracefully (DESIGN.md §21.2).
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	err := run(ctx, os.Args[1:], os.Stdout, os.Stderr)
 	switch {
 	case err == nil:
@@ -96,6 +104,11 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 			fmt.Fprintf(stderr, "poolgate %s: %v\n", cmd, err)
 			return err
 		}
+	case "admin":
+		if err := cmdAdmin(rest, stdout, stderr); err != nil {
+			fmt.Fprintf(stderr, "poolgate %s: %v\n", cmd, err)
+			return err
+		}
 	case "-h", "--help", "help":
 		usage(stderr)
 		return nil
@@ -114,7 +127,9 @@ usage:
   poolgate init                 initialize data dir, master key, and DB
   poolgate import <auth.json>   import a Codex account (explicit, never automatic)
                                 [--strategy fallback|best-quota|load-balance]
-  poolgate serve                start the proxy listener + health scheduler
+  poolgate serve                start the proxy + admin listeners + health scheduler
+  poolgate admin reset-auth     wipe all passkeys/recovery codes/sessions and
+                                print a fresh single-use bootstrap token
 
 environment:
   POOLGATE_DATA_DIR   override the data directory (default: `+config.DefaultDataDir+`)
@@ -187,19 +202,86 @@ func cmdInit(_ []string, stdout io.Writer) error {
 		return err
 	}
 
-	token, err := randToken("pgbt")
+	// Issue a real short-TTL single-use bootstrap token via the same path
+	// `admin reset-auth` uses (DESIGN.md §16 / §17). The plaintext is printed
+	// once below and never written to durable logs; only its hash is persisted.
+	mgr, err := newAdminManager(st)
 	if err != nil {
 		return err
 	}
-	const bootstrapTTL = 15 * time.Minute
+	token, bt, err := mgr.IssueBootstrapToken(context.Background())
+	if err != nil {
+		return err
+	}
+	ttl := time.Until(bt.ExpiresAt).Round(time.Second)
 
 	fmt.Fprintf(stdout, "poolgate initialized.\n")
 	fmt.Fprintf(stdout, "  data dir:       %s\n", cfg.DataDir)
 	fmt.Fprintf(stdout, "  schema version: %d\n", ver)
 	fmt.Fprintf(stdout, "  proxy bind:     %s:%d\n", cfg.Server.Proxy.Host, cfg.Server.Proxy.Port)
 	fmt.Fprintf(stdout, "\nBootstrap token (single-use, expires in %s — not written to logs):\n  %s\n",
-		bootstrapTTL, token)
+		ttl, token)
 	fmt.Fprintf(stdout, "\nNext: `poolgate import <auth.json>` to add an account, then `poolgate serve`.\n")
+	return nil
+}
+
+// newAdminManager builds the admin-auth manager over the store. Both `init` and
+// `admin reset-auth` route bootstrap-token issuance through this single path so
+// the token is always persisted (hashed) and consumable (DESIGN.md §16 / §17).
+func newAdminManager(st *store.Store) (*adminauth.Manager, error) {
+	return adminauth.New(st)
+}
+
+// cmdAdmin dispatches the `poolgate admin <subcommand>` group. Currently only
+// `reset-auth` (the local lockout escape hatch, DESIGN.md §16) is implemented.
+func cmdAdmin(args []string, stdout, stderr io.Writer) error {
+	if len(args) < 1 {
+		fmt.Fprint(stderr, "usage: poolgate admin reset-auth\n")
+		return errUsage
+	}
+	sub, rest := args[0], args[1:]
+	switch sub {
+	case "reset-auth":
+		return cmdAdminResetAuth(rest, stdout)
+	default:
+		fmt.Fprintf(stderr, "poolgate admin: unknown subcommand %q\n\nusage: poolgate admin reset-auth\n", sub)
+		return errUsage
+	}
+}
+
+// cmdAdminResetAuth performs a full admin-login reset: it removes all passkeys,
+// invalidates recovery codes, revokes all sessions, clears stale bootstrap
+// tokens, and prints a fresh short-TTL single-use bootstrap token to stdout
+// (never to durable logs — DESIGN.md §16 / §0 fixes).
+func cmdAdminResetAuth(_ []string, stdout io.Writer) error {
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	st, err := openStore(cfg)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	mgr, err := newAdminManager(st)
+	if err != nil {
+		return err
+	}
+	token, sum, err := mgr.ResetAuth(context.Background())
+	if err != nil {
+		return err
+	}
+	ttl := time.Until(sum.BootstrapExpiresAt).Round(time.Second)
+
+	fmt.Fprintf(stdout, "admin auth reset.\n")
+	fmt.Fprintf(stdout, "  passkeys removed:         %d\n", sum.PasskeysRemoved)
+	fmt.Fprintf(stdout, "  recovery codes removed:   %d\n", sum.RecoveryCodesRemoved)
+	fmt.Fprintf(stdout, "  sessions revoked:         %d\n", sum.SessionsRevoked)
+	fmt.Fprintf(stdout, "  bootstrap tokens cleared: %d\n", sum.BootstrapTokensCleared)
+	fmt.Fprintf(stdout, "\nBootstrap token (single-use, expires in %s — not written to logs):\n  %s\n",
+		ttl, token)
+	fmt.Fprintf(stdout, "\nRegister a new passkey with this token, then it is consumed.\n")
 	return nil
 }
 
@@ -312,9 +394,9 @@ func validStrategy(s model.Strategy) bool {
 	}
 }
 
-// cmdServe starts the proxy listener with the translation gateway and the health
-// scheduler loop. It blocks until ctx is cancelled (graceful shutdown) or the
-// server fails.
+// cmdServe starts BOTH listeners — the proxy (translation gateway) and the
+// loopback admin API — plus the health scheduler loop. It blocks until ctx is
+// cancelled (SIGTERM → graceful shutdown of both) or a listener fails.
 func cmdServe(ctx context.Context, _ []string, stdout io.Writer) error {
 	cfg, err := loadConfig()
 	if err != nil {
@@ -336,8 +418,16 @@ func cmdServe(ctx context.Context, _ []string, stdout io.Writer) error {
 
 	gw := gateway.New(st, cfg, gateway.WithLogger(logger), gateway.WithHealth(engine))
 
+	// Admin API handler (loopback listener), wired with the same store so the
+	// bootstrap token issued by `init` / `admin reset-auth` registers the first
+	// passkey through /admin/register/* end-to-end (DESIGN.md §3 / §16 / §17).
+	adminHandler, err := buildAdminHandler(cfg, st, logger)
+	if err != nil {
+		return err
+	}
+
 	// Thin scheduler goroutine: engine.Run ticks with the real clock and returns
-	// ctx.Err() on cancellation (graceful shutdown alongside the proxy).
+	// ctx.Err() on cancellation (graceful shutdown alongside the listeners).
 	go func() {
 		if err := engine.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			logger.Warn("health scheduler stopped", slog.Any("err", err))
@@ -345,21 +435,53 @@ func cmdServe(ctx context.Context, _ []string, stdout io.Writer) error {
 	}()
 
 	logger.Info("health scheduler started", slog.String("probe_mode", cfg.HealthProbeMode))
-	return serveGateway(ctx, cfg, gw, logger, nil)
+	return serveBoth(ctx, cfg, gw, adminHandler, logger, nil, nil)
 }
 
-// newHealthEngine builds the health probe engine. The zero-spend auth-check is
-// always wired; small-live-requests are opt-in via probeMode == "allow-live"
-// (bounded by the per-account daily budget in the engine).
-func newHealthEngine(st *store.Store, refresher *oauth.Refresher, probeMode string, logger *slog.Logger) *health.Engine {
-	opts := []health.Option{
-		health.WithLogger(logger),
-		health.WithAuthProbe(health.NewModelsAuthChecker()),
+// buildAdminHandler constructs the loopback admin API handler: the admin-auth
+// manager (sessions / CSRF / recovery / bootstrap tokens), the WebAuthn service
+// (RP resolved once from static admin config, gated by that manager as its
+// authorizer), and the admin HTTP server that mounts them. It returns the fully
+// middleware-wrapped handler (strict security headers + CSP + same-origin CORS).
+func buildAdminHandler(cfg model.Config, st *store.Store, logger *slog.Logger) (http.Handler, error) {
+	mgr, err := adminauth.New(st)
+	if err != nil {
+		return nil, fmt.Errorf("admin auth: %w", err)
 	}
-	if probeMode == "allow-live" {
-		opts = append(opts, health.WithAllowLive(true), health.WithLiveProbe(health.NewLiveRequester()))
+	wa, err := webauthnsvc.New(cfg, st, webauthnsvc.WithAuthorizer(mgr))
+	if err != nil {
+		return nil, fmt.Errorf("webauthn: %w", err)
 	}
-	return health.New(st, usagepkg.New(), refresher, opts...)
+	srv, err := admin.New(cfg, st, mgr, wa)
+	if err != nil {
+		return nil, fmt.Errorf("admin api: %w", err)
+	}
+	logger.Info("admin API configured",
+		slog.String("origin", srv.Origin()), slog.String("rp_id", wa.RPID()))
+	return srv.Handler(), nil
+}
+
+// serveBoth runs the proxy and admin listeners concurrently and blocks until ctx
+// is cancelled (both shut down gracefully) or either listener fails to serve
+// (the peer is then cancelled too and the first error is returned). onReady
+// callbacks, when non-nil, receive each bound address (used by tests to discover
+// ephemeral ports).
+func serveBoth(ctx context.Context, cfg model.Config, gw *gateway.Gateway, adminHandler http.Handler, logger *slog.Logger, proxyReady, adminReady func(addr string)) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	errCh := make(chan error, 2)
+	go func() { errCh <- serveGateway(ctx, cfg, gw, logger, proxyReady) }()
+	go func() { errCh <- serveAdmin(ctx, cfg, adminHandler, logger, adminReady) }()
+
+	var firstErr error
+	for i := 0; i < 2; i++ {
+		if err := <-errCh; err != nil && firstErr == nil {
+			firstErr = err
+			cancel() // a bind/serve failure on one listener brings the peer down too
+		}
+	}
+	return firstErr
 }
 
 // serveGateway binds the proxy listener and serves the gateway routes until ctx
@@ -367,20 +489,47 @@ func newHealthEngine(st *store.Store, refresher *oauth.Refresher, probeMode stri
 // once the listener is open (used by tests to discover the ephemeral port).
 func serveGateway(ctx context.Context, cfg model.Config, gw *gateway.Gateway, logger *slog.Logger, onReady func(addr string)) error {
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Proxy.Host, cfg.Server.Proxy.Port)
+	return serveListener(ctx, addr, gw.Routes(), func(bound string) {
+		logger.Info("proxy listening", slog.String("addr", bound))
+		if cfg.Server.Proxy.Host != "127.0.0.1" && cfg.Server.Proxy.Host != "localhost" {
+			logger.Info("proxy bound to a non-loopback address; front it with a reverse proxy",
+				slog.String("host", cfg.Server.Proxy.Host))
+		}
+		if onReady != nil {
+			onReady(bound)
+		}
+	})
+}
+
+// serveAdmin binds the admin listener and serves the admin API handler until ctx
+// is cancelled. The admin surface is expected to stay loopback (DESIGN.md §3); a
+// non-loopback bind is a warning, not a refusal.
+func serveAdmin(ctx context.Context, cfg model.Config, handler http.Handler, logger *slog.Logger, onReady func(addr string)) error {
+	addr := fmt.Sprintf("%s:%d", cfg.Server.Admin.Host, cfg.Server.Admin.Port)
+	return serveListener(ctx, addr, handler, func(bound string) {
+		logger.Info("admin listening (loopback)", slog.String("addr", bound))
+		if cfg.Server.Admin.Host != "127.0.0.1" && cfg.Server.Admin.Host != "localhost" {
+			logger.Warn("admin bound to a non-loopback address; keep the admin surface private",
+				slog.String("host", cfg.Server.Admin.Host))
+		}
+		if onReady != nil {
+			onReady(bound)
+		}
+	})
+}
+
+// serveListener binds addr and serves handler with a bounded read-header timeout
+// (no write timeout — SSE streams are long-lived), invoking onReady with the
+// bound address once the socket is open, and shutting the server down gracefully
+// (5s drain deadline) when ctx is cancelled.
+func serveListener(ctx context.Context, addr string, handler http.Handler, onReady func(bound string)) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
-
 	srv := &http.Server{
-		Handler:           gw.Routes(),
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
-		// No WriteTimeout: SSE streams are long-lived.
-	}
-	logger.Info("proxy listening", slog.String("addr", ln.Addr().String()))
-	if cfg.Server.Proxy.Host != "127.0.0.1" && cfg.Server.Proxy.Host != "localhost" {
-		logger.Info("proxy bound to a non-loopback address; front it with a reverse proxy",
-			slog.String("host", cfg.Server.Proxy.Host))
 	}
 	if onReady != nil {
 		onReady(ln.Addr().String())
@@ -400,13 +549,18 @@ func serveGateway(ctx context.Context, cfg model.Config, gw *gateway.Gateway, lo
 	return nil
 }
 
-// randToken returns a random token with the given prefix.
-func randToken(prefix string) (string, error) {
-	var b [24]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "", err
+// newHealthEngine builds the health probe engine. The zero-spend auth-check is
+// always wired; small-live-requests are opt-in via probeMode == "allow-live"
+// (bounded by the per-account daily budget in the engine).
+func newHealthEngine(st *store.Store, refresher *oauth.Refresher, probeMode string, logger *slog.Logger) *health.Engine {
+	opts := []health.Option{
+		health.WithLogger(logger),
+		health.WithAuthProbe(health.NewModelsAuthChecker()),
 	}
-	return prefix + "_" + hex.EncodeToString(b[:]), nil
+	if probeMode == "allow-live" {
+		opts = append(opts, health.WithAllowLive(true), health.WithLiveProbe(health.NewLiveRequester()))
+	}
+	return health.New(st, usagepkg.New(), refresher, opts...)
 }
 
 // randSKKey returns a fresh inbound proxy key in the sk- form.

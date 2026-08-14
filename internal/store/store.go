@@ -32,6 +32,11 @@ const DBFileName = "poolgate.db"
 // ErrNotFound is returned when a requested row does not exist.
 var ErrNotFound = errors.New("store: not found")
 
+// ErrAlreadyUsed is returned by the single-use consume methods
+// (ConsumeRecoveryCode / ConsumeBootstrapToken) when the row exists but has
+// already been consumed (used_at is set).
+var ErrAlreadyUsed = errors.New("store: already used")
+
 // memberTypeAccount / memberTypeGroup are the polymorphic member kinds in
 // group_members. v1 is flat and only uses account members, but the column is
 // kept so nesting can land later without a schema break (DESIGN.md §0 D8).
@@ -167,6 +172,47 @@ ALTER TABLE accounts ADD COLUMN next_probe_at         TEXT;
 ALTER TABLE accounts ADD COLUMN consecutive_failures  INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE accounts ADD COLUMN backoff_level         INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE accounts ADD COLUMN concurrency_cap       INTEGER NOT NULL DEFAULT 0;
+`,
+	},
+	{
+		// v3 — admin-auth persistence (DESIGN.md §16 / §22): registered passkeys,
+		// login sessions, one-time recovery codes, and short-TTL single-use
+		// bootstrap registration tokens. Recovery codes and bootstrap tokens store
+		// only a SHA-256 hash of the secret, never the plaintext. Append-only:
+		// v1/v2 above are never edited.
+		version: 3,
+		sql: `
+CREATE TABLE webauthn_credentials (
+	id          TEXT PRIMARY KEY,
+	cred_id     BLOB NOT NULL UNIQUE,
+	public_key  BLOB NOT NULL,
+	sign_count  INTEGER NOT NULL DEFAULT 0,
+	aaguid      BLOB,
+	transports  TEXT NOT NULL DEFAULT '[]',
+	label       TEXT NOT NULL DEFAULT '',
+	created_at  TEXT NOT NULL
+);
+
+CREATE TABLE sessions (
+	id           TEXT PRIMARY KEY,
+	created_at   TEXT NOT NULL,
+	last_seen_at TEXT NOT NULL,
+	expires_at   TEXT NOT NULL
+);
+CREATE INDEX idx_sessions_expires ON sessions(expires_at);
+
+CREATE TABLE recovery_codes (
+	id      TEXT PRIMARY KEY,
+	hash    TEXT NOT NULL,
+	used_at TEXT
+);
+
+CREATE TABLE bootstrap_tokens (
+	id         TEXT PRIMARY KEY,
+	token_hash TEXT NOT NULL,
+	expires_at TEXT NOT NULL,
+	used_at    TEXT
+);
 `,
 	},
 }

@@ -151,7 +151,7 @@ func TestCmdServeAllowLive(t *testing.T) {
 	t.Setenv(envDataDir, dataDir)
 	t.Setenv(envMasterKey, "")
 	if err := os.WriteFile(filepath.Join(dataDir, configFile),
-		[]byte("server:\n  proxy:\n    host: 127.0.0.1\n    port: 0\nhealth_probe_mode: allow-live\n"), 0o600); err != nil {
+		[]byte("server:\n  proxy:\n    host: 127.0.0.1\n    port: 0\n  admin:\n    host: 127.0.0.1\n    port: 0\nhealth_probe_mode: allow-live\n"), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
 	if err := cmdInit(nil, io.Discard); err != nil {

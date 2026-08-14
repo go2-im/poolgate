@@ -175,6 +175,58 @@ type AccountTiming struct {
 	ConcurrencyCap      int       `json:"concurrency_cap"`
 }
 
+// Session is a persisted admin login session (DESIGN.md §16 / §22.3). It carries
+// only timestamps: the opaque session id is the bearer credential (stored in a
+// cookie by the admin HTTP layer in a later stage). Lifetime is bounded by
+// ExpiresAt (absolute) and by an idle timeout measured from LastSeenAt.
+type Session struct {
+	ID         string    `json:"id"`
+	CreatedAt  time.Time `json:"created_at"`
+	LastSeenAt time.Time `json:"last_seen_at"`
+	ExpiresAt  time.Time `json:"expires_at"`
+}
+
+// RecoveryCode is a one-time admin recovery code (DESIGN.md §16). Only the
+// SHA-256 hash of the code is persisted; the plaintext is shown once at
+// generation. UsedAt is the zero time until the code is consumed.
+type RecoveryCode struct {
+	ID     string    `json:"id"`
+	Hash   string    `json:"hash"`
+	UsedAt time.Time `json:"used_at"`
+}
+
+// Used reports whether the recovery code has already been consumed.
+func (c RecoveryCode) Used() bool { return !c.UsedAt.IsZero() }
+
+// BootstrapToken is a short-TTL, single-use admin bootstrap registration token
+// (DESIGN.md §16 / §17 / §0 fixes). Only the SHA-256 hash is persisted; the
+// plaintext is printed once to the local console and never to durable logs.
+// UsedAt is the zero time until the token is consumed.
+type BootstrapToken struct {
+	ID        string    `json:"id"`
+	TokenHash string    `json:"token_hash"`
+	ExpiresAt time.Time `json:"expires_at"`
+	UsedAt    time.Time `json:"used_at"`
+}
+
+// Used reports whether the bootstrap token has already been consumed.
+func (t BootstrapToken) Used() bool { return !t.UsedAt.IsZero() }
+
+// WebAuthnCredential is a registered passkey (DESIGN.md §8 / §16). CredID and
+// PublicKey are opaque WebAuthn byte blobs; SignCount guards against cloned
+// authenticators; Transports is the authenticator's advertised transport list.
+// The WebAuthn ceremony logic lands in a later stage — this stage only persists.
+type WebAuthnCredential struct {
+	ID         string    `json:"id"`
+	CredID     []byte    `json:"cred_id"`
+	PublicKey  []byte    `json:"public_key"`
+	SignCount  uint32    `json:"sign_count"`
+	AAGUID     []byte    `json:"aaguid"`
+	Transports []string  `json:"transports"`
+	Label      string    `json:"label"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
 // Config is the runtime configuration (see internal/config for loading/defaults).
 type Config struct {
 	Server            ServerConfig `yaml:"server" json:"server"`
@@ -197,8 +249,18 @@ type ServerConfig struct {
 	Proxy ListenConfig `yaml:"proxy" json:"proxy"`
 }
 
-// ListenConfig is a host:port bind pair.
+// ListenConfig is a host:port bind pair. For the admin listener it also carries
+// the static WebAuthn RP inputs (DESIGN.md §16 / §0 fixes): the RP origin and RP
+// ID are resolved ONCE at startup from these fields and never from per-request
+// forwarded headers. Both are optional and meaningful only on the admin
+// listener; when empty the WebAuthn service derives them from Host:Port.
 type ListenConfig struct {
 	Host string `yaml:"host" json:"host"`
 	Port int    `yaml:"port" json:"port"`
+	// ExternalOrigin is the browser-facing origin (scheme://host[:port]) used as
+	// the WebAuthn RP origin for the admin listener. Optional.
+	ExternalOrigin string `yaml:"external_origin,omitempty" json:"external_origin,omitempty"`
+	// RPID is the WebAuthn Relying Party ID (an effective domain) for the admin
+	// listener. Optional; when empty it is derived from the origin's host.
+	RPID string `yaml:"rp_id,omitempty" json:"rp_id,omitempty"`
 }

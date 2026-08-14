@@ -1,0 +1,310 @@
+// Package admin is poolgate's loopback admin HTTP API (DESIGN.md §3 / §16 /
+// §22). It is a JSON-only backend — there is no server-rendered UI here; a React
+// frontend (later phase) is served as static assets and talks to these routes.
+// The admin listener is separate from the proxy listener and is expected to bind
+// loopback only.
+//
+// Everything the package needs is expressed as small interfaces (Store,
+// SessionManager, Ceremonies) so the HTTP surface is unit-tested against fakes
+// with an injectable clock; *store.Store, *adminauth.Manager and
+// *webauthnsvc.Service satisfy them in production (see admin_wiring_test.go).
+//
+// Cross-cutting behavior lives in middleware (see middleware.go): strict
+// security headers + CSP on every response, same-origin CORS, a session-auth
+// guard on everything except the auth/bootstrap endpoints, a CSRF check on
+// state-changing methods, and anti-brute-force rate-limit + lockout on the
+// login / recovery / bootstrap paths.
+package admin
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/go-webauthn/webauthn/protocol"
+	"github.com/go-webauthn/webauthn/webauthn"
+
+	"github.com/go2-im/poolgate/internal/model"
+	"github.com/go2-im/poolgate/internal/webauthnsvc"
+)
+
+// SessionCookieName is the admin session cookie. It is HttpOnly + SameSite=Strict
+// and Secure whenever the resolved admin origin is https.
+const SessionCookieName = "pg_admin_session"
+
+// CSRFHeaderName is the header carrying the CSRF token on state-changing requests.
+const CSRFHeaderName = "X-CSRF-Token"
+
+// Store is the persistence surface the admin API needs. *store.Store satisfies it.
+type Store interface {
+	// accounts
+	InsertAccount(ctx context.Context, a model.Account) (model.Account, error)
+	GetAccount(ctx context.Context, id string) (model.Account, error)
+	ListAccounts(ctx context.Context) ([]model.Account, error)
+	DeleteAccount(ctx context.Context, id string) error
+	// api keys
+	InsertApiKey(ctx context.Context, k model.ApiKey) (model.ApiKey, error)
+	ListApiKeys(ctx context.Context) ([]model.ApiKey, error)
+	GetApiKeyByID(ctx context.Context, id string) (model.ApiKey, error)
+	DeleteApiKey(ctx context.Context, id string) error
+	// endpoints
+	InsertEndpoint(ctx context.Context, e model.Endpoint) (model.Endpoint, error)
+	GetEndpoint(ctx context.Context, name string) (model.Endpoint, error)
+	ListEndpoints(ctx context.Context) ([]model.Endpoint, error)
+	DeleteEndpoint(ctx context.Context, name string) error
+	// policy groups
+	InsertPolicyGroup(ctx context.Context, g model.PolicyGroup) (model.PolicyGroup, error)
+	GetPolicyGroup(ctx context.Context, id string) (model.PolicyGroup, error)
+	ListPolicyGroups(ctx context.Context) ([]model.PolicyGroup, error)
+	UpdatePolicyGroup(ctx context.Context, g model.PolicyGroup) error
+	DeletePolicyGroup(ctx context.Context, id string) error
+	// usage / health / status
+	GetLatestUsage(ctx context.Context, accountID string) (model.UsageSnapshot, error)
+	ListHealthChecks(ctx context.Context, accountID string, limit int) ([]model.HealthCheck, error)
+	SchemaVersion(ctx context.Context) (int, error)
+}
+
+// SessionManager is the admin-auth surface for sessions, CSRF and recovery
+// codes. *adminauth.Manager satisfies it.
+type SessionManager interface {
+	CreateSession(ctx context.Context) (model.Session, error)
+	ValidateSession(ctx context.Context, id string) (model.Session, error)
+	RotateSession(ctx context.Context, oldID string) (model.Session, error)
+	RevokeSession(ctx context.Context, id string) error
+	RevokeAllSessions(ctx context.Context) (int64, error)
+	IssueCSRF(sessionID string) (string, error)
+	VerifyCSRF(sessionID, token string) bool
+	VerifyRecoveryCode(ctx context.Context, code string) error
+	GenerateRecoveryCodes(ctx context.Context, n int) ([]string, error)
+}
+
+// Ceremonies is the WebAuthn ceremony surface. *webauthnsvc.Service satisfies it.
+type Ceremonies interface {
+	BeginRegistration(ctx context.Context, gate webauthnsvc.RegisterGate) (*protocol.CredentialCreation, string, error)
+	FinishRegistration(ctx context.Context, gate webauthnsvc.RegisterGate, challengeID string, body []byte) (model.WebAuthnCredential, error)
+	BeginLogin(ctx context.Context) (*protocol.CredentialAssertion, string, error)
+	FinishLogin(ctx context.Context, challengeID string, body []byte) (webauthn.User, error)
+}
+
+// Server wires the admin API. Construct with New; the zero value is not usable.
+type Server struct {
+	store    Store
+	sessions SessionManager
+	webauthn Ceremonies
+
+	origin   string // canonical admin origin (scheme://host[:port]) for CORS
+	secure   bool   // set the Secure cookie flag (origin is https)
+	now      func() time.Time
+	limiter  *limiter
+	recovery int // number of recovery codes minted with the first passkey
+
+	// anti-brute-force tunables, applied to the limiter in New.
+	limiterMaxFailures int
+	limiterWindow      time.Duration
+	limiterLockout     time.Duration
+}
+
+// Option customizes a Server.
+type Option func(*Server)
+
+// WithClock injects the time source (default time.Now, UTC), shared with the
+// rate-limiter so lockouts are deterministic under test.
+func WithClock(now func() time.Time) Option {
+	return func(s *Server) {
+		if now != nil {
+			s.now = now
+		}
+	}
+}
+
+// WithRateLimit overrides the anti-brute-force parameters (max failures within
+// the window before a lockout, and the lockout duration).
+func WithRateLimit(maxFailures int, window, lockout time.Duration) Option {
+	return func(s *Server) {
+		if maxFailures > 0 {
+			s.limiterMaxFailures = maxFailures
+		}
+		if window > 0 {
+			s.limiterWindow = window
+		}
+		if lockout > 0 {
+			s.limiterLockout = lockout
+		}
+	}
+}
+
+// WithRecoveryCodeCount overrides how many one-time recovery codes are minted and
+// returned (once) when the first passkey is registered. 0 keeps the default.
+func WithRecoveryCodeCount(n int) Option {
+	return func(s *Server) {
+		if n >= 0 {
+			s.recovery = n
+		}
+	}
+}
+
+// New builds a Server. All three collaborators must be non-nil. The admin origin
+// is resolved once from the static admin listener config (never per-request) and
+// used for same-origin CORS and the cookie Secure flag.
+func New(cfg model.Config, st Store, sessions SessionManager, wa Ceremonies, opts ...Option) (*Server, error) {
+	if st == nil || sessions == nil || wa == nil {
+		return nil, errors.New("admin: nil dependency")
+	}
+	origin, secure, err := resolveOrigin(cfg.Server.Admin)
+	if err != nil {
+		return nil, err
+	}
+	s := &Server{
+		store:    st,
+		sessions: sessions,
+		webauthn: wa,
+		origin:   origin,
+		secure:   secure,
+		now:      func() time.Time { return time.Now().UTC() },
+		recovery: defaultRecoveryCodes,
+	}
+	s.limiterMaxFailures = defaultMaxFailures
+	s.limiterWindow = defaultBruteWindow
+	s.limiterLockout = defaultLockout
+	for _, opt := range opts {
+		opt(s)
+	}
+	s.limiter = newLimiter(s.limiterMaxFailures, s.limiterWindow, s.limiterLockout, s.now)
+	return s, nil
+}
+
+// Origin returns the resolved canonical admin origin.
+func (s *Server) Origin() string { return s.origin }
+
+// Handler builds the admin router with all middleware applied. The returned
+// handler sets strict security headers + CSP on every response and enforces
+// same-origin CORS around the route mux.
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+	s.routes(mux)
+	return securityHeaders(s.cors(mux))
+}
+
+// routes registers every admin route on mux. Public auth/bootstrap endpoints are
+// registered directly; resource endpoints are wrapped by the session guard
+// (which also enforces CSRF on state-changing methods).
+func (s *Server) routes(mux *http.ServeMux) {
+	// ---- auth / bootstrap (public: no session guard) ----
+	mux.HandleFunc("POST /admin/register/begin", s.brute("register", s.handleRegisterBegin))
+	mux.HandleFunc("POST /admin/register/finish", s.brute("register", s.handleRegisterFinish))
+	mux.HandleFunc("POST /admin/login/begin", s.handleLoginBegin)
+	mux.HandleFunc("POST /admin/login/finish", s.brute("login", s.handleLoginFinish))
+	mux.HandleFunc("POST /admin/login/recovery", s.brute("recovery", s.handleLoginRecovery))
+
+	// ---- session-scoped auth actions (guarded) ----
+	mux.HandleFunc("POST /admin/logout", s.guard(s.handleLogout))
+	mux.HandleFunc("POST /admin/sessions/revoke-all", s.guard(s.handleRevokeAll))
+	mux.HandleFunc("GET /admin/csrf", s.guard(s.handleCSRF))
+	mux.HandleFunc("GET /admin/me", s.guard(s.handleMe))
+
+	// ---- resources (guarded) ----
+	mux.HandleFunc("POST /admin/api/accounts/import", s.guard(s.handleAccountImport))
+	mux.HandleFunc("GET /admin/api/accounts", s.guard(s.handleAccountsList))
+	mux.HandleFunc("GET /admin/api/accounts/{id}", s.guard(s.handleAccountGet))
+	mux.HandleFunc("DELETE /admin/api/accounts/{id}", s.guard(s.handleAccountDelete))
+
+	mux.HandleFunc("GET /admin/api/api_keys", s.guard(s.handleApiKeysList))
+	mux.HandleFunc("POST /admin/api/api_keys", s.guard(s.handleApiKeyCreate))
+	mux.HandleFunc("DELETE /admin/api/api_keys/{id}", s.guard(s.handleApiKeyDelete))
+
+	mux.HandleFunc("GET /admin/api/endpoints", s.guard(s.handleEndpointsList))
+	mux.HandleFunc("POST /admin/api/endpoints", s.guard(s.handleEndpointCreate))
+	mux.HandleFunc("DELETE /admin/api/endpoints/{name}", s.guard(s.handleEndpointDelete))
+
+	mux.HandleFunc("GET /admin/api/policy_groups", s.guard(s.handlePolicyGroupsList))
+	mux.HandleFunc("POST /admin/api/policy_groups", s.guard(s.handlePolicyGroupCreate))
+	mux.HandleFunc("PATCH /admin/api/policy_groups/{id}", s.guard(s.handlePolicyGroupPatch))
+	mux.HandleFunc("DELETE /admin/api/policy_groups/{id}", s.guard(s.handlePolicyGroupDelete))
+
+	mux.HandleFunc("GET /admin/api/usage", s.guard(s.handleUsage))
+	mux.HandleFunc("GET /admin/api/health", s.guard(s.handleHealth))
+	mux.HandleFunc("GET /admin/api/status", s.guard(s.handleStatus))
+}
+
+// ---- origin resolution ----------------------------------------------------
+
+// resolveOrigin derives the canonical admin origin from the static admin
+// listener config: external_origin wins; otherwise a loopback http origin is
+// synthesized from Host:Port. It never consults request headers (DESIGN.md §0
+// fixes). secure reports whether the scheme is https (drives the cookie flag).
+func resolveOrigin(admin model.ListenConfig) (origin string, secure bool, err error) {
+	origin = strings.TrimSpace(admin.ExternalOrigin)
+	if origin == "" {
+		host := strings.TrimSpace(admin.Host)
+		if host == "" {
+			host = "127.0.0.1"
+		}
+		port := admin.Port
+		if port == 0 {
+			port = 7070
+		}
+		origin = fmt.Sprintf("http://%s:%d", host, port)
+	}
+	u, perr := url.Parse(origin)
+	if perr != nil || u.Scheme == "" || u.Host == "" {
+		return "", false, fmt.Errorf("admin: invalid admin origin %q", origin)
+	}
+	return origin, u.Scheme == "https", nil
+}
+
+// ---- JSON + error helpers -------------------------------------------------
+
+// apiError is poolgate's OpenAI-compatible error envelope (DESIGN.md §19.4).
+type apiError struct {
+	Message string `json:"message"`
+	Type    string `json:"type"`
+	Code    string `json:"code,omitempty"`
+	Param   string `json:"param,omitempty"`
+}
+
+const (
+	errUnauthorized = "poolgate_unauthorized"
+	errForbidden    = "poolgate_forbidden"
+	errNotFound     = "poolgate_not_found"
+	errBadRequest   = "poolgate_bad_request"
+	errConflict     = "poolgate_conflict"
+	errRateLimited  = "poolgate_rate_limited"
+	errInternal     = "poolgate_internal"
+)
+
+// writeJSON writes v as an indented JSON body with the given status.
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	if v == nil {
+		return
+	}
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(true)
+	_ = enc.Encode(v)
+}
+
+// writeErr writes the error envelope with the given status/type/message.
+func writeErr(w http.ResponseWriter, status int, typ, msg string) {
+	writeJSON(w, status, map[string]apiError{"error": {Message: msg, Type: typ}})
+}
+
+// decodeJSON strictly decodes the request body into dst, rejecting unknown
+// fields and trailing data. It caps the body to guard against abuse.
+func decodeJSON(r *http.Request, dst any) error {
+	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 1<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+	// Reject any trailing tokens after the first JSON value.
+	if dec.More() {
+		return errors.New("admin: unexpected trailing JSON")
+	}
+	return nil
+}
