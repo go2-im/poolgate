@@ -131,16 +131,17 @@ endpoints:
 - Reverse proxy: `net/http/httputil.ReverseProxy` (FlushInterval=-1 for SSE) or manual relay.
 - Frontend: **React** (Vite), built to static assets, embedded via `go:embed`.
 - Config: **YAML**.
+- Release/dist: **GoReleaser** (archives, Homebrew tap, Scoop, nfpm deb/rpm, Docker), **cosign** (keyless OIDC signing) + SLSA provenance, **Dependabot/Renovate** + `govulncheck` for dependency automation.
 
 ## 9. Build phases
 
-1. **Core:** `config`, `store` (SQLite + field encryption; encrypt/decrypt round-trip test), `oauth` (login/import/refresh, issuer pinned).
+1. **Core:** `config`, `store` (SQLite + field encryption; encrypt/decrypt round-trip test), `oauth` (login/import/refresh, issuer pinned). Plus **`poolgate init`** auto-provisioning + startup migrations (§17).
 2. **Policy + proxy:** `policy` engine (strategies + nesting + cycle check + health), `proxy` server (`/e/<ep>/v1`, sk- auth, SSE, egress allowlist), **trusted-proxy header handling + streaming pass-through for tunnels/reverse-proxies (§14)**, per-request logging with session/model/tokens (§15).
    - **`health`**: probe engine + account state machine (usage-poll / auth-check / small live request), adaptive per-state scheduling, auto-recovery, feeds `url-test`/`best-quota` (see §12).
 3. **Admin API + passkey:** WebAuthn register/login (bootstrap token, multiple passkeys, recovery codes, `admin reset-auth` CLI), session + CSRF, CRUD for accounts/groups/endpoints/keys. Accounts list API supports metadata (subscription type / region / tags), filter / search / sort / paginate in SQL (§13).
    - **`notify`**: channel CRUD (DingTalk / WeCom / custom webhook) + a "test" button; alert rules wired to policy/proxy events (see §11).
 4. **Web UI:** React pages (login, dashboard/usage, accounts w/ categorize·search·sort, policy groups w/ composition view, endpoints, keys, **real-time monitor** — live scrolling logs + charts filterable by session/api-key/model (§15), settings), `go:embed`. Admin server exposes an SSE/WS live-events stream.
-5. **Release:** cross-compiled single binary, SHA256SUMS + signature, SLSA provenance, SHA-pinned CI, no silent auto-update, `docs/BUILD.md`.
+5. **Release:** GoReleaser-driven — cross-compiled single binary, `SHA256SUMS` + cosign signature, SLSA provenance, Homebrew tap / Scoop / Docker / deb-rpm, verification-gated `install.sh`, SHA-pinned CI, Dependabot, no silent auto-update, `docs/BUILD.md` (§18).
 6. **Optional:** usage charts, account cooldown tuning, weighted load-balance.
 
 ## 10. Development model
@@ -252,4 +253,33 @@ A live observability view in the admin UI, backed by the proxy's per-request rec
 - **Passkey primary, no password.** Registration allows **platform** (Touch ID / Windows Hello), **cross-platform** (security keys), and **hybrid/caBLE** authenticators → the browser offers **QR-code sign-in with your phone**. Multiple passkeys can be registered (recommend a phone passkey + a hardware key backup).
 - **Recovery:** one-time recovery codes generated at setup (shown once).
 - **CLI full reset (always available locally):** `poolgate admin reset-auth` **completely resets admin login** — removes **all** registered passkeys, invalidates recovery codes and active sessions, and re-issues a one-time bootstrap registration token (printed to the local console). This is the guaranteed lockout escape hatch; it requires local shell access to the host (which already implies full control), never a network path.
+
+## 17. First-run initialization (auto-provisioning)
+
+Zero-to-running should be one step; setup is guided and idempotent.
+
+- **`poolgate init`** (CLI): creates the config dir + data dir, generates the **master key** into the OS keychain (fallback `master.key`, `0600`), runs SQLite **schema migrations**, writes a default `config.yaml` (loopback defaults), and prints a **one-time admin bootstrap URL/token** to register the first passkey. Idempotent — safe to re-run; missing pieces are filled in.
+- **Auto-migrate on startup:** every launch runs pending DB migrations, so upgrades need no manual DB steps.
+- **Web first-run wizard:** if no passkey is registered, the admin UI opens a setup wizard — register first passkey (QR or platform), set `external_origin`/`rp_id`, import the first account(s), and create a starter policy + endpoint.
+- **Docker/headless:** env-var-driven init (`POOLGATE_*`), data on a mounted volume; bootstrap token surfaced in container logs.
+
+## 18. Distribution, packaging & release automation
+
+Driven by **GoReleaser** + **GitHub Actions**; every channel ships verifiable artifacts.
+
+**Install channels (Homebrew primary):**
+
+- **Homebrew tap** — `brew install go2-im/tap/poolgate` (formula auto-updated on release; macOS + Linux).
+- **Scoop / winget** — Windows (optional).
+- **Docker image** — `ghcr.io/go2-im/poolgate` (self-host).
+- **deb/rpm** via `nfpm` — Linux servers (optional).
+- **One-line install script** — `install.sh` detects OS/arch, downloads the matching archive from the latest GitHub Release, **verifies `SHA256SUMS` + the cosign signature before installing** (never a blind `curl | sh`; Homebrew is still the recommended path). This directly addresses the audited "unverifiable binary / curl-pipe-sh" risk.
+
+**Release CI (`release.yml`, on tag `v*`):** GoReleaser cross-compiles (darwin/linux/windows × amd64/arm64), builds archives + `SHA256SUMS`, **signs with cosign (keyless via GitHub OIDC)**, emits **SLSA provenance / artifact attestations**, publishes the GitHub Release, updates the Homebrew tap, and pushes the Docker image. All third-party Actions are **SHA-pinned**, `permissions` least-privileged, `id-token: write` only where needed — no long-lived signing key or registry token in the job env.
+
+**CI (`ci.yml`, on PR/push):** `go build ./...`, `go vet`, `staticcheck`, unit tests, `govulncheck`, frontend build, and the suspicious-domain lint — all green required to merge.
+
+**Dependency automation:** **Dependabot** (or Renovate) for `gomod`, `github-actions`, and the frontend `npm` ecosystem — grouped, scheduled PRs, gated by `ci.yml` + `govulncheck`.
+
+**App self-update policy:** consistent with §Security — **no silent auto-update**. `poolgate` may *check* and report a newer version, but upgrading is an explicit `brew upgrade` / re-run of the verified installer.
 

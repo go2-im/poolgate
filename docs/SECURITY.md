@@ -12,6 +12,7 @@ poolgate is designed against a security audit of a comparable tool (a multi-acco
 - **Egress allowlist** — upstream + OAuth issuer pinned; `Authorization`-bearing requests to non-allowlisted hosts are refused.
 - **Logs carry no secrets** — no token/key material (not even prefixes) in logs; redaction middleware.
 - **No silent auto-update** — releases are signed + checksummed; any update is verified and user-confirmed.
+- **Verified install** — the one-line `install.sh` verifies `SHA256SUMS` + cosign signature before installing (no blind `curl | sh`); Homebrew is the recommended path. Release artifacts carry cosign signatures + SLSA provenance; dependencies are auto-updated (Dependabot/Renovate) and scanned (`govulncheck`).
 - **Notifications carry no secrets** — DingTalk / WeCom / custom-webhook alerts reference accounts by label/id only (never tokens, `sk-` keys, or PII); webhook URLs are HTTPS-only and validated; notification egress is separate from the credential-egress allowlist.
 - **Trusted-proxy parsing is strict** — `X-Forwarded-*` headers are honored only from configured `trusted_proxies` CIDRs; untrusted peers can't spoof client IP or host. poolgate never launches a tunnel itself.
 - **Tunnel/reverse-proxy exposure is deliberate** — behind cloudflared/ngrok/reverse-proxy the proxy is effectively public, gated by the `sk-` key; the admin listener should not be tunnel-exposed unless intended (and remains passkey-gated). Monitoring/live-log data contains no secrets.
