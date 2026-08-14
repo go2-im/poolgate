@@ -1,0 +1,142 @@
+// Package crypto provides field-level encryption for secret columns using
+// NaCl secretbox (XSalsa20-Poly1305). The master key is loaded from a keyfile
+// or an env var; if a keyfile path is given and absent, a fresh key is
+// generated and persisted 0600. OS-keychain sourcing is a later phase
+// (DESIGN.md §5 / §17).
+package crypto
+
+import (
+	"crypto/rand"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+
+	"golang.org/x/crypto/nacl/secretbox"
+)
+
+// KeySize is the secretbox master key length in bytes.
+const KeySize = 32
+
+const nonceSize = 24
+
+// ErrKeySize is returned when a supplied master key is not KeySize bytes.
+var ErrKeySize = fmt.Errorf("crypto: master key must be %d bytes", KeySize)
+
+// Cipher seals and opens secrets with a fixed 32-byte master key.
+type Cipher struct {
+	key [KeySize]byte
+}
+
+// New builds a Cipher from a raw key. The key must be exactly KeySize bytes.
+func New(key []byte) (*Cipher, error) {
+	if len(key) != KeySize {
+		return nil, ErrKeySize
+	}
+	c := &Cipher{}
+	copy(c.key[:], key)
+	return c, nil
+}
+
+// Seal encrypts plaintext and returns a base64 std-encoded string of
+// nonce||box. Each call uses a fresh random nonce.
+func (c *Cipher) Seal(plaintext string) (string, error) {
+	var nonce [nonceSize]byte
+	if _, err := io.ReadFull(rand.Reader, nonce[:]); err != nil {
+		return "", fmt.Errorf("crypto: read nonce: %w", err)
+	}
+	sealed := secretbox.Seal(nonce[:], []byte(plaintext), &nonce, &c.key)
+	return base64.StdEncoding.EncodeToString(sealed), nil
+}
+
+// Open reverses Seal: it decodes the base64 string and decrypts it.
+func (c *Cipher) Open(ciphertext string) (string, error) {
+	raw, err := base64.StdEncoding.DecodeString(ciphertext)
+	if err != nil {
+		return "", fmt.Errorf("crypto: decode: %w", err)
+	}
+	if len(raw) < nonceSize {
+		return "", errors.New("crypto: ciphertext too short")
+	}
+	var nonce [nonceSize]byte
+	copy(nonce[:], raw[:nonceSize])
+	opened, ok := secretbox.Open(nil, raw[nonceSize:], &nonce, &c.key)
+	if !ok {
+		return "", errors.New("crypto: decryption failed")
+	}
+	return string(opened), nil
+}
+
+// LoadKeyFromEnv returns the master key decoded from a base64 std-encoded env
+// var value. It errors if the var is unset/empty or not KeySize bytes.
+func LoadKeyFromEnv(envVar string) ([]byte, error) {
+	v := os.Getenv(envVar)
+	if v == "" {
+		return nil, fmt.Errorf("crypto: env var %q is empty", envVar)
+	}
+	key, err := base64.StdEncoding.DecodeString(v)
+	if err != nil {
+		return nil, fmt.Errorf("crypto: decode env key: %w", err)
+	}
+	if len(key) != KeySize {
+		return nil, ErrKeySize
+	}
+	return key, nil
+}
+
+// LoadOrCreateKeyfile reads a base64 std-encoded master key from path. If the
+// file does not exist, a fresh random key is generated and written 0600
+// (creating parent dirs as needed), then returned.
+func LoadOrCreateKeyfile(path string) ([]byte, error) {
+	data, err := os.ReadFile(path)
+	switch {
+	case err == nil:
+		key, derr := base64.StdEncoding.DecodeString(string(trimSpace(data)))
+		if derr != nil {
+			return nil, fmt.Errorf("crypto: decode keyfile %q: %w", path, derr)
+		}
+		if len(key) != KeySize {
+			return nil, ErrKeySize
+		}
+		return key, nil
+	case errors.Is(err, os.ErrNotExist):
+		return generateKeyfile(path)
+	default:
+		return nil, fmt.Errorf("crypto: read keyfile %q: %w", path, err)
+	}
+}
+
+func generateKeyfile(path string) ([]byte, error) {
+	key := make([]byte, KeySize)
+	if _, err := io.ReadFull(rand.Reader, key); err != nil {
+		return nil, fmt.Errorf("crypto: generate key: %w", err)
+	}
+	if dir := filepath.Dir(path); dir != "" {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return nil, fmt.Errorf("crypto: mkdir for keyfile: %w", err)
+		}
+	}
+	enc := base64.StdEncoding.EncodeToString(key)
+	if err := os.WriteFile(path, []byte(enc+"\n"), 0o600); err != nil {
+		return nil, fmt.Errorf("crypto: write keyfile %q: %w", path, err)
+	}
+	return key, nil
+}
+
+// trimSpace strips surrounding ASCII whitespace (keyfiles may have a trailing newline).
+func trimSpace(b []byte) []byte {
+	start, end := 0, len(b)
+	for start < end && isSpace(b[start]) {
+		start++
+	}
+	for end > start && isSpace(b[end-1]) {
+		end--
+	}
+	return b[start:end]
+}
+
+func isSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
