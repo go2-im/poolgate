@@ -2,6 +2,29 @@
 
 > Living design doc. Reflects decisions made during planning; expect it to evolve before/while scaffolding.
 
+## 0. Authoritative decisions (v3) — supersede conflicting text below
+
+Sections 1–27 grew incrementally; where they conflict with this ledger, **this ledger wins**. Rationale + citations in [`REVIEW.md`](REVIEW.md).
+
+**Codex 0.147.0 reality (verified vs `openai/codex@rust-v0.147.0`):**
+
+- **D1 — Translation gateway, not transparent proxy.** Upstream is `https://chatgpt.com/backend-api/codex/responses` with `stream:true` + forced `Accept: text/event-stream`. poolgate rewrites `Authorization` **and** `ChatGPT-Account-ID` **together** (never one alone), and preserves Codex identity headers (`originator` default `codex_cli_rs`, `User-Agent`, `OpenAI-Beta`, `x-codex-turn-state`). (Supersedes the "reverse proxy" framing in §6/§8/§23.5.)
+- **D2 — Transport: WS-first, but v1 forces HTTP fallback.** Codex tries a WebSocket `/responses` upgrade first (`supports_websockets:true`, warmup `response.create generate=false`, connection-scoped `previous_response_id`). **v1 does NOT accept the WS upgrade → Codex falls back to HTTP POST+SSE**, which is **stateless** (full inline `input`, no `previous_response_id`). WS proxying is a later phase. (Supersedes §14/§23.5 "POST+SSE only" and §19.1's stateful framing.)
+- **D3 — Session affinity is turn-scoped correctness, keyed on `x-codex-turn-state` — and is N/A in v1.** Because v1 forces the stateless HTTP path, **no affinity is needed in v1**. When WS is added later, affinity MUST pin a turn to one backend keyed on the `x-codex-turn-state` token (not the §15 monitoring session id). (Corrects §19.1: not a best-effort-session-id optimization.)
+- **D4 — Usage is generic percent windows + `plan_type`.** Model `GET /backend-api/wham/usage` → `plan_type` + N `rate_limit` windows each `{used_percent, window_seconds, resets_at}`. No fixed "5h/1week token" columns. (Supersedes §5/§12/§13/§24.2 hardcoding.)
+- **D5 — Cheap auth-check probe = the real `/models`.** Use authenticated `GET {base}/models?client_version=<v>` (200 valid / 401·403 invalid) as the zero-spend token check. (Supersedes §12's `/v1/models` note.)
+- **D6 — Refresh single-flight + atomic persistence is P1.** OAuth rotates `refresh_token`; a reused one permanently bricks the account. One per-account single-flight shared by probe **and** hot path; write via temp+rename (atomic), interprocess-safe. (Elevates §19.3 to cover the hot path + probe together.)
+
+**Scope trims (single-user; see REVIEW.md §3):**
+
+- **D7 — 3 strategies:** `fallback`, `best-quota`, `load-balance` (round-robin = its default mode; `select` = single-member group; weighted LB later). Define `best-quota` = max over accounts of `min` window `used_percent` headroom vs that plan's caps, deterministic tie-break.
+- **D8 — Flat policy groups in v1** (Endpoint → PolicyGroup → Accounts; no nesting/DAG/cycle-check/tree-UI). Keep polymorphic `group_members` schema for later nesting.
+- **D9 — Trim:** 3 install channels (Release binaries + `install.sh` + Docker); append-only audit log (no hash-chain); no per-key spend budgets (keep rate-limit + scoping); no dual-key grace (multiple keys + manual rotate); keep SHA256SUMS+cosign, drop full SLSA + reproducible-build CI gate; on-demand export (no scheduler); drop `/metrics` from v1 (slog JSON + in-app monitor); single UI language + dark mode (no i18n framework / a11y / mobile program); charts = 3–4 headline counters (no chart suite/rollup); defer match-rule engine (keep model allow-deny), master-key rotation, subpath hosting.
+
+**Correctness/robustness fixes (see REVIEW.md §2):** config/policy **hot-reload** via atomic snapshot on admin commit; **auto-recovery gated by `Retry-After`**; **bootstrap token** short-TTL + single-use, not in durable logs; **account-state enum** adds terminal `revoked`/`dead` (no auto-recovery); **WebAuthn RP origin** resolved once at startup from static config only (never per-request forwarded headers); **PKCE** loopback callback with single-use `state` + S256; **memory hygiene** (disable core dumps, mlock master key); **sanitize** client-supplied fields into logs/monitor; **`/readyz`** = migrations applied + ≥1 endpoint has a reachable healthy account; **backup restorability** check (integrity_check + sample decrypt + schema version).
+
+**Phase split:** **2a = walking skeleton** (config + store + one imported encrypted account + on-path single-flight refresh + one `sk-` key + one endpoint + `fallback` + translation gateway forcing HTTP+SSE → one account end-to-end); **2b** = remaining strategies + health engine + generic usage model; **later** = WS proxying + `x-codex-turn-state` affinity. §20 backup + §21.4 clock-align move out of Phase 1.
+
 ## 1. Goal & scope
 
 A **single-user**, self-hostable tool that:

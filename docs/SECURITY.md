@@ -41,3 +41,16 @@ poolgate is designed against a security audit of a comparable tool (a multi-acco
 - **Phase 2:** proxy rejects unknown host egress; unauthenticated `/v1` → 401; default bind is `127.0.0.1` (test).
 - **Phase 3:** unauthenticated admin API → 401; missing CSRF token rejected; CSP header present; passkey register/login + recovery + `admin reset-auth` work.
 - **Phase 5:** release artifacts have checksums + signature + provenance; CI actions are SHA-pinned; domain-lint passes.
+
+## v3 additions (from design review — see REVIEW.md)
+
+- **Refresh single-flight + atomic persistence (P1).** OAuth rotates `refresh_token`; a reused one permanently bricks the account. One per-account single-flight shared by the probe engine **and** the proxy hot path; persist via temp-file + atomic rename, interprocess-safe (flock). Never fire concurrent refreshes for one account.
+- **WebAuthn RP origin is static-only.** RP ID / origin resolved **once at startup** from `external_origin` (else `rp_id`/`rp_origin`); **never** derived from per-request forwarded headers. Forwarded headers (trusted CIDRs only) affect client-IP logging + cookie-Secure decision, not identity.
+- **Bootstrap/registration token.** Short TTL (~10–15 min) **and** single-use (consumed on first successful passkey registration); for Docker/headless prefer a one-time file/reveal over persistent container logs.
+- **PKCE interactive login.** Loopback callback bound to `127.0.0.1` on the registered port; cryptographically-random `state` bound to the initiating admin session and single-use; PKCE S256; strict redirect binding.
+- **Memory hygiene for secrets.** Disable core dumps at startup (RLIMIT_CORE=0 / PR_SET_DUMPABLE=0); `mlock`/guard the master key and passphrase-derived keys against swap; zeroize where practical.
+- **Log/monitor injection.** Treat all client-supplied fields (session id, model, headers) as untrusted: length-cap and strip/escape control chars/newlines before persisting to `request_logs` or pushing to the live SSE/WS monitor.
+- **Auto-recovery gated by `Retry-After`.** Never re-probe a 429'd account before `max(Retry-After, backoff)`; enforce a per-account daily live-probe budget + global probe rate cap; default probe mode = usage-poll-only (live probes opt-in) to avoid anti-abuse flags.
+- **Backup restorability.** Verify a backup by PRAGMA `integrity_check` + sample-decrypt of each secret column type + schema-version check; the passphrase-wrapped master key makes the bundle portable across hosts.
+- **Audit log:** plain **append-only** table (INSERT-only in code paths) covering auth / CRUD / key-use / config changes. (Hash-chain tamper-evidence dropped as single-user gold-plating — see REVIEW.md §3.)
+- **`/readyz` is secret-free** and returns not-ready when no endpoint has a reachable healthy account; `/healthz` is liveness only. Neither leaks account identifiers.
