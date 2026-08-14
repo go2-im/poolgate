@@ -20,9 +20,11 @@ A **single-user**, self-hostable tool that:
 | **Local** | `127.0.0.1` | passkey (RP ID `localhost`; WebAuthn treats `http://localhost` as a secure context, so no TLS needed) | none |
 | **Remote (self-hosted)** | `127.0.0.1`, fronted by **your** reverse proxy (Caddy/nginx) | passkey (RP ID = your domain) | terminated at the reverse proxy |
 
-The binary itself never opens outbound tunnels. "Remote" = you put it behind your own TLS reverse proxy.
+**All listener ports are configurable** (admin + proxy), defaults are just defaults.
 
-> WebAuthn passkeys are bound to the RP ID (domain). A passkey registered on `localhost` will not work on `your.domain` and vice-versa — register one per environment (or one hardware key registered in each). RP ID / origin are config.
+The binary **never launches or manages a tunnel itself** — but it is built to run **smoothly behind whatever you put in front of it**: a reverse proxy (Caddy/nginx) *or* an external tunnel you run (cloudflared, ngrok, etc.). See §14 for how (trusted-proxy headers, external origin, streaming pass-through). So "remote" = you front the loopback listener with your own TLS reverse proxy or tunnel.
+
+> WebAuthn passkeys are bound to the RP ID (domain). A passkey registered on `localhost` will not work on `your.domain` and vice-versa — register one per environment (or one roaming/phone passkey usable across them). RP ID / origin are config (and can be derived from trusted forwarded headers, §14). **Cross-device / QR sign-in is supported** — the WebAuthn config allows platform, cross-platform, and hybrid (caBLE) authenticators, so the browser can show a QR code to authenticate with a passkey on your phone (§16).
 
 ## 3. Architecture — one Go binary, two listeners
 
@@ -89,7 +91,7 @@ Request flow: inbound key auth → resolve endpoint → group → engine selects
 - **Why a DB, not just JSON:** config data (accounts/groups/endpoints/keys/passkeys) is small, but **request/usage logs + per-key/per-account stats grow** and need indexed aggregation for the UI; the policy engine's health updates and admin edits need transactional consistency under concurrent proxy load.
 - **Encryption at rest:** secret columns (access/refresh tokens, etc.) are **field-encrypted** with `nacl/secretbox` (or `age`) before insert — SQLCipher would require CGO, so we do app-level field encryption instead. Master key from **OS keychain** (macOS Keychain / Windows DPAPI) preferred, else keyfile / env; never stored in plaintext next to the DB.
 - **Retention:** request/usage log tables are periodically pruned; keeps the DB small even under heavy use.
-- **Tables (initial):** `accounts` (incl. `subscription_type`, `region`/`zone`, `tags`, `label`, state, usage snapshot, latency), `policy_groups`, `group_members`, `endpoints`, `api_keys`, `key_scopes`, `webauthn_credentials`, `usage_snapshots`, `health_checks`, `request_logs`, `audit_log`, `settings`.
+- **Tables (initial):** `accounts` (incl. `subscription_type`, `region`/`zone`, `tags`, `label`, state, usage snapshot, latency), `policy_groups`, `group_members`, `endpoints`, `api_keys`, `key_scopes`, `webauthn_credentials`, `usage_snapshots`, `health_checks`, `request_logs` (time, api_key_id, session_id, endpoint, policy, account_id, model, status, latency_ms, tokens_in/out), `audit_log`, `settings`.
 
 ## 6. Egress hardening
 
@@ -105,6 +107,8 @@ The UI is the source of truth (writes to SQLite); YAML is used to seed on first 
 server:
   admin: { host: 127.0.0.1, port: 7070, rp_id: localhost, rp_origin: "http://localhost:7070" }
   proxy: { host: 127.0.0.1, port: 8787 }
+  external_origin: ""            # e.g. https://poolgate.example.com when behind a tunnel/proxy
+  trusted_proxies: []            # CIDRs allowed to set X-Forwarded-* (e.g. 127.0.0.1/32)
 security:
   master_key_source: keychain   # keychain | keyfile | env
   upstream_allowlist: ["chatgpt.com", "api.openai.com"]
@@ -122,7 +126,7 @@ endpoints:
 
 - Backend: **Go 1.23**, `net/http` (Go 1.22 mux) or `chi`.
 - SQLite: `modernc.org/sqlite`.
-- WebAuthn: `github.com/go-webauthn/webauthn`.
+- WebAuthn: `github.com/go-webauthn/webauthn` (allow platform + cross-platform + hybrid/caBLE authenticators → QR / phone cross-device sign-in).
 - Crypto: `nacl/secretbox` (field encryption), `argon2id` (only if a password fallback is ever added — default is passkey-only + recovery codes).
 - Reverse proxy: `net/http/httputil.ReverseProxy` (FlushInterval=-1 for SSE) or manual relay.
 - Frontend: **React** (Vite), built to static assets, embedded via `go:embed`.
@@ -131,11 +135,11 @@ endpoints:
 ## 9. Build phases
 
 1. **Core:** `config`, `store` (SQLite + field encryption; encrypt/decrypt round-trip test), `oauth` (login/import/refresh, issuer pinned).
-2. **Policy + proxy:** `policy` engine (strategies + nesting + cycle check + health), `proxy` server (`/e/<ep>/v1`, sk- auth, SSE, egress allowlist).
+2. **Policy + proxy:** `policy` engine (strategies + nesting + cycle check + health), `proxy` server (`/e/<ep>/v1`, sk- auth, SSE, egress allowlist), **trusted-proxy header handling + streaming pass-through for tunnels/reverse-proxies (§14)**, per-request logging with session/model/tokens (§15).
    - **`health`**: probe engine + account state machine (usage-poll / auth-check / small live request), adaptive per-state scheduling, auto-recovery, feeds `url-test`/`best-quota` (see §12).
 3. **Admin API + passkey:** WebAuthn register/login (bootstrap token, multiple passkeys, recovery codes, `admin reset-auth` CLI), session + CSRF, CRUD for accounts/groups/endpoints/keys. Accounts list API supports metadata (subscription type / region / tags), filter / search / sort / paginate in SQL (§13).
    - **`notify`**: channel CRUD (DingTalk / WeCom / custom webhook) + a "test" button; alert rules wired to policy/proxy events (see §11).
-4. **Web UI:** React pages (login, dashboard/usage, accounts, policy groups w/ composition view, endpoints, keys, settings), `go:embed`.
+4. **Web UI:** React pages (login, dashboard/usage, accounts w/ categorize·search·sort, policy groups w/ composition view, endpoints, keys, **real-time monitor** — live scrolling logs + charts filterable by session/api-key/model (§15), settings), `go:embed`. Admin server exposes an SSE/WS live-events stream.
 5. **Release:** cross-compiled single binary, SHA256SUMS + signature, SLSA provenance, SHA-pinned CI, no silent auto-update, `docs/BUILD.md`.
 6. **Optional:** usage charts, account cooldown tuning, weighted load-balance.
 
@@ -220,4 +224,32 @@ Each account carries management metadata (see §4): **subscription type**, **reg
 - Subscription type is auto-detected from the plan endpoint where possible and stays editable; region/zone is a user-selected value (dropdown, config-defined list) — since it may not be reliably detectable.
 
 Backed by indexed columns in `accounts`; the list API takes `filter` / `q` / `sort` / `page` params so filtering and sorting happen in SQL, not in the browser.
+
+## 14. Ports, reverse-proxy & tunnel compatibility
+
+Ports are fully configurable, and poolgate is designed to sit behind whatever fronting you choose (you run it; poolgate does not).
+
+- **Configurable listeners:** `server.admin.{host,port}` and `server.proxy.{host,port}`; both default to loopback and can be changed freely.
+- **Trusted proxies:** `server.trusted_proxies` (CIDR list). Only when the peer is a trusted proxy does poolgate honor `X-Forwarded-For` / `-Proto` / `-Host` (real client IP for logs/rate-limit, external scheme/host for URL/RP-origin). Untrusted peers' forwarded headers are ignored → no IP/host spoofing.
+- **External origin:** `server.external_origin` (e.g. `https://poolgate.example.com`) sets the canonical scheme+host used for WebAuthn RP origin, cookie flags, and the proxy URLs shown in the UI to copy into Codex/Cursor — so behind a cloudflared/ngrok URL the UI shows the *public* endpoint, not `127.0.0.1`.
+- **Streaming through tunnels:** SSE and WebSocket (`/v1/responses`, chat streaming) pass through with immediate per-chunk flush, `Cache-Control: no-transform`, no response buffering, and keep-alives tuned so cloudflared/ngrok/nginx don't buffer or drop long-lived streams. Idle/read timeouts are generous for streaming routes.
+- **Still loopback by default:** the tunnel/proxy connects to the loopback listener; you never have to bind `0.0.0.0`.
+
+> Security: since a tunnel makes the proxy effectively public, the `sk-` key remains the gate (constant-time). Do **not** expose the *admin* listener through a tunnel unless you intend to — and even then it is passkey-gated. Trusted-proxy parsing is strict to prevent spoofed client IPs. (See `docs/SECURITY.md`.)
+
+## 15. Real-time request monitoring
+
+A live observability view in the admin UI, backed by the proxy's per-request records.
+
+- **Live log stream:** the admin server pushes new request records over SSE/WebSocket; the UI shows a **real-time scrolling log** (auto-scroll, pause, tail). Each row: time, endpoint, policy, chosen account (label), model, api-key (label), session, status, latency, tokens (in/out).
+- **Charts / volume:** request rate over time, latency percentiles, token throughput, success vs error, and breakdowns by account / key / model — rolling windows with live update.
+- **Filters:** by **session**, **api-key**, and **model** (composable), plus endpoint/account/status/time-range. Filtering runs in SQL over `request_logs` for history and is also applied to the live stream.
+- **Session definition:** best-effort grouping — a client-supplied conversation/session id header if present, else derived per (api-key + client) connection; documented so it's predictable.
+- **Storage/retention:** `request_logs` (indexed on time, api_key_id, model, session_id, account_id, status) with configurable retention/prune; aggregates can be rolled up to keep charts fast. No secrets in logs.
+
+## 16. Admin auth details (passkey, QR/cross-device, CLI reset)
+
+- **Passkey primary, no password.** Registration allows **platform** (Touch ID / Windows Hello), **cross-platform** (security keys), and **hybrid/caBLE** authenticators → the browser offers **QR-code sign-in with your phone**. Multiple passkeys can be registered (recommend a phone passkey + a hardware key backup).
+- **Recovery:** one-time recovery codes generated at setup (shown once).
+- **CLI full reset (always available locally):** `poolgate admin reset-auth` **completely resets admin login** — removes **all** registered passkeys, invalidates recovery codes and active sessions, and re-issues a one-time bootstrap registration token (printed to the local console). This is the guaranteed lockout escape hatch; it requires local shell access to the host (which already implies full control), never a network path.
 
