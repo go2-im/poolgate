@@ -313,7 +313,7 @@ Driven by **GoReleaser** + **GitHub Actions**; every channel ships verifiable ar
 
 **Release CI (`release.yml`, on tag `v*`):** GoReleaser cross-compiles (darwin/linux/windows × amd64/arm64), builds archives + `SHA256SUMS`, **signs with cosign (keyless via GitHub OIDC)**, publishes the GitHub Release, updates the Homebrew tap, and pushes the Docker image (**full SLSA provenance + reproducible-build gate deferred** — see §0 D9; Scoop/deb-rpm not published in v1). All third-party Actions are **SHA-pinned**, `permissions` least-privileged, `id-token: write` only where needed — no long-lived signing key or registry token in the job env.
 
-**CI (`ci.yml`, on PR/push):** `go build ./...`, `go vet`, `staticcheck`, unit tests, `govulncheck`, frontend build, and the suspicious-domain lint — all green required to merge.
+**CI (`ci.yml`, on PR/push):** `go build ./...`, `go vet`, `staticcheck`, **`go test -race ./...` + coverage gate (≥80% `internal/*` — see §25)**, `govulncheck`, frontend build, and the suspicious-domain lint — all green required to merge.
 
 **Dependency automation:** **Dependabot** (or Renovate) for `gomod`, `github-actions`, and the frontend `npm` ecosystem — grouped, scheduled PRs, gated by `ci.yml` + `govulncheck`.
 
@@ -378,6 +378,8 @@ Driven by **GoReleaser** + **GitHub Actions**; every channel ships verifiable ar
 - **24.7 Theme:** **single UI language + dark mode** in v1. i18n framework, accessibility program, and mobile-responsive layout are **deferred** (see §0 D9).
 
 ## 25. Testing & QA plan
+
+**Mandatory UT coverage (project rule):** every package ships with unit tests — no package is merged without them. CI enforces `go test ./...` **and `-race`**, plus a **coverage floor** (≥ 80% for `internal/*`; the security/correctness-critical logic — `crypto`, `store`, `oauth` refresh single-flight, `gateway` header-rewrite + auth + failover, `policy` selection — is held near-full). Tests are written **alongside** each stage, not deferred. Prefer table-driven tests + the fake upstream (§25.1) + an injectable clock (§25.3) so everything is deterministic.
 
 - **25.1 Fake upstream:** in-process `httptest` fake (scripted SSE, 401/429/5xx, latency, quota/plan JSON) + **golden contract fixtures** vs real OpenAI/ChatGPT shapes.
 - **25.2 Streaming chaos:** mid-stream account death, client-disconnect → upstream cancellation, failover-boundary (§19.2) correctness.
