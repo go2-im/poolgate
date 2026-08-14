@@ -44,6 +44,7 @@ The binary itself never opens outbound tunnels. "Remote" = you put it behind you
 │                                                                │
 │  Shared core packages:                                         │
 │    config · store(SQLite, encrypted secrets) · oauth · usage · │
+│    health(probe + account state machine) ·                     │
 │    policy(engine) · proxy(forwarder) · auth(webauthn+keys) ·   │
 │    notify(dingtalk / wecom / webhook)                          │
 └──────────────────────────────────────────────────────────────┘
@@ -55,7 +56,7 @@ Splitting Admin and Proxy into separate listeners lets you expose the proxy to y
 
 Three entities:
 
-- **Account** — a pooled Codex/ChatGPT credential (the leaf "proxy"). Carries health state (`ok` / `cooldown` / `expired`), last usage snapshot (5h / 1week windows, plan), and optional measured latency.
+- **Account** — a pooled Codex/ChatGPT credential (the leaf "proxy"). Carries a **state** (`ok` / `cooldown` / `quota_exhausted` / `expired` / `unknown`), last usage snapshot (5h / 1week windows, plan), and measured latency. State is maintained both passively (from real proxy traffic) and actively by the **health probe engine** (§12), which auto-recovers accounts when their quota/rate-limit clears. Also carries **management metadata** — **subscription type** (Free / Plus / Pro / Team / Enterprise / …, auto-detected from the plan endpoint where possible, editable), **subscription region/zone**, a human **label**, and free-form **tags/category** — used by the admin UI for grouping, search and sort (§13), and usable as account selectors when composing policies (e.g. "a policy over all Pro accounts in region US").
 - **PolicyGroup** — named, has a `type` (strategy) and an **ordered member list**; each member is an Account **or another PolicyGroup** (nesting → a DAG; cycles rejected). Strategies:
   - `select` — manually pinned member.
   - `fallback` — first healthy in order; on 401/429/5xx/timeout advance + cooldown the failed member.
@@ -88,7 +89,7 @@ Request flow: inbound key auth → resolve endpoint → group → engine selects
 - **Why a DB, not just JSON:** config data (accounts/groups/endpoints/keys/passkeys) is small, but **request/usage logs + per-key/per-account stats grow** and need indexed aggregation for the UI; the policy engine's health updates and admin edits need transactional consistency under concurrent proxy load.
 - **Encryption at rest:** secret columns (access/refresh tokens, etc.) are **field-encrypted** with `nacl/secretbox` (or `age`) before insert — SQLCipher would require CGO, so we do app-level field encryption instead. Master key from **OS keychain** (macOS Keychain / Windows DPAPI) preferred, else keyfile / env; never stored in plaintext next to the DB.
 - **Retention:** request/usage log tables are periodically pruned; keeps the DB small even under heavy use.
-- **Tables (initial):** `accounts`, `policy_groups`, `group_members`, `endpoints`, `api_keys`, `key_scopes`, `webauthn_credentials`, `usage_snapshots`, `request_logs`, `audit_log`, `settings`.
+- **Tables (initial):** `accounts` (incl. `subscription_type`, `region`/`zone`, `tags`, `label`, state, usage snapshot, latency), `policy_groups`, `group_members`, `endpoints`, `api_keys`, `key_scopes`, `webauthn_credentials`, `usage_snapshots`, `health_checks`, `request_logs`, `audit_log`, `settings`.
 
 ## 6. Egress hardening
 
@@ -131,7 +132,8 @@ endpoints:
 
 1. **Core:** `config`, `store` (SQLite + field encryption; encrypt/decrypt round-trip test), `oauth` (login/import/refresh, issuer pinned).
 2. **Policy + proxy:** `policy` engine (strategies + nesting + cycle check + health), `proxy` server (`/e/<ep>/v1`, sk- auth, SSE, egress allowlist).
-3. **Admin API + passkey:** WebAuthn register/login (bootstrap token, multiple passkeys, recovery codes, `admin reset-auth` CLI), session + CSRF, CRUD for accounts/groups/endpoints/keys.
+   - **`health`**: probe engine + account state machine (usage-poll / auth-check / small live request), adaptive per-state scheduling, auto-recovery, feeds `url-test`/`best-quota` (see §12).
+3. **Admin API + passkey:** WebAuthn register/login (bootstrap token, multiple passkeys, recovery codes, `admin reset-auth` CLI), session + CSRF, CRUD for accounts/groups/endpoints/keys. Accounts list API supports metadata (subscription type / region / tags), filter / search / sort / paginate in SQL (§13).
    - **`notify`**: channel CRUD (DingTalk / WeCom / custom webhook) + a "test" button; alert rules wired to policy/proxy events (see §11).
 4. **Web UI:** React pages (login, dashboard/usage, accounts, policy groups w/ composition view, endpoints, keys, settings), `go:embed`.
 5. **Release:** cross-compiled single binary, SHA256SUMS + signature, SLSA provenance, SHA-pinned CI, no silent auto-update, `docs/BUILD.md`.
@@ -157,6 +159,7 @@ Multiple channels can be enabled at once; each channel has a "send test" action 
 |-------|---------|
 | Account expired / refresh failed | a pooled account's token can no longer refresh |
 | Account entered cooldown | repeated 401/429/5xx from an account |
+| **Account recovered** | a degraded account passed a health probe and returned to `ok` (§12) |
 | Policy has no healthy member | every account in a group is down → that endpoint is failing |
 | Quota low / exhausted | remaining 5h or 1week usage below threshold |
 | Auth anomalies | repeated invalid proxy-key attempts (possible probing) |
@@ -169,4 +172,52 @@ Rules are configurable (which events → which channels, thresholds, dedup/rate-
 - **Never include secrets/PII in alert payloads** — no tokens, no `sk-` keys, no `access_token`; reference accounts by label/id only.
 - Notification egress is a **separate, explicitly user-configured outbound channel**, kept distinct from the credential-egress allowlist — credentials are never sent to a notification endpoint, and the credential allowlist is never widened by adding a channel.
 - Webhook URLs must be **HTTPS**; validated on save; delivery has timeout + bounded retries; failures are logged (without payload secrets) and surfaced in the UI.
+
+## 12. Health probing & account-state monitoring
+
+An active **`health`** engine periodically probes each account so the pool reflects real state — and, importantly, **auto-recovers** accounts once their quota/rate-limit clears (e.g. after you manually reset an account's quota, or a usage window rolls over, a probe discovers it and flips the account back to `ok` without manual intervention).
+
+**Probe kinds (cheapest that answers the question):**
+
+1. **Usage poll (zero token spend)** — read the ChatGPT usage endpoint for remaining 5h / 1week windows + plan. Primary signal for quota level and for detecting a reset. Default cadence for all accounts.
+2. **Auth check (no/near-zero spend)** — `GET /v1/models` (or equivalent) to confirm the token is still valid (catches `expired`).
+3. **Small live request (minimal spend)** — a tiny real completion (e.g. `max_tokens: 1`) to confirm the account actually serves traffic (catches rate-limit/quota state the usage endpoint may not reflect, and confirms recovery). Used mainly to re-test degraded accounts and to confirm recovery; opt-in cadence for healthy accounts to keep spend near zero.
+
+**Account state machine:**
+
+```
+        probe ok / small-req ok
+   ┌───────────────◄───────────────┐
+   │                                │
+[cooldown]  [quota_exhausted]   [expired]           [unknown]
+   ▲   │          ▲   │             ▲                    │
+   │   │ 429/5xx  │   │ quota=0     │ 401 & refresh fail │ first seen
+   │   └──────────┘   └─────────────┘                    ▼
+   └──────────────── [ok] ◄──────────────────────────────┘
+```
+
+- Real proxy traffic transitions passively (401→try refresh→`expired`; 429/5xx→`cooldown`; quota=0→`quota_exhausted`).
+- The probe engine transitions actively **and drives recovery**: degraded accounts (`cooldown` / `quota_exhausted`) are re-probed on a **shorter, backing-off interval** so recovery is discovered quickly; `ok` accounts are polled on a longer interval. On a successful probe, the account returns to `ok` and re-enters policy rotation automatically.
+
+**Scheduling & cost control (all configurable):**
+
+- Per-state intervals: e.g. `ok` usage-poll every N min; `cooldown`/`quota_exhausted` re-probe every M min with exponential backoff up to a cap; `expired` retried rarely (needs re-auth).
+- Global mode switch: **usage-poll-only** (zero token spend) vs **allow small live requests** for degraded/recovery checks. Per-account override.
+- Jittered schedules to avoid synchronized bursts; single-flight per account (no overlapping probes); probe results also feed the `url-test` (latency) and `best-quota` (remaining quota) policy strategies.
+
+**Persistence & UI:** latest state + usage + latency per account in `accounts`; probe history in a `health_checks` table (pruned). The admin UI shows live per-account state, remaining quota bars, last-probe time, and a manual "probe now" button.
+
+**Notifications:** state transitions fire alerts via `notify` (§11) — including a **recovered** event (`cooldown`/`quota_exhausted` → `ok`), plus degraded/expired/quota-low. Recovery notifications must reference the account by label/id only.
+
+## 13. Account management (metadata, categorize, search, sort)
+
+Each account carries management metadata (see §4): **subscription type**, **region/zone**, **label**, **tags/category**. The admin UI's Accounts view is built for a pool that may grow to dozens/hundreds:
+
+- **Categorize / group by:** subscription type, region/zone, tag/category, or state.
+- **Search / filter:** free-text over label/tags + faceted filters (type, region, state, quota range, "in policy X", "healthy only").
+- **Sort:** by label, subscription type, region, state, remaining 5h/1week quota, latency, last-probe time, created/updated.
+- **Bulk actions:** tag, set region/type, enable/disable, "probe now", add-to-policy.
+- Subscription type is auto-detected from the plan endpoint where possible and stays editable; region/zone is a user-selected value (dropdown, config-defined list) — since it may not be reliably detectable.
+
+Backed by indexed columns in `accounts`; the list API takes `filter` / `q` / `sort` / `page` params so filtering and sorting happen in SQL, not in the browser.
 
