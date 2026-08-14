@@ -29,6 +29,16 @@ Requires **Go 1.25+**. This builds the binary, installs it (to `/usr/local/bin`,
 
 Packaged release builds (Homebrew tap, Docker image, signed binaries) are described in [`docs/DESIGN.md`](docs/DESIGN.md#18-distribution-packaging--release-automation).
 
+### Uninstall
+
+```bash
+./scripts/uninstall.sh              # remove the installed binary
+./scripts/uninstall.sh --service    # also remove the systemd unit / launchd agent
+./scripts/uninstall.sh --purge      # ALSO delete the data dir (accounts, tokens, master key)
+```
+
+`uninstall.sh` mirrors the installer: it removes the `poolgate` binary from the same prefix (`--prefix`, else `/usr/local/bin` then `~/.local/bin`). `--service` removes the service unit. `--purge` is **irreversible** — it deletes your encrypted accounts *and* the master key that decrypts them, so it always confirms first (pass `--yes` to skip, `--data-dir` to point at a non-default data dir). Run `./scripts/uninstall.sh --help` for all options.
+
 ## Quick start
 
 ```bash
