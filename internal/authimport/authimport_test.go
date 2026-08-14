@@ -2,6 +2,8 @@ package authimport
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/go2-im/poolgate/internal/model"
@@ -59,5 +61,53 @@ func TestParseMissingRequiredToken(t *testing.T) {
 func TestParseInvalidJSON(t *testing.T) {
 	if _, err := Parse([]byte("{not json")); err == nil {
 		t.Fatal("expected parse error")
+	}
+}
+
+func TestParseMissingAccessToken(t *testing.T) {
+	in := `{"tokens":{"refresh_token":"r","account_id":"x"}}`
+	if _, err := Parse([]byte(in)); !errors.Is(err, ErrNoTokens) {
+		t.Fatalf("want ErrNoTokens for missing access, got %v", err)
+	}
+}
+
+func TestParseFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "auth.json")
+	if err := os.WriteFile(path, []byte(fixture), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	got, err := ParseFile(path)
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	if got.AccessToken != "access-abc" {
+		t.Errorf("access = %q", got.AccessToken)
+	}
+	if got.RefreshToken != "refresh-xyz" {
+		t.Errorf("refresh = %q", got.RefreshToken)
+	}
+	if got.State != model.StateUnknown {
+		t.Errorf("state = %q want unknown", got.State)
+	}
+}
+
+func TestParseFileMissing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "does-not-exist.json")
+	if _, err := ParseFile(path); err == nil {
+		t.Fatal("expected error for missing file")
+	} else if !os.IsNotExist(errors.Unwrap(err)) {
+		t.Fatalf("want not-exist error, got %v", err)
+	}
+}
+
+func TestParseFileMalformed(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "auth.json")
+	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := ParseFile(path); err == nil {
+		t.Fatal("expected parse error for malformed file")
 	}
 }

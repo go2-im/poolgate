@@ -33,3 +33,7 @@ master.key
 .idea/
 .vscode/
 *.swp
+
+# built binary
+/poolgate
+cmd/poolgate/poolgate

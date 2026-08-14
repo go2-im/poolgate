@@ -1,6 +1,7 @@
 package crypto
 
 import (
+	"encoding/base64"
 	"os"
 	"path/filepath"
 	"testing"
@@ -107,5 +108,143 @@ func TestLoadKeyFromEnv(t *testing.T) {
 	}
 	if len(key) != KeySize {
 		t.Fatalf("key size %d want %d", len(key), KeySize)
+	}
+}
+
+// validKeyB64 is a valid 32-byte key base64 std-encoded.
+const validKeyB64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+
+func TestOpenErrors(t *testing.T) {
+	c, _ := New(make([]byte, KeySize))
+	cases := []struct {
+		name string
+		in   string
+	}{
+		{"invalid base64", "!!!not-base64!!!"},
+		{"too short", base64.StdEncoding.EncodeToString([]byte("short"))},
+		{"empty", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := c.Open(tc.in); err == nil {
+				t.Fatalf("Open(%q): expected error", tc.in)
+			}
+		})
+	}
+}
+
+func TestLoadKeyFromEnvErrors(t *testing.T) {
+	const env = "POOLGATE_TEST_KEY_ERR"
+	cases := []struct {
+		name string
+		set  bool
+		val  string
+	}{
+		{"unset", false, ""},
+		{"empty", true, ""},
+		{"garbage base64", true, "!!!not base64!!!"},
+		{"wrong size decoded", true, base64.StdEncoding.EncodeToString([]byte("too short key"))},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.set {
+				t.Setenv(env, tc.val)
+			} else {
+				os.Unsetenv(env)
+			}
+			if _, err := LoadKeyFromEnv(env); err == nil {
+				t.Fatalf("expected error for case %q", tc.name)
+			}
+		})
+	}
+}
+
+func TestLoadOrCreateKeyfileErrors(t *testing.T) {
+	t.Run("garbage base64 in file", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "bad.key")
+		if err := os.WriteFile(path, []byte("!!!not base64!!!\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadOrCreateKeyfile(path); err == nil {
+			t.Fatal("expected decode error")
+		}
+	})
+
+	t.Run("wrong size key in file", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "wrong.key")
+		short := base64.StdEncoding.EncodeToString([]byte("too short"))
+		if err := os.WriteFile(path, []byte(short+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadOrCreateKeyfile(path); err != ErrKeySize {
+			t.Fatalf("want ErrKeySize, got %v", err)
+		}
+	})
+
+	t.Run("read error when path is a directory", func(t *testing.T) {
+		dir := t.TempDir()
+		// path is an existing directory -> ReadFile returns a non-ErrNotExist error.
+		if _, err := LoadOrCreateKeyfile(dir); err == nil {
+			t.Fatal("expected read error for directory path")
+		}
+	})
+
+	t.Run("valid key with trailing whitespace", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "ok.key")
+		if err := os.WriteFile(path, []byte("  "+validKeyB64+"\r\n\t "), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		key, err := LoadOrCreateKeyfile(path)
+		if err != nil {
+			t.Fatalf("LoadOrCreateKeyfile: %v", err)
+		}
+		if len(key) != KeySize {
+			t.Fatalf("key size %d want %d", len(key), KeySize)
+		}
+	})
+}
+
+func TestGenerateKeyfileErrors(t *testing.T) {
+	t.Run("mkdir fails when parent is a file", func(t *testing.T) {
+		dir := t.TempDir()
+		blocker := filepath.Join(dir, "afile")
+		if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// Dir of this path is blocker/sub, but blocker is a regular file -> MkdirAll fails.
+		path := filepath.Join(blocker, "sub", "master.key")
+		if _, err := generateKeyfile(path); err == nil {
+			t.Fatal("expected mkdir error")
+		}
+	})
+
+	t.Run("write fails when path is a directory", func(t *testing.T) {
+		dir := t.TempDir()
+		// path itself is an existing directory -> WriteFile fails.
+		if _, err := generateKeyfile(dir); err == nil {
+			t.Fatal("expected write error")
+		}
+	})
+}
+
+func TestTrimSpace(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"", ""},
+		{"   ", ""},
+		{"\t\r\n", ""},
+		{"abc", "abc"},
+		{"  abc  ", "abc"},
+		{"\n\tabc\r\n", "abc"},
+		{"a b", "a b"},
+	}
+	for _, tc := range cases {
+		if got := string(trimSpace([]byte(tc.in))); got != tc.want {
+			t.Fatalf("trimSpace(%q) = %q want %q", tc.in, got, tc.want)
+		}
 	}
 }

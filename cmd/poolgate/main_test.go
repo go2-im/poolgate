@@ -30,11 +30,11 @@ func TestIntegrationInitImportServeProxy(t *testing.T) {
 	t.Setenv(envMasterKey, "")
 
 	// (1) init: provisions data dir + keyfile + migrated DB. Idempotent.
-	if err := cmdInit(nil); err != nil {
+	if err := cmdInit(nil, io.Discard); err != nil {
 		t.Fatalf("cmdInit: %v", err)
 	}
 	// Re-running init must be a no-op (idempotency, DESIGN.md §17).
-	if err := cmdInit(nil); err != nil {
+	if err := cmdInit(nil, io.Discard); err != nil {
 		t.Fatalf("cmdInit (second run): %v", err)
 	}
 
@@ -53,7 +53,7 @@ func TestIntegrationInitImportServeProxy(t *testing.T) {
 	if err := os.WriteFile(authPath, []byte(authJSON), 0o600); err != nil {
 		t.Fatalf("write fake auth.json: %v", err)
 	}
-	if err := cmdImport([]string{authPath}); err != nil {
+	if err := cmdImport([]string{authPath}, io.Discard); err != nil {
 		t.Fatalf("cmdImport: %v", err)
 	}
 

@@ -16,7 +16,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -29,6 +31,10 @@ import (
 	"github.com/go2-im/poolgate/internal/model"
 	"github.com/go2-im/poolgate/internal/store"
 )
+
+// errUsage is a sentinel returned by run for a usage error (unknown/missing
+// command). main maps it to exit code 2; genuine failures map to exit code 1.
+var errUsage = errors.New("usage")
 
 const (
 	// defaultGroupName / defaultEndpointName are created by `import` when the
@@ -47,36 +53,58 @@ const (
 )
 
 func main() {
-	if len(os.Args) < 2 {
-		usage()
-		os.Exit(2)
-	}
-	cmd, args := os.Args[1], os.Args[2:]
-
-	var err error
-	switch cmd {
-	case "init":
-		err = cmdInit(args)
-	case "import":
-		err = cmdImport(args)
-	case "serve":
-		err = cmdServe(args)
-	case "-h", "--help", "help":
-		usage()
+	ctx := context.Background()
+	err := run(ctx, os.Args[1:], os.Stdout, os.Stderr)
+	switch {
+	case err == nil:
 		return
-	default:
-		fmt.Fprintf(os.Stderr, "poolgate: unknown command %q\n\n", cmd)
-		usage()
+	case errors.Is(err, errUsage):
 		os.Exit(2)
-	}
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "poolgate %s: %v\n", cmd, err)
+	default:
 		os.Exit(1)
 	}
 }
 
-func usage() {
-	fmt.Fprint(os.Stderr, `poolgate — Codex/ChatGPT account pool gateway (Phase 2a)
+// run is the testable entrypoint: it dispatches a subcommand and returns an
+// error instead of calling os.Exit. errUsage signals a usage error (exit 2);
+// any other error is a runtime failure (exit 1). Output is written to stdout,
+// diagnostics/usage to stderr.
+func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	if len(args) < 1 {
+		usage(stderr)
+		return errUsage
+	}
+	cmd, rest := args[0], args[1:]
+
+	switch cmd {
+	case "init":
+		if err := cmdInit(rest, stdout); err != nil {
+			fmt.Fprintf(stderr, "poolgate %s: %v\n", cmd, err)
+			return err
+		}
+	case "import":
+		if err := cmdImport(rest, stdout); err != nil {
+			fmt.Fprintf(stderr, "poolgate %s: %v\n", cmd, err)
+			return err
+		}
+	case "serve":
+		if err := cmdServe(ctx, rest, stdout); err != nil {
+			fmt.Fprintf(stderr, "poolgate %s: %v\n", cmd, err)
+			return err
+		}
+	case "-h", "--help", "help":
+		usage(stderr)
+		return nil
+	default:
+		fmt.Fprintf(stderr, "poolgate: unknown command %q\n\n", cmd)
+		usage(stderr)
+		return errUsage
+	}
+	return nil
+}
+
+func usage(w io.Writer) {
+	fmt.Fprint(w, `poolgate — Codex/ChatGPT account pool gateway (Phase 2a)
 
 usage:
   poolgate init                 initialize data dir, master key, and DB
@@ -133,7 +161,7 @@ func openStore(cfg model.Config) (*store.Store, error) {
 
 // cmdInit provisions the data dir, master key, and DB schema. Idempotent. It
 // prints a short-TTL single-use bootstrap token stub and never imports accounts.
-func cmdInit(_ []string) error {
+func cmdInit(_ []string, stdout io.Writer) error {
 	cfg, err := loadConfig()
 	if err != nil {
 		return err
@@ -160,20 +188,20 @@ func cmdInit(_ []string) error {
 	}
 	const bootstrapTTL = 15 * time.Minute
 
-	fmt.Printf("poolgate initialized.\n")
-	fmt.Printf("  data dir:       %s\n", cfg.DataDir)
-	fmt.Printf("  schema version: %d\n", ver)
-	fmt.Printf("  proxy bind:     %s:%d\n", cfg.Server.Proxy.Host, cfg.Server.Proxy.Port)
-	fmt.Printf("\nBootstrap token (single-use, expires in %s — not written to logs):\n  %s\n",
+	fmt.Fprintf(stdout, "poolgate initialized.\n")
+	fmt.Fprintf(stdout, "  data dir:       %s\n", cfg.DataDir)
+	fmt.Fprintf(stdout, "  schema version: %d\n", ver)
+	fmt.Fprintf(stdout, "  proxy bind:     %s:%d\n", cfg.Server.Proxy.Host, cfg.Server.Proxy.Port)
+	fmt.Fprintf(stdout, "\nBootstrap token (single-use, expires in %s — not written to logs):\n  %s\n",
 		bootstrapTTL, token)
-	fmt.Printf("\nNext: `poolgate import <auth.json>` to add an account, then `poolgate serve`.\n")
+	fmt.Fprintf(stdout, "\nNext: `poolgate import <auth.json>` to add an account, then `poolgate serve`.\n")
 	return nil
 }
 
 // cmdImport parses a Codex auth.json and stores the account. If the store has no
 // policy group / endpoint / key yet, it creates a default fallback group over
 // the imported account, a `default` endpoint, and one sk- key (printed once).
-func cmdImport(args []string) error {
+func cmdImport(args []string, stdout io.Writer) error {
 	if len(args) < 1 {
 		return errors.New("usage: poolgate import <auth.json>")
 	}
@@ -199,11 +227,11 @@ func cmdImport(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("imported account %s (label %q, state %s)\n", acct.ID, acct.Label, acct.State)
+	fmt.Fprintf(stdout, "imported account %s (label %q, state %s)\n", acct.ID, acct.Label, acct.State)
 
 	// Create default group + endpoint + key if none exists yet.
 	if _, err := st.GetEndpoint(ctx, defaultEndpointName); err == nil {
-		fmt.Printf("endpoint %q already exists; account added to the pool only.\n", defaultEndpointName)
+		fmt.Fprintf(stdout, "endpoint %q already exists; account added to the pool only.\n", defaultEndpointName)
 		return nil
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return err
@@ -228,15 +256,16 @@ func cmdImport(args []string) error {
 		return err
 	}
 
-	fmt.Printf("created default fallback group %q, endpoint %q\n", defaultGroupName, defaultEndpointName)
-	fmt.Printf("\nProxy URL:  http://%s:%d/e/%s/v1/responses\n",
+	fmt.Fprintf(stdout, "created default fallback group %q, endpoint %q\n", defaultGroupName, defaultEndpointName)
+	fmt.Fprintf(stdout, "\nProxy URL:  http://%s:%d/e/%s/v1/responses\n",
 		cfg.Server.Proxy.Host, cfg.Server.Proxy.Port, defaultEndpointName)
-	fmt.Printf("API key (shown once — store it now):\n  %s\n", skKey)
+	fmt.Fprintf(stdout, "API key (shown once — store it now):\n  %s\n", skKey)
 	return nil
 }
 
-// cmdServe starts the proxy listener with the translation gateway.
-func cmdServe(_ []string) error {
+// cmdServe starts the proxy listener with the translation gateway. It blocks
+// until ctx is cancelled (graceful shutdown) or the server fails.
+func cmdServe(ctx context.Context, _ []string, stdout io.Writer) error {
 	cfg, err := loadConfig()
 	if err != nil {
 		return err
@@ -247,22 +276,44 @@ func cmdServe(_ []string) error {
 	}
 	defer st.Close()
 
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	logger := slog.New(slog.NewJSONHandler(stdout, nil))
 	gw := gateway.New(st, cfg, gateway.WithLogger(logger))
+	return serveGateway(ctx, cfg, gw, logger, nil)
+}
 
+// serveGateway binds the proxy listener and serves the gateway routes until ctx
+// is cancelled. When onReady is non-nil it is invoked with the bound address
+// once the listener is open (used by tests to discover the ephemeral port).
+func serveGateway(ctx context.Context, cfg model.Config, gw *gateway.Gateway, logger *slog.Logger, onReady func(addr string)) error {
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Proxy.Host, cfg.Server.Proxy.Port)
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+
 	srv := &http.Server{
-		Addr:              addr,
 		Handler:           gw.Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 		// No WriteTimeout: SSE streams are long-lived.
 	}
-	logger.Info("proxy listening", slog.String("addr", addr))
+	logger.Info("proxy listening", slog.String("addr", ln.Addr().String()))
 	if cfg.Server.Proxy.Host != "127.0.0.1" && cfg.Server.Proxy.Host != "localhost" {
 		logger.Info("proxy bound to a non-loopback address; front it with a reverse proxy",
 			slog.String("host", cfg.Server.Proxy.Host))
 	}
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if onReady != nil {
+		onReady(ln.Addr().String())
+	}
+
+	// Graceful shutdown on context cancellation.
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+	}()
+
+	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
 	return nil

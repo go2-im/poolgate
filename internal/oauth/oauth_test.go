@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,6 +18,25 @@ import (
 	"github.com/go2-im/poolgate/internal/model"
 	"github.com/go2-im/poolgate/internal/store"
 )
+
+// fakeStore is a minimal TokenStore that records the last UpdateTokens call and
+// can be programmed to fail, so the persist-error path is exercised without the
+// real SQLite store.
+type fakeStore struct {
+	err        error
+	calls      int
+	gotID      string
+	gotAccess  string
+	gotRefresh string
+}
+
+func (f *fakeStore) UpdateTokens(_ context.Context, id, accessToken, refreshToken string) error {
+	f.calls++
+	f.gotID = id
+	f.gotAccess = accessToken
+	f.gotRefresh = refreshToken
+	return f.err
+}
 
 // newTestStore builds an on-disk store in a temp dir with a random key.
 func newTestStore(t *testing.T) *store.Store {
@@ -156,5 +177,168 @@ func TestRefreshSingleFlightCoalesces(t *testing.T) {
 	}
 	if got := atomic.LoadInt64(&calls); got != 1 {
 		t.Errorf("HTTP refresh calls = %d, want 1 (single-flight coalesced)", got)
+	}
+}
+
+// TestWithClientID verifies the option overrides the client_id sent to the
+// issuer (default is DefaultClientID).
+func TestWithClientID(t *testing.T) {
+	ctx := context.Background()
+
+	var gotClientID string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req refreshRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		gotClientID = req.ClientID
+		_ = json.NewEncoder(w).Encode(refreshResponse{AccessToken: "at-new"})
+	}))
+	defer srv.Close()
+
+	fs := &fakeStore{}
+	r := NewRefresher(fs, srv.URL, WithHTTPClient(srv.Client()), WithClientID("custom-client"))
+	_, err := r.RefreshAccount(ctx, model.Account{ID: "acct-1", RefreshToken: "rt-old", State: model.StateOK})
+	if err != nil {
+		t.Fatalf("RefreshAccount: %v", err)
+	}
+	if gotClientID != "custom-client" {
+		t.Errorf("client_id = %q, want custom-client", gotClientID)
+	}
+}
+
+// TestRefreshKeepsOldRefreshTokenWhenNotRotated verifies that when the issuer
+// omits a rotated refresh_token, the existing one is preserved and persisted.
+func TestRefreshKeepsOldRefreshTokenWhenNotRotated(t *testing.T) {
+	ctx := context.Background()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// No refresh_token in the response, no id_token either.
+		_ = json.NewEncoder(w).Encode(refreshResponse{AccessToken: "at-new"})
+	}))
+	defer srv.Close()
+
+	fs := &fakeStore{}
+	r := NewRefresher(fs, srv.URL, WithHTTPClient(srv.Client()))
+	acct := model.Account{ID: "acct-1", AccessToken: "at-old", RefreshToken: "rt-keep", IDToken: "id-old", State: model.StateOK}
+	updated, err := r.RefreshAccount(ctx, acct)
+	if err != nil {
+		t.Fatalf("RefreshAccount: %v", err)
+	}
+	if updated.AccessToken != "at-new" {
+		t.Errorf("access token = %q, want at-new", updated.AccessToken)
+	}
+	if updated.RefreshToken != "rt-keep" {
+		t.Errorf("refresh token = %q, want rt-keep (unrotated, preserved)", updated.RefreshToken)
+	}
+	// id_token was empty in the response, so the original must be preserved.
+	if updated.IDToken != "id-old" {
+		t.Errorf("id_token = %q, want id-old (preserved)", updated.IDToken)
+	}
+	// UpdatedAt must be stamped.
+	if updated.UpdatedAt.IsZero() {
+		t.Error("UpdatedAt not stamped")
+	}
+	if fs.calls != 1 || fs.gotRefresh != "rt-keep" || fs.gotAccess != "at-new" {
+		t.Errorf("UpdateTokens got id=%q access=%q refresh=%q calls=%d",
+			fs.gotID, fs.gotAccess, fs.gotRefresh, fs.calls)
+	}
+}
+
+// TestRefreshErrorPaths table-drives every failure branch in refresh().
+func TestRefreshErrorPaths(t *testing.T) {
+	tests := []struct {
+		name       string
+		acct       model.Account
+		issuer     string // if empty, an httptest server URL is substituted
+		handler    http.HandlerFunc
+		storeErr   error
+		closeSrv   bool // close the server before the call to force a transport error
+		wantSubstr string
+		wantCalls  int // expected UpdateTokens calls
+	}{
+		{
+			name:       "no refresh token",
+			acct:       model.Account{ID: "a", RefreshToken: ""},
+			issuer:     "http://unused.example",
+			wantSubstr: "has no refresh token",
+		},
+		{
+			name:       "build request bad url",
+			acct:       model.Account{ID: "a", RefreshToken: "rt"},
+			issuer:     "http://\x7f-bad-control-char",
+			wantSubstr: "build refresh request",
+		},
+		{
+			name:       "transport error",
+			acct:       model.Account{ID: "a", RefreshToken: "rt"},
+			handler:    func(w http.ResponseWriter, r *http.Request) {},
+			closeSrv:   true,
+			wantSubstr: "refresh request",
+		},
+		{
+			name: "non-200 status invalid_grant",
+			acct: model.Account{ID: "a", RefreshToken: "rt"},
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":"invalid_grant"}`))
+			},
+			wantSubstr: "refresh failed: status 400",
+		},
+		{
+			name: "invalid json body",
+			acct: model.Account{ID: "a", RefreshToken: "rt"},
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(`not-json{`))
+			},
+			wantSubstr: "decode refresh response",
+		},
+		{
+			name: "missing access_token",
+			acct: model.Account{ID: "a", RefreshToken: "rt"},
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewEncoder(w).Encode(refreshResponse{RefreshToken: "rt-rotated"})
+			},
+			wantSubstr: "missing access_token",
+		},
+		{
+			name: "persist error",
+			acct: model.Account{ID: "a", RefreshToken: "rt"},
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewEncoder(w).Encode(refreshResponse{AccessToken: "at-new", RefreshToken: "rt-new"})
+			},
+			storeErr:   errors.New("db locked"),
+			wantSubstr: "persist rotated tokens",
+			wantCalls:  1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			fs := &fakeStore{err: tt.storeErr}
+
+			issuer := tt.issuer
+			var opts []Option
+			if tt.handler != nil {
+				srv := httptest.NewServer(tt.handler)
+				defer srv.Close()
+				issuer = srv.URL
+				opts = append(opts, WithHTTPClient(srv.Client()))
+				if tt.closeSrv {
+					srv.Close() // now Do() hits a closed listener -> transport error
+				}
+			}
+
+			r := NewRefresher(fs, issuer, opts...)
+			_, err := r.RefreshAccount(ctx, tt.acct)
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tt.wantSubstr)
+			}
+			if !strings.Contains(err.Error(), tt.wantSubstr) {
+				t.Errorf("error = %q, want substring %q", err.Error(), tt.wantSubstr)
+			}
+			if fs.calls != tt.wantCalls {
+				t.Errorf("UpdateTokens calls = %d, want %d", fs.calls, tt.wantCalls)
+			}
+		})
 	}
 }
