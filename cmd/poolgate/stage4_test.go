@@ -136,10 +136,10 @@ func TestNewHealthEngineProbeModes(t *testing.T) {
 
 	refresher := oauth.NewRefresher(st, cfg.Issuer)
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	if e := newHealthEngine(st, refresher, "usage-poll-only", logger); e == nil {
+	if e := newHealthEngine(st, refresher, "usage-poll-only", logger, nil); e == nil {
 		t.Fatal("newHealthEngine(usage-poll-only) = nil")
 	}
-	if e := newHealthEngine(st, refresher, "allow-live", logger); e == nil {
+	if e := newHealthEngine(st, refresher, "allow-live", logger, nil); e == nil {
 		t.Fatal("newHealthEngine(allow-live) = nil")
 	}
 }

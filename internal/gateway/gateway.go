@@ -70,6 +70,14 @@ type HealthHooks interface {
 	OnQuotaExhausted(ctx context.Context, acct model.Account, resetAt time.Time) error
 }
 
+// EventSink receives the secret-free notification events the gateway emits when an
+// endpoint's policy group has no healthy member (DESIGN.md §11). *notify.Engine
+// satisfies it. Optional; when nil, no events are emitted. Emit MUST be
+// non-blocking so request handling is never stalled by notification I/O.
+type EventSink interface {
+	Emit(ev model.NotifyEvent)
+}
+
 // Gateway is the proxy HTTP handler set.
 type Gateway struct {
 	store        *store.Store
@@ -79,6 +87,7 @@ type Gateway struct {
 	allowlist    []string
 	logger       *slog.Logger
 	health       HealthHooks
+	events       EventSink
 
 	// cursors holds one round-robin Cursor per policy group id (load-balance
 	// strategy). It persists across requests so rotation is fair over time.
@@ -105,6 +114,11 @@ func WithLogger(l *slog.Logger) Option { return func(g *Gateway) { g.logger = l 
 // gateway drives account-state transitions on real upstream 401/429/5xx failures
 // and retries a refreshed account after a 401.
 func WithHealth(h HealthHooks) Option { return func(g *Gateway) { g.health = h } }
+
+// WithEventSink wires the notification sink (DESIGN.md §11). When set, the gateway
+// emits a secret-free policy_no_healthy_member event when an endpoint's group has
+// no routable account.
+func WithEventSink(s EventSink) Option { return func(g *Gateway) { g.events = s } }
 
 // New builds a Gateway over st using cfg (for the upstream allowlist).
 func New(st *store.Store, cfg model.Config, opts ...Option) *Gateway {
@@ -198,6 +212,7 @@ func (g *Gateway) handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	eligible := eligibleAccounts(group, accounts)
 	if len(eligible) == 0 {
+		g.emitNoHealthyMember(endpoint, group)
 		writeError(w, http.StatusServiceUnavailable, "poolgate_no_healthy_account",
 			"no_healthy_account", "no healthy account available for endpoint "+endpoint)
 		return
@@ -404,6 +419,22 @@ func (g *Gateway) anyEndpointReady(ctx context.Context) bool {
 		}
 	}
 	return false
+}
+
+// emitNoHealthyMember emits a secret-free policy_no_healthy_member event
+// (DESIGN.md §11) referencing the endpoint and group by name only. Best-effort:
+// a nil sink is a no-op and Emit never blocks.
+func (g *Gateway) emitNoHealthyMember(endpoint string, group model.PolicyGroup) {
+	if g.events == nil {
+		return
+	}
+	g.events.Emit(model.NotifyEvent{
+		Kind:        model.EventPolicyNoHealthyMember,
+		Endpoint:    endpoint,
+		PolicyGroup: group.Name,
+		Message:     "poolgate: endpoint " + endpoint + " has no healthy account (policy group " + group.Name + ")",
+		At:          time.Now().UTC(),
+	})
 }
 
 // checkEgress refuses Authorization-bearing egress to any host not on the
