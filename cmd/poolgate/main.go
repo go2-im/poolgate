@@ -22,14 +22,18 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/go2-im/poolgate/internal/authimport"
 	"github.com/go2-im/poolgate/internal/config"
 	"github.com/go2-im/poolgate/internal/crypto"
 	"github.com/go2-im/poolgate/internal/gateway"
+	"github.com/go2-im/poolgate/internal/health"
 	"github.com/go2-im/poolgate/internal/model"
+	"github.com/go2-im/poolgate/internal/oauth"
 	"github.com/go2-im/poolgate/internal/store"
+	usagepkg "github.com/go2-im/poolgate/internal/usage"
 )
 
 // errUsage is a sentinel returned by run for a usage error (unknown/missing
@@ -109,7 +113,8 @@ func usage(w io.Writer) {
 usage:
   poolgate init                 initialize data dir, master key, and DB
   poolgate import <auth.json>   import a Codex account (explicit, never automatic)
-  poolgate serve                start the proxy listener
+                                [--strategy fallback|best-quota|load-balance]
+  poolgate serve                start the proxy listener + health scheduler
 
 environment:
   POOLGATE_DATA_DIR   override the data directory (default: `+config.DefaultDataDir+`)
@@ -199,13 +204,14 @@ func cmdInit(_ []string, stdout io.Writer) error {
 }
 
 // cmdImport parses a Codex auth.json and stores the account. If the store has no
-// policy group / endpoint / key yet, it creates a default fallback group over
-// the imported account, a `default` endpoint, and one sk- key (printed once).
+// policy group / endpoint / key yet, it creates a default group over the imported
+// account (strategy from --strategy, default fallback), a `default` endpoint, and
+// one sk- key (printed once).
 func cmdImport(args []string, stdout io.Writer) error {
-	if len(args) < 1 {
-		return errors.New("usage: poolgate import <auth.json>")
+	path, strategy, err := parseImportArgs(args)
+	if err != nil {
+		return err
 	}
-	path := args[0]
 
 	cfg, err := loadConfig()
 	if err != nil {
@@ -239,7 +245,7 @@ func cmdImport(args []string, stdout io.Writer) error {
 
 	group, err := st.InsertPolicyGroup(ctx, model.PolicyGroup{
 		Name:             defaultGroupName,
-		Strategy:         model.StrategyFallback,
+		Strategy:         strategy,
 		MemberAccountIDs: []string{acct.ID},
 	})
 	if err != nil {
@@ -256,15 +262,59 @@ func cmdImport(args []string, stdout io.Writer) error {
 		return err
 	}
 
-	fmt.Fprintf(stdout, "created default fallback group %q, endpoint %q\n", defaultGroupName, defaultEndpointName)
+	fmt.Fprintf(stdout, "created default %s group %q, endpoint %q\n", strategy, defaultGroupName, defaultEndpointName)
 	fmt.Fprintf(stdout, "\nProxy URL:  http://%s:%d/e/%s/v1/responses\n",
 		cfg.Server.Proxy.Host, cfg.Server.Proxy.Port, defaultEndpointName)
 	fmt.Fprintf(stdout, "API key (shown once — store it now):\n  %s\n", skKey)
 	return nil
 }
 
-// cmdServe starts the proxy listener with the translation gateway. It blocks
-// until ctx is cancelled (graceful shutdown) or the server fails.
+// parseImportArgs extracts the auth.json path and the optional --strategy value
+// (order-independent). The strategy defaults to fallback and must be one of the
+// three v1 strategies (DESIGN.md §0 D7).
+func parseImportArgs(args []string) (path string, strategy model.Strategy, err error) {
+	strategy = model.StrategyFallback
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--strategy" || a == "-strategy":
+			if i+1 >= len(args) {
+				return "", "", errors.New("usage: poolgate import <auth.json> [--strategy fallback|best-quota|load-balance]")
+			}
+			strategy = model.Strategy(args[i+1])
+			i++
+		case strings.HasPrefix(a, "--strategy="):
+			strategy = model.Strategy(strings.TrimPrefix(a, "--strategy="))
+		case strings.HasPrefix(a, "-strategy="):
+			strategy = model.Strategy(strings.TrimPrefix(a, "-strategy="))
+		default:
+			if path == "" {
+				path = a
+			}
+		}
+	}
+	if path == "" {
+		return "", "", errors.New("usage: poolgate import <auth.json> [--strategy fallback|best-quota|load-balance]")
+	}
+	if !validStrategy(strategy) {
+		return "", "", fmt.Errorf("invalid --strategy %q (want fallback, best-quota, or load-balance)", strategy)
+	}
+	return path, strategy, nil
+}
+
+// validStrategy reports whether s is one of the three v1 strategies.
+func validStrategy(s model.Strategy) bool {
+	switch s {
+	case model.StrategyFallback, model.StrategyBestQuota, model.StrategyLoadBalance:
+		return true
+	default:
+		return false
+	}
+}
+
+// cmdServe starts the proxy listener with the translation gateway and the health
+// scheduler loop. It blocks until ctx is cancelled (graceful shutdown) or the
+// server fails.
 func cmdServe(ctx context.Context, _ []string, stdout io.Writer) error {
 	cfg, err := loadConfig()
 	if err != nil {
@@ -277,8 +327,39 @@ func cmdServe(ctx context.Context, _ []string, stdout io.Writer) error {
 	defer st.Close()
 
 	logger := slog.New(slog.NewJSONHandler(stdout, nil))
-	gw := gateway.New(st, cfg, gateway.WithLogger(logger))
+
+	// Health engine: reuse the SAME oauth single-flight refresher the gateway hot
+	// path uses (DESIGN.md §19.3), poll usage for zero-spend quota/recovery, and
+	// gate the probe cost by the configured mode (usage-poll-only by default).
+	refresher := oauth.NewRefresher(st, cfg.Issuer)
+	engine := newHealthEngine(st, refresher, cfg.HealthProbeMode, logger)
+
+	gw := gateway.New(st, cfg, gateway.WithLogger(logger), gateway.WithHealth(engine))
+
+	// Thin scheduler goroutine: engine.Run ticks with the real clock and returns
+	// ctx.Err() on cancellation (graceful shutdown alongside the proxy).
+	go func() {
+		if err := engine.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			logger.Warn("health scheduler stopped", slog.Any("err", err))
+		}
+	}()
+
+	logger.Info("health scheduler started", slog.String("probe_mode", cfg.HealthProbeMode))
 	return serveGateway(ctx, cfg, gw, logger, nil)
+}
+
+// newHealthEngine builds the health probe engine. The zero-spend auth-check is
+// always wired; small-live-requests are opt-in via probeMode == "allow-live"
+// (bounded by the per-account daily budget in the engine).
+func newHealthEngine(st *store.Store, refresher *oauth.Refresher, probeMode string, logger *slog.Logger) *health.Engine {
+	opts := []health.Option{
+		health.WithLogger(logger),
+		health.WithAuthProbe(health.NewModelsAuthChecker()),
+	}
+	if probeMode == "allow-live" {
+		opts = append(opts, health.WithAllowLive(true), health.WithLiveProbe(health.NewLiveRequester()))
+	}
+	return health.New(st, usagepkg.New(), refresher, opts...)
 }
 
 // serveGateway binds the proxy listener and serves the gateway routes until ctx

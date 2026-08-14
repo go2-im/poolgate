@@ -98,6 +98,83 @@ type PolicyGroup struct {
 	MemberAccountIDs []string `json:"member_account_ids"`
 }
 
+// UsageWindow is one generic rate-limit window read from the upstream usage
+// endpoint (DESIGN.md §0 D4). It intentionally carries NO fixed 5h/1week
+// semantics: Name is a display label (e.g. "primary"/"secondary" or an
+// additional limit's name), and the window is described purely by its used
+// percentage, its length in seconds, and when it resets.
+type UsageWindow struct {
+	Name          string    `json:"name"`
+	UsedPercent   float64   `json:"used_percent"`
+	WindowSeconds int       `json:"window_seconds"`
+	ResetsAt      time.Time `json:"resets_at"`
+}
+
+// Headroom returns the remaining percentage headroom (100 - used_percent),
+// clamped to [0,100]. best-quota routing uses the min headroom across windows
+// (DESIGN.md §4 / §24.2).
+func (w UsageWindow) Headroom() float64 {
+	h := 100 - w.UsedPercent
+	if h < 0 {
+		return 0
+	}
+	if h > 100 {
+		return 100
+	}
+	return h
+}
+
+// Usage is the generic usage model: a plan type plus N percent-usage windows.
+// It is what internal/usage.Client returns after parsing GET /wham/usage.
+type Usage struct {
+	PlanType string        `json:"plan_type"`
+	Windows  []UsageWindow `json:"windows"`
+}
+
+// UsageSnapshot is a persisted point-in-time Usage for one account.
+type UsageSnapshot struct {
+	ID         string        `json:"id"`
+	AccountID  string        `json:"account_id"`
+	PlanType   string        `json:"plan_type"`
+	Windows    []UsageWindow `json:"windows"`
+	CapturedAt time.Time     `json:"captured_at"`
+}
+
+// HealthCheckKind labels the probe that produced a HealthCheck record
+// (DESIGN.md §12 probe kinds).
+type HealthCheckKind string
+
+const (
+	// HealthKindUsagePoll — GET /wham/usage (zero token spend).
+	HealthKindUsagePoll HealthCheckKind = "usage_poll"
+	// HealthKindAuthCheck — authenticated GET /models (zero token spend).
+	HealthKindAuthCheck HealthCheckKind = "auth_check"
+	// HealthKindLiveRequest — tiny real completion (minimal spend).
+	HealthKindLiveRequest HealthCheckKind = "live_request"
+)
+
+// HealthCheck is one recorded probe result for an account (DESIGN.md §12).
+type HealthCheck struct {
+	ID        string          `json:"id"`
+	AccountID string          `json:"account_id"`
+	Kind      HealthCheckKind `json:"kind"`
+	OK        bool            `json:"ok"`
+	Detail    string          `json:"detail"`
+	LatencyMS int             `json:"latency_ms"`
+	At        time.Time       `json:"at"`
+}
+
+// AccountTiming holds the per-account scheduling/backoff state driven by the
+// health engine (DESIGN.md §12 scheduling & §23.1 concurrency). Zero-valued
+// timestamps mean "unset" (stored as SQL NULL).
+type AccountTiming struct {
+	CooldownUntil       time.Time `json:"cooldown_until"`
+	NextProbeAt         time.Time `json:"next_probe_at"`
+	ConsecutiveFailures int       `json:"consecutive_failures"`
+	BackoffLevel        int       `json:"backoff_level"`
+	ConcurrencyCap      int       `json:"concurrency_cap"`
+}
+
 // Config is the runtime configuration (see internal/config for loading/defaults).
 type Config struct {
 	Server            ServerConfig `yaml:"server" json:"server"`
@@ -105,6 +182,13 @@ type Config struct {
 	MasterKeySource   string       `yaml:"master_key_source" json:"master_key_source"`
 	UpstreamAllowlist []string     `yaml:"upstream_allowlist" json:"upstream_allowlist"`
 	Issuer            string       `yaml:"issuer" json:"issuer"`
+	// HealthProbeMode selects the global probe cost policy for the health
+	// engine (DESIGN.md §12 scheduling & cost control):
+	//   - "usage-poll-only" (default) — zero token spend; only usage-poll and
+	//     the zero-spend auth-check are used.
+	//   - "allow-live"      — additionally permit the opt-in small-live-request
+	//     for degraded/recovery checks, bounded by the per-account daily budget.
+	HealthProbeMode string `yaml:"health_probe_mode" json:"health_probe_mode"`
 }
 
 // ServerConfig holds the two listener bindings (admin + proxy).

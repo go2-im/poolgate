@@ -22,6 +22,7 @@ func TestDefault(t *testing.T) {
 		MasterKeySource:   DefaultMasterKeySource,
 		UpstreamAllowlist: DefaultUpstreamAllowlist(),
 		Issuer:            DefaultIssuer,
+		HealthProbeMode:   DefaultHealthProbeMode,
 	}
 	if !reflect.DeepEqual(cfg, want) {
 		t.Fatalf("Default() = %+v, want %+v", cfg, want)
@@ -119,7 +120,8 @@ func TestLoadFullYAMLOverridesEveryField(t *testing.T) {
 		"upstream_allowlist:\n" +
 		"  - a.example\n" +
 		"  - b.example\n" +
-		"issuer: https://issuer.example/token\n"
+		"issuer: https://issuer.example/token\n" +
+		"health_probe_mode: allow-live\n"
 	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -136,6 +138,7 @@ func TestLoadFullYAMLOverridesEveryField(t *testing.T) {
 		MasterKeySource:   "env",
 		UpstreamAllowlist: []string{"a.example", "b.example"},
 		Issuer:            "https://issuer.example/token",
+		HealthProbeMode:   "allow-live",
 	}
 	if !reflect.DeepEqual(cfg, want) {
 		t.Fatalf("Load(full) = %+v, want %+v", cfg, want)
@@ -270,6 +273,15 @@ func TestApplyDefaultsPerField(t *testing.T) {
 				}
 				if len(c.UpstreamAllowlist) != 2 {
 					t.Fatalf("allowlist = %v", c.UpstreamAllowlist)
+				}
+			},
+		},
+		{
+			name: "set health_probe_mode retained",
+			in:   model.Config{HealthProbeMode: "allow-live"},
+			check: func(t *testing.T, c model.Config) {
+				if c.HealthProbeMode != "allow-live" {
+					t.Fatalf("health_probe_mode = %q, want allow-live", c.HealthProbeMode)
 				}
 			},
 		},

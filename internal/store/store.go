@@ -136,6 +136,39 @@ CREATE TABLE endpoints (
 );
 `,
 	},
+	{
+		// v2 — generic usage snapshots + health-check history + per-account
+		// timing/backoff columns for the health engine (DESIGN.md §0 D4 / §5 /
+		// §12 / §23.1). Append-only: v1 above is never edited.
+		version: 2,
+		sql: `
+CREATE TABLE usage_snapshots (
+	id          TEXT PRIMARY KEY,
+	account_id  TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+	plan_type   TEXT NOT NULL DEFAULT '',
+	windows     TEXT NOT NULL DEFAULT '[]',
+	captured_at TEXT NOT NULL
+);
+CREATE INDEX idx_usage_snapshots_account ON usage_snapshots(account_id, captured_at);
+
+CREATE TABLE health_checks (
+	id          TEXT PRIMARY KEY,
+	account_id  TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+	kind        TEXT NOT NULL,
+	ok          INTEGER NOT NULL DEFAULT 0,
+	detail      TEXT NOT NULL DEFAULT '',
+	latency_ms  INTEGER NOT NULL DEFAULT 0,
+	at          TEXT NOT NULL
+);
+CREATE INDEX idx_health_checks_account ON health_checks(account_id, at);
+
+ALTER TABLE accounts ADD COLUMN cooldown_until        TEXT;
+ALTER TABLE accounts ADD COLUMN next_probe_at         TEXT;
+ALTER TABLE accounts ADD COLUMN consecutive_failures  INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE accounts ADD COLUMN backoff_level         INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE accounts ADD COLUMN concurrency_cap       INTEGER NOT NULL DEFAULT 0;
+`,
+	},
 }
 
 // Migrate applies any migrations whose version is not yet recorded. It is
@@ -355,6 +388,178 @@ func (s *Store) scanAccount(sc rowScanner) (model.Account, error) {
 	a.CreatedAt = parseTime(createdAt)
 	a.UpdatedAt = parseTime(updatedAt)
 	return a, nil
+}
+
+// ---- usage snapshots ------------------------------------------------------
+
+// SaveUsageSnapshot inserts a generic usage snapshot for an account. The
+// windows are stored as a JSON column (DESIGN.md §0 D4 / §5). If snap.ID is
+// empty a random id is generated; if CapturedAt is zero it defaults to now. The
+// stored snapshot (with its final ID/CapturedAt) is returned.
+func (s *Store) SaveUsageSnapshot(ctx context.Context, snap model.UsageSnapshot) (model.UsageSnapshot, error) {
+	if snap.AccountID == "" {
+		return model.UsageSnapshot{}, errors.New("store: usage snapshot missing account_id")
+	}
+	if snap.ID == "" {
+		snap.ID = newID("usg")
+	}
+	if snap.CapturedAt.IsZero() {
+		snap.CapturedAt = time.Now().UTC()
+	}
+	if snap.Windows == nil {
+		snap.Windows = []model.UsageWindow{}
+	}
+	windows, err := json.Marshal(snap.Windows)
+	if err != nil {
+		return model.UsageSnapshot{}, fmt.Errorf("store: marshal usage windows: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `
+INSERT INTO usage_snapshots (id, account_id, plan_type, windows, captured_at)
+VALUES (?, ?, ?, ?, ?)`,
+		snap.ID, snap.AccountID, snap.PlanType, string(windows), formatTime(snap.CapturedAt),
+	); err != nil {
+		return model.UsageSnapshot{}, fmt.Errorf("store: insert usage snapshot: %w", err)
+	}
+	return snap, nil
+}
+
+// GetLatestUsage returns the most recent usage snapshot for an account.
+// ErrNotFound is returned when the account has no snapshots.
+func (s *Store) GetLatestUsage(ctx context.Context, accountID string) (model.UsageSnapshot, error) {
+	var (
+		snap       model.UsageSnapshot
+		windows    string
+		capturedAt string
+	)
+	err := s.db.QueryRowContext(ctx, `
+SELECT id, account_id, plan_type, windows, captured_at
+FROM usage_snapshots WHERE account_id = ?
+ORDER BY captured_at DESC, id DESC LIMIT 1`, accountID,
+	).Scan(&snap.ID, &snap.AccountID, &snap.PlanType, &windows, &capturedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return model.UsageSnapshot{}, ErrNotFound
+		}
+		return model.UsageSnapshot{}, fmt.Errorf("store: get latest usage: %w", err)
+	}
+	if err := json.Unmarshal([]byte(windows), &snap.Windows); err != nil {
+		return model.UsageSnapshot{}, fmt.Errorf("store: unmarshal usage windows: %w", err)
+	}
+	snap.CapturedAt = parseTime(capturedAt)
+	return snap, nil
+}
+
+// ---- health checks --------------------------------------------------------
+
+// RecordHealthCheck appends one probe result to health_checks. If hc.ID is
+// empty a random id is generated; if At is zero it defaults to now. The stored
+// record (with its final ID/At) is returned.
+func (s *Store) RecordHealthCheck(ctx context.Context, hc model.HealthCheck) (model.HealthCheck, error) {
+	if hc.AccountID == "" {
+		return model.HealthCheck{}, errors.New("store: health check missing account_id")
+	}
+	if hc.ID == "" {
+		hc.ID = newID("hc")
+	}
+	if hc.At.IsZero() {
+		hc.At = time.Now().UTC()
+	}
+	if _, err := s.db.ExecContext(ctx, `
+INSERT INTO health_checks (id, account_id, kind, ok, detail, latency_ms, at)
+VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		hc.ID, hc.AccountID, string(hc.Kind), boolToInt(hc.OK), hc.Detail, hc.LatencyMS, formatTime(hc.At),
+	); err != nil {
+		return model.HealthCheck{}, fmt.Errorf("store: insert health check: %w", err)
+	}
+	return hc, nil
+}
+
+// ListHealthChecks returns an account's probe history newest-first, up to limit
+// rows (limit <= 0 means all).
+func (s *Store) ListHealthChecks(ctx context.Context, accountID string, limit int) ([]model.HealthCheck, error) {
+	q := `SELECT id, account_id, kind, ok, detail, latency_ms, at
+FROM health_checks WHERE account_id = ? ORDER BY at DESC, id DESC`
+	args := []any{accountID}
+	if limit > 0 {
+		q += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("store: list health checks: %w", err)
+	}
+	defer rows.Close()
+
+	var out []model.HealthCheck
+	for rows.Next() {
+		var (
+			hc   model.HealthCheck
+			kind string
+			okI  int
+			at   string
+		)
+		if err := rows.Scan(&hc.ID, &hc.AccountID, &kind, &okI, &hc.Detail, &hc.LatencyMS, &at); err != nil {
+			return nil, fmt.Errorf("store: scan health check: %w", err)
+		}
+		hc.Kind = model.HealthCheckKind(kind)
+		hc.OK = okI != 0
+		hc.At = parseTime(at)
+		out = append(out, hc)
+	}
+	return out, rows.Err()
+}
+
+// ---- account timing -------------------------------------------------------
+
+// GetAccountTiming loads the per-account scheduling/backoff state. Zero-valued
+// timestamps mean the column was NULL. ErrNotFound if the account is missing.
+func (s *Store) GetAccountTiming(ctx context.Context, id string) (model.AccountTiming, error) {
+	var (
+		t                        model.AccountTiming
+		cooldownUntil, nextProbe sql.NullString
+	)
+	err := s.db.QueryRowContext(ctx, `
+SELECT cooldown_until, next_probe_at, consecutive_failures, backoff_level, concurrency_cap
+FROM accounts WHERE id = ?`, id,
+	).Scan(&cooldownUntil, &nextProbe, &t.ConsecutiveFailures, &t.BackoffLevel, &t.ConcurrencyCap)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return model.AccountTiming{}, ErrNotFound
+		}
+		return model.AccountTiming{}, fmt.Errorf("store: get account timing: %w", err)
+	}
+	if cooldownUntil.Valid {
+		t.CooldownUntil = parseTime(cooldownUntil.String)
+	}
+	if nextProbe.Valid {
+		t.NextProbeAt = parseTime(nextProbe.String)
+	}
+	return t, nil
+}
+
+// SetAccountTiming persists the per-account scheduling/backoff state, bumping
+// updated_at. Zero-valued timestamps are written as SQL NULL.
+func (s *Store) SetAccountTiming(ctx context.Context, id string, t model.AccountTiming) error {
+	res, err := s.db.ExecContext(ctx, `
+UPDATE accounts SET
+	cooldown_until = ?, next_probe_at = ?,
+	consecutive_failures = ?, backoff_level = ?, concurrency_cap = ?,
+	updated_at = ?
+WHERE id = ?`,
+		nullableTime(t.CooldownUntil), nullableTime(t.NextProbeAt),
+		t.ConsecutiveFailures, t.BackoffLevel, t.ConcurrencyCap,
+		formatTime(time.Now().UTC()), id)
+	if err != nil {
+		return fmt.Errorf("store: set account timing: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: set account timing rows: %w", err)
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // ---- api keys -------------------------------------------------------------
@@ -581,6 +786,22 @@ func parseTime(s string) time.Time {
 }
 
 func nowRFC3339() string { return formatTime(time.Now().UTC()) }
+
+// nullableTime formats t for storage, or returns a NULL for the zero time.
+func nullableTime(t time.Time) any {
+	if t.IsZero() {
+		return nil
+	}
+	return formatTime(t)
+}
+
+// boolToInt maps a bool to SQLite's 0/1 integer boolean.
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
 
 // newID returns a short random id with the given prefix, e.g. "acct_9f3a...".
 func newID(prefix string) string {

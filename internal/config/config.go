@@ -23,6 +23,11 @@ const (
 	DefaultDataDir         = "poolgate-data"
 	DefaultMasterKeySource = "keyfile"
 
+	// DefaultHealthProbeMode is the global health-probe cost policy: usage-poll
+	// only (zero token spend). "allow-live" opts into small-live-requests
+	// (DESIGN.md §12). It is the safe default so no account is billed by probes.
+	DefaultHealthProbeMode = "usage-poll-only"
+
 	// DefaultIssuer is the OAuth token endpoint, pinned regardless of any `iss`
 	// claim in imported tokens (DESIGN.md §0 D6 / §6).
 	DefaultIssuer = "https://auth.openai.com/oauth/token"
@@ -45,6 +50,7 @@ func Default() model.Config {
 		MasterKeySource:   DefaultMasterKeySource,
 		UpstreamAllowlist: DefaultUpstreamAllowlist(),
 		Issuer:            DefaultIssuer,
+		HealthProbeMode:   DefaultHealthProbeMode,
 	}
 }
 
@@ -95,5 +101,8 @@ func applyDefaults(cfg *model.Config) {
 	}
 	if cfg.Issuer == "" {
 		cfg.Issuer = DefaultIssuer
+	}
+	if cfg.HealthProbeMode == "" {
+		cfg.HealthProbeMode = DefaultHealthProbeMode
 	}
 }
