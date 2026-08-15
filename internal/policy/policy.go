@@ -45,6 +45,11 @@ type View interface {
 	// over its usage windows of (100 - used_percent). Only consulted by
 	// best-quota. See MinHeadroom for the canonical computation from a Usage.
 	Headroom(accountID string) float64
+	// InFlight returns the number of in-flight upstream requests currently routed
+	// to the account. Consulted by load-balance for least-in-flight selection
+	// (DESIGN.md §23.1). Implementations that don't track concurrency return 0,
+	// which reduces load-balance to plain round-robin.
+	InFlight(accountID string) int
 	// Cursor returns the group's round-robin cursor (stateful, advanced by
 	// load-balance). Callers keep one Cursor per group; it is only consulted by
 	// the load-balance strategy.
@@ -111,8 +116,12 @@ func selectBestQuota(members []model.Account, view View) (model.Account, error) 
 	return best, nil
 }
 
-// selectLoadBalance round-robins across the healthy members (in stored order),
-// advancing the group's cursor by one on each successful selection.
+// selectLoadBalance distributes across the healthy members using least-in-flight
+// selection (DESIGN.md §23.1): it picks the healthy member with the fewest
+// in-flight requests, breaking ties with the group's round-robin cursor over the
+// tied set. When every healthy member has equal in-flight counts (the common case,
+// e.g. all zero when concurrency is untracked), this reduces to plain round-robin
+// (DESIGN.md §0 D7).
 func selectLoadBalance(members []model.Account, view View) (model.Account, error) {
 	healthy := make([]model.Account, 0, len(members))
 	for _, a := range members {
@@ -123,8 +132,29 @@ func selectLoadBalance(members []model.Account, view View) (model.Account, error
 	if len(healthy) == 0 {
 		return model.Account{}, ErrNoHealthyMember
 	}
-	idx := view.Cursor().next(len(healthy))
-	return healthy[idx], nil
+	// Snapshot each healthy member's in-flight count ONCE: a View backed by live
+	// counters (the gateway's) can change between reads, so computing the minimum
+	// and the tied set from separate reads could otherwise yield an empty tied set
+	// (and a divide-by-zero in the cursor). One snapshot keeps them consistent.
+	counts := make([]int, len(healthy))
+	minInFlight := 0
+	for i, a := range healthy {
+		counts[i] = view.InFlight(a.ID)
+		if i == 0 || counts[i] < minInFlight {
+			minInFlight = counts[i]
+		}
+	}
+	// Round-robin over the members tied at that minimum (stored order). The min
+	// came from this snapshot, so at least one member qualifies — tied is never
+	// empty.
+	tied := make([]model.Account, 0, len(healthy))
+	for i, a := range healthy {
+		if counts[i] == minInFlight {
+			tied = append(tied, a)
+		}
+	}
+	idx := view.Cursor().next(len(tied))
+	return tied[idx], nil
 }
 
 // Cursor is the per-group round-robin state. The zero value is ready to use.
@@ -137,10 +167,14 @@ type Cursor struct {
 }
 
 // next returns the index into a slice of the given length for the current
-// rotation position, then advances the cursor by one. mod must be > 0.
+// rotation position, then advances the cursor by one. mod <= 0 returns 0 (a
+// defensive guard so a momentarily-empty candidate set can never divide by zero).
 func (c *Cursor) next(mod int) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if mod <= 0 {
+		return 0
+	}
 	i := int(c.n % uint64(mod))
 	c.n++
 	return i
@@ -169,6 +203,7 @@ func MinHeadroom(u model.Usage) float64 {
 type StaticView struct {
 	Healthy      map[string]bool
 	HeadroomByID map[string]float64
+	InFlightByID map[string]int
 	cursor       Cursor
 }
 
@@ -177,6 +212,9 @@ func (v *StaticView) IsHealthy(accountID string) bool { return v.Healthy[account
 
 // Headroom reports the recorded headroom of the account (missing = 0).
 func (v *StaticView) Headroom(accountID string) float64 { return v.HeadroomByID[accountID] }
+
+// InFlight reports the recorded in-flight count of the account (missing = 0).
+func (v *StaticView) InFlight(accountID string) int { return v.InFlightByID[accountID] }
 
 // Cursor returns the view's round-robin cursor.
 func (v *StaticView) Cursor() *Cursor { return &v.cursor }

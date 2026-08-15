@@ -375,7 +375,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 // GetAccount loads and decrypts a single account by id.
 func (s *Store) GetAccount(ctx context.Context, id string) (model.Account, error) {
 	row := s.db.QueryRowContext(ctx, `
-SELECT id, label, access_token, refresh_token, account_id, id_token, state, created_at, updated_at
+SELECT id, label, access_token, refresh_token, account_id, id_token, state, concurrency_cap, created_at, updated_at
 FROM accounts WHERE id = ?`, id)
 	return s.scanAccount(row)
 }
@@ -383,7 +383,7 @@ FROM accounts WHERE id = ?`, id)
 // ListAccounts returns all accounts ordered by creation time then id.
 func (s *Store) ListAccounts(ctx context.Context) ([]model.Account, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, label, access_token, refresh_token, account_id, id_token, state, created_at, updated_at
+SELECT id, label, access_token, refresh_token, account_id, id_token, state, concurrency_cap, created_at, updated_at
 FROM accounts ORDER BY created_at, id`)
 	if err != nil {
 		return nil, fmt.Errorf("store: list accounts: %w", err)
@@ -472,7 +472,7 @@ func (s *Store) scanAccount(sc rowScanner) (model.Account, error) {
 		createdAt, updatedAt  string
 	)
 	if err := sc.Scan(&a.ID, &a.Label, &sealedAccess, &refresh, &a.AccountID,
-		&a.IDToken, &state, &createdAt, &updatedAt); err != nil {
+		&a.IDToken, &state, &a.ConcurrencyCap, &createdAt, &updatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return model.Account{}, ErrNotFound
 		}
