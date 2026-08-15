@@ -658,6 +658,14 @@ func TestSettings(t *testing.T) {
 	if origin, _ := m["origin"].(string); origin == "" {
 		t.Errorf("origin is empty, want the resolved admin origin")
 	}
+	// The harness config has no external_origin (origin synthesized from Host:Port)
+	// and binds http loopback, so both fields must reflect that exactly.
+	if v, ok := m["external_origin"]; !ok || v != "" {
+		t.Errorf("external_origin = %v (present=%v), want empty string", v, ok)
+	}
+	if v, ok := m["secure"].(bool); !ok || v {
+		t.Errorf("secure = %v (present=%v), want false", m["secure"], ok)
+	}
 	// The response must never carry a secret or token field.
 	for _, k := range []string{"secret", "token", "bootstrap_token", "csrf_token"} {
 		if _, ok := m[k]; ok {

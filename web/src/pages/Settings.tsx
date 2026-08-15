@@ -9,7 +9,15 @@ import {
 } from '../api'
 import { errMessage } from './ui'
 
-export function Settings({ me, onSignedOut }: { me: Me; onSignedOut: () => void }) {
+export function Settings({
+  me,
+  onSignedOut,
+  onSessionChanged,
+}: {
+  me: Me
+  onSignedOut: () => void
+  onSessionChanged: () => void | Promise<void>
+}) {
   const [settings, setSettings] = useState<SettingsData | null>(null)
   const [err, setErr] = useState('')
   const [note, setNote] = useState('')
@@ -30,6 +38,10 @@ export function Settings({ me, onSignedOut }: { me: Me; onSignedOut: () => void 
       await registerAdditionalPasskey(label.trim() || 'passkey')
       setLabel('')
       setNote('New passkey registered. You can now sign in with it on this device.')
+      // Registration rotates the session (fresh cookie + timestamps); refresh the
+      // parent `me` so the Session panel reflects the live session, not the
+      // destroyed one.
+      await onSessionChanged()
     } catch (e) {
       setErr(errMessage(e))
     } finally {

@@ -74,14 +74,26 @@ export function Notifications() {
   async function doCreate() {
     setErr('')
     setNote('')
+    // Guard the free-text numeric fields: a non-numeric entry must not be coerced
+    // to NaN (which JSON.stringify emits as null, silently discarding the value).
+    const mh = minHeadroom.trim()
+    const ded = dedup.trim()
+    if (mh && !Number.isFinite(Number(mh))) {
+      setErr('Min headroom must be a number.')
+      return
+    }
+    if (ded && !Number.isFinite(Number(ded))) {
+      setErr('Dedup window must be a number (seconds).')
+      return
+    }
     setBusy(true)
     try {
       await createNotifyChannel({
         type,
         name: name.trim(),
         events,
-        min_headroom: minHeadroom ? Number(minHeadroom) : 0,
-        dedup_seconds: dedup ? Number(dedup) : 0,
+        min_headroom: mh ? Number(mh) : 0,
+        dedup_seconds: ded ? Number(ded) : 0,
         config: {
           url: url.trim(),
           secret: secret.trim() || undefined,

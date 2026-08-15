@@ -13,6 +13,12 @@ import { errMessage } from './ui'
 // unbounded; the newest rows are kept.
 const MAX_ROWS = 300
 
+// COUNTER_DEBOUNCE_MS bounds how often live activity triggers a counters refetch.
+// Counters are always the server's authoritative aggregate — never folded on the
+// client — so they can never drift/double-count; they just lag live activity by
+// at most this window.
+const COUNTER_DEBOUNCE_MS = 4000
+
 const EMPTY_COUNTERS: RequestCounters = { total: 0, success: 0, error: 0, tokens_in: 0, tokens_out: 0 }
 
 // statusPill maps an HTTP status to a pill class (0 = transport failure = bad).
@@ -31,7 +37,23 @@ function hhmmss(iso: string): string {
   return d.toLocaleTimeString()
 }
 
-type ConnState = 'live' | 'paused' | 'connecting' | 'error'
+// mergeLogs unions two log lists, deduped by id and ordered newest-first, capped
+// at MAX_ROWS. Used so a completing history load() cannot drop live rows that
+// arrived during the fetch window, and so a record present in both the history
+// snapshot and the live stream is never rendered twice.
+function mergeLogs(a: RequestLog[], b: RequestLog[]): RequestLog[] {
+  const seen = new Set<string>()
+  const out: RequestLog[] = []
+  for (const l of [...a, ...b]) {
+    if (seen.has(l.id)) continue
+    seen.add(l.id)
+    out.push(l)
+  }
+  out.sort((x, y) => (x.at < y.at ? 1 : x.at > y.at ? -1 : 0))
+  return out.slice(0, MAX_ROWS)
+}
+
+type ConnState = 'live' | 'paused' | 'connecting' | 'error' | 'failed'
 
 export function Monitor() {
   const [draft, setDraft] = useState<MonitorFilter>({})
@@ -42,9 +64,29 @@ export function Monitor() {
   const [live, setLive] = useState(true)
   const [conn, setConn] = useState<ConnState>('paused')
   const esRef = useRef<EventSource | null>(null)
+  // ctTimer debounces counter refetches triggered by live activity.
+  const ctTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // seenRef tracks the ids already in the log list so onmessage can dedup without
+  // rescanning the whole array on every event; reset whenever the filter changes.
+  const seenRef = useRef<Set<string>>(new Set())
 
-  // load fetches the history + counters for the applied filter (the SSE stream
-  // then layers live rows on top).
+  // refreshCounters fetches the server-authoritative aggregate for a filter. It
+  // ignores stale in-flight responses via the applied identity captured by the
+  // caller (see the effect below).
+  const refreshCounters = useCallback(async (f: MonitorFilter) => {
+    try {
+      const c = await getMonitorCounters(f)
+      setCounters(c)
+    } catch {
+      // A transient counters error should not clobber the live tail; leave the
+      // last-known counts in place.
+    }
+  }, [])
+
+  // load fetches the history + counters for the applied filter and MERGES the
+  // history into whatever the live stream has already delivered (so a record
+  // streamed during the fetch window is preserved, and a record present in both
+  // is not duplicated). Counters come straight from the server.
   const load = useCallback(async () => {
     setErr('')
     try {
@@ -52,16 +94,24 @@ export function Monitor() {
         listRequestLogs({ ...applied, limit: MAX_ROWS }),
         getMonitorCounters(applied),
       ])
-      setLogs(l.logs)
+      setLogs((cur) => {
+        const merged = mergeLogs(cur, l.logs)
+        seenRef.current = new Set(merged.map((x) => x.id))
+        return merged
+      })
       setCounters(c)
     } catch (e) {
       setErr(errMessage(e))
     }
   }, [applied])
 
+  // On a filter change, clear the tail + seen set so rows from the previous filter
+  // never linger, then load fresh history.
   useEffect(() => {
+    setLogs([])
+    seenRef.current = new Set()
     void load()
-  }, [load])
+  }, [applied, load])
 
   // Live SSE: (re)open the stream whenever the applied filter changes or live is
   // toggled on; always close the previous EventSource first, and on cleanup.
@@ -76,7 +126,14 @@ export function Monitor() {
     const es = new EventSource(monitorStreamURL(applied))
     esRef.current = es
     es.onopen = () => setConn('live')
-    es.onerror = () => setConn('error') // EventSource auto-retries in the background
+    es.onerror = () => {
+      // Per the SSE spec, EventSource only auto-retries a connection that had
+      // opened and then dropped (readyState CONNECTING). A non-2xx initial
+      // response (e.g. 503 when the monitor is not wired) CLOSES the connection
+      // permanently — surface that as a distinct "failed" state rather than a
+      // misleading "reconnecting…".
+      setConn(es.readyState === EventSource.CLOSED ? 'failed' : 'error')
+    }
     es.onmessage = (ev) => {
       let rec: RequestLog
       try {
@@ -84,22 +141,34 @@ export function Monitor() {
       } catch {
         return
       }
-      setLogs((cur) => [rec, ...cur].slice(0, MAX_ROWS))
-      // Keep counters live by folding the new record in (server-side counters
-      // agree on next manual reload).
-      setCounters((c) => ({
-        total: c.total + 1,
-        success: c.success + (rec.status >= 200 && rec.status < 300 ? 1 : 0),
-        error: c.error + (rec.status >= 200 && rec.status < 300 ? 0 : 1),
-        tokens_in: c.tokens_in + (rec.tokens_in || 0),
-        tokens_out: c.tokens_out + (rec.tokens_out || 0),
-      }))
+      if (seenRef.current.has(rec.id)) return // dedup: already shown (history or a prior frame)
+      seenRef.current.add(rec.id)
+      setLogs((cur) => mergeLogs([rec], cur))
+      // Counters stay server-authoritative: schedule a debounced refetch instead
+      // of folding the record in (which could double-count against the aggregate
+      // or be lost when a history load resolves).
+      if (ctTimer.current === null) {
+        ctTimer.current = setTimeout(() => {
+          ctTimer.current = null
+          void refreshCounters(applied)
+        }, COUNTER_DEBOUNCE_MS)
+      }
     }
     return () => {
       es.close()
       if (esRef.current === es) esRef.current = null
     }
-  }, [applied, live])
+  }, [applied, live, refreshCounters])
+
+  // Clear any pending counter-refresh timer on unmount.
+  useEffect(() => {
+    return () => {
+      if (ctTimer.current !== null) {
+        clearTimeout(ctTimer.current)
+        ctTimer.current = null
+      }
+    }
+  }, [])
 
   function apply() {
     // Trim blanks so the query omits empty facets; a new object identity triggers
@@ -124,12 +193,14 @@ export function Monitor() {
     paused: 'paused',
     connecting: 'connecting…',
     error: 'reconnecting…',
+    failed: 'disconnected — resume to retry',
   }
   const connClass: Record<ConnState, string> = {
     live: 'pill ok',
     paused: 'pill',
     connecting: 'pill warn',
-    error: 'pill bad',
+    error: 'pill warn',
+    failed: 'pill bad',
   }
 
   function set(k: keyof MonitorFilter, v: string) {

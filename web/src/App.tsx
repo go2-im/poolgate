@@ -51,7 +51,9 @@ export function App() {
       {page === 'endpoints' && <Endpoints />}
       {page === 'keys' && <ApiKeys />}
       {page === 'notifications' && <Notifications />}
-      {page === 'settings' && <Settings me={state.me} onSignedOut={refresh} />}
+      {page === 'settings' && (
+        <Settings me={state.me} onSignedOut={refresh} onSessionChanged={refresh} />
+      )}
     </Layout>
   )
 }
