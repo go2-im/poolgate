@@ -46,6 +46,10 @@ poolgate init                       # provision config/data dir + master key; pr
 poolgate import ~/.codex/auth.json  # explicit — accounts are never imported automatically
 poolgate serve                      # start the proxy (127.0.0.1:8787) + admin (127.0.0.1:7070)
 
+# open the passkey-protected admin UI (register your first passkey with the
+# bootstrap token from `poolgate init`):
+#   http://127.0.0.1:7070
+
 # point your Codex/Cursor/OpenAI client at:
 #   http://127.0.0.1:8787/e/<endpoint>/v1
 ```

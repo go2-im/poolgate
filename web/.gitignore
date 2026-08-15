@@ -1,0 +1,10 @@
+# Frontend build tooling — never commit installed deps or an npmrc/lockfile that
+# could pin a private registry URL. The BUILT output (../internal/webui/dist) IS
+# committed so the Go binary embeds it and `go build`/`install.sh` need no npm.
+node_modules/
+.npmrc
+package-lock.json
+npm-shrinkwrap.json
+yarn.lock
+pnpm-lock.yaml
+*.tsbuildinfo

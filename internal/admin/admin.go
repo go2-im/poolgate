@@ -123,6 +123,7 @@ type Server struct {
 	webauthn Ceremonies
 	notifier Notifier
 	monitor  MonitorStream
+	spa      http.Handler
 
 	origin   string // canonical admin origin (scheme://host[:port]) for CORS
 	secure   bool   // set the Secure cookie flag (origin is https)
@@ -186,6 +187,14 @@ func WithNotifier(n Notifier) Option {
 // still work directly from the store).
 func WithMonitor(m MonitorStream) Option {
 	return func(s *Server) { s.monitor = m }
+}
+
+// WithSPA mounts the embedded admin single-page app (DESIGN.md §9 phase 4) as an
+// UNAUTHENTICATED catch-all so the login UI loads before a session exists. When
+// unset, non-API routes 404 (headless / API-only deployments). The handler must
+// itself refuse the /admin/ namespace.
+func WithSPA(h http.Handler) Option {
+	return func(s *Server) { s.spa = h }
 }
 
 // New builds a Server. All three collaborators must be non-nil. The admin origin
@@ -280,6 +289,14 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /admin/api/monitor/logs", s.guard(s.handleMonitorLogs))
 	mux.HandleFunc("GET /admin/api/monitor/counters", s.guard(s.handleMonitorCounters))
 	mux.HandleFunc("GET /admin/api/monitor/stream", s.guard(s.handleMonitorStream))
+
+	// Embedded SPA (unauthenticated catch-all): serves the admin UI + assets and
+	// falls back to index.html for client-side routes. Registered last / most
+	// general; the specific /admin/... patterns above take precedence, and the
+	// handler itself refuses the /admin/ namespace.
+	if s.spa != nil {
+		mux.Handle("GET /", s.spa)
+	}
 }
 
 // ---- origin resolution ----------------------------------------------------
