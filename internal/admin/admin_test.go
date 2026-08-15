@@ -142,6 +142,42 @@ func TestCSRFRequiredOnStateChanging(t *testing.T) {
 	}
 }
 
+func TestCORSLoopbackAlias(t *testing.T) {
+	h := newHarness(t) // origin resolves to http://127.0.0.1:7070
+	cookie, _ := h.authed()
+
+	// A loopback alias (localhost) on the same scheme+port is accepted, and the
+	// ACAO echoes the request origin so credentialed CORS works.
+	rec := h.do(http.MethodGet, "/admin/me", nil, func(r *http.Request) {
+		r.AddCookie(cookie)
+		r.Header.Set("Origin", "http://localhost:7070")
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("loopback alias = %d, want 200", rec.Code)
+	}
+	if acao := rec.Header().Get("Access-Control-Allow-Origin"); acao != "http://localhost:7070" {
+		t.Errorf("ACAO = %q, want the request origin echoed", acao)
+	}
+
+	// A loopback host on a DIFFERENT port is still cross-origin -> 403.
+	rec = h.do(http.MethodGet, "/admin/me", nil, func(r *http.Request) {
+		r.AddCookie(cookie)
+		r.Header.Set("Origin", "http://localhost:9999")
+	})
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("different-port loopback = %d, want 403", rec.Code)
+	}
+
+	// A non-loopback host is rejected even on the same port.
+	rec = h.do(http.MethodGet, "/admin/me", nil, func(r *http.Request) {
+		r.AddCookie(cookie)
+		r.Header.Set("Origin", "http://10.0.0.5:7070")
+	})
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("non-loopback host = %d, want 403", rec.Code)
+	}
+}
+
 func TestCORSSameOrigin(t *testing.T) {
 	h := newHarness(t)
 	cookie, csrf := h.authed()

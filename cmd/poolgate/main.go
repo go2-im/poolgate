@@ -41,6 +41,7 @@ import (
 	"github.com/go2-im/poolgate/internal/store"
 	usagepkg "github.com/go2-im/poolgate/internal/usage"
 	"github.com/go2-im/poolgate/internal/webauthnsvc"
+	"github.com/go2-im/poolgate/internal/webui"
 )
 
 // errUsage is a sentinel returned by run for a usage error (unknown/missing
@@ -482,7 +483,14 @@ func buildAdminHandler(cfg model.Config, st *store.Store, logger *slog.Logger, n
 	if err != nil {
 		return nil, fmt.Errorf("webauthn: %w", err)
 	}
-	srv, err := admin.New(cfg, st, mgr, wa, admin.WithNotifier(notifier), admin.WithMonitor(mon))
+	opts := []admin.Option{admin.WithNotifier(notifier), admin.WithMonitor(mon)}
+	// Mount the embedded admin SPA when a bundle is present; otherwise run API-only.
+	if spa, serr := webui.Handler(); serr == nil {
+		opts = append(opts, admin.WithSPA(spa))
+	} else {
+		logger.Warn("admin UI bundle unavailable; serving API only", slog.Any("err", serr))
+	}
+	srv, err := admin.New(cfg, st, mgr, wa, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("admin api: %w", err)
 	}

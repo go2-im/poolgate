@@ -7,6 +7,7 @@ import (
 	"context"
 	"net"
 	"net/http"
+	"net/url"
 
 	"github.com/go2-im/poolgate/internal/model"
 )
@@ -42,12 +43,14 @@ func (s *Server) cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
 		if origin != "" {
-			if origin != s.origin {
+			if !s.originAllowed(origin) {
 				writeErr(w, http.StatusForbidden, errForbidden, "cross-origin request rejected")
 				return
 			}
 			h := w.Header()
-			h.Set("Access-Control-Allow-Origin", s.origin)
+			// Echo the (validated) request origin — required for credentialed CORS,
+			// and lets a loopback alias (localhost vs 127.0.0.1) work.
+			h.Set("Access-Control-Allow-Origin", origin)
 			h.Set("Access-Control-Allow-Credentials", "true")
 			h.Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
 			h.Set("Access-Control-Allow-Headers", "Content-Type, "+CSRFHeaderName)
@@ -59,6 +62,36 @@ func (s *Server) cors(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// originAllowed reports whether a request Origin may access the admin API. It is
+// the resolved admin origin exactly, OR — when that origin is loopback — a
+// loopback alias with the same scheme+port (so an operator who opens
+// http://localhost:7070 works even though the origin resolved to
+// http://127.0.0.1:7070, and vice versa). A genuine cross-site origin (any
+// non-loopback host) is still rejected.
+func (s *Server) originAllowed(origin string) bool {
+	if origin == s.origin {
+		return true
+	}
+	req, err1 := url.Parse(origin)
+	self, err2 := url.Parse(s.origin)
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	if req.Scheme != self.Scheme || req.Port() != self.Port() {
+		return false
+	}
+	return isLoopbackHost(req.Hostname()) && isLoopbackHost(self.Hostname())
+}
+
+// isLoopbackHost reports whether h is a loopback host name or IP.
+func isLoopbackHost(h string) bool {
+	if h == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(h)
+	return ip != nil && ip.IsLoopback()
 }
 
 // guard wraps a handler so it runs only for a valid admin session, and — for

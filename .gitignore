@@ -25,8 +25,10 @@ master.key
 /web/dist/
 /web/.vite/
 
-# ---- embedded build output (generated at build time) ----
-/internal/webui/dist/
+# ---- embedded admin UI bundle ----
+# The BUILT SPA (internal/webui/dist) IS committed so `go build` / `install.sh`
+# embed the UI with no npm step (single-binary ethos). Rebuild it with
+# `cd web && npm install && npm run build`.
 
 # ---- editor / OS ----
 .DS_Store
