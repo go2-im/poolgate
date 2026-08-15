@@ -182,6 +182,7 @@ type fakeStore struct {
 	usage    map[string]model.UsageSnapshot
 	checks   map[string][]model.HealthCheck
 	channels map[string]model.NotifyChannel
+	reqLogs  []model.RequestLog
 	seq      int
 	failList bool // force list operations to error
 }
@@ -535,4 +536,78 @@ func (f *fakeStore) DeleteNotifyChannel(_ context.Context, id string) error {
 	}
 	delete(f.channels, id)
 	return nil
+}
+
+// ---- fake request logs (monitor) -----------------------------------------
+
+func (f *fakeStore) ListRequestLogs(_ context.Context, filter model.RequestLogFilter, limit, offset int) ([]model.RequestLog, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failList {
+		return nil, errors.New("list failed")
+	}
+	var out []model.RequestLog
+	for _, l := range f.reqLogs {
+		if filter.Matches(l) {
+			out = append(out, l)
+		}
+	}
+	if offset > 0 {
+		if offset >= len(out) {
+			return nil, nil
+		}
+		out = out[offset:]
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (f *fakeStore) CountRequestLogs(_ context.Context, filter model.RequestLogFilter) (store.RequestCounters, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failList {
+		return store.RequestCounters{}, errors.New("count failed")
+	}
+	var c store.RequestCounters
+	for _, l := range f.reqLogs {
+		if !filter.Matches(l) {
+			continue
+		}
+		c.Total++
+		if l.Status >= 200 && l.Status < 300 {
+			c.Success++
+		}
+		c.TokensIn += l.TokensIn
+		c.TokensOut += l.TokensOut
+	}
+	c.Error = c.Total - c.Success
+	return c, nil
+}
+
+// fakeMonitor is an in-memory MonitorStream: Subscribe returns a channel the test
+// feeds via push().
+type fakeMonitor struct {
+	mu   sync.Mutex
+	subs []chan model.RequestLog
+}
+
+func (m *fakeMonitor) Subscribe(_ model.RequestLogFilter) (<-chan model.RequestLog, func()) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ch := make(chan model.RequestLog, 8)
+	m.subs = append(m.subs, ch)
+	return ch, func() {}
+}
+
+func (m *fakeMonitor) push(l model.RequestLog) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, ch := range m.subs {
+		select {
+		case ch <- l:
+		default:
+		}
+	}
 }

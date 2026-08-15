@@ -189,7 +189,7 @@ func TestBootstrapFirstPasskeyEndToEnd(t *testing.T) {
 	defer st.Close()
 
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	handler, err := buildAdminHandler(cfg, st, logger, nil)
+	handler, err := buildAdminHandler(cfg, st, logger, nil, nil)
 	if err != nil {
 		t.Fatalf("buildAdminHandler: %v", err)
 	}
@@ -312,7 +312,7 @@ func TestBuildAdminHandlerError(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	st := openStoreForTest(t, cfg)
 	defer st.Close()
-	if _, err := buildAdminHandler(cfg, st, logger, nil); err == nil {
+	if _, err := buildAdminHandler(cfg, st, logger, nil, nil); err == nil {
 		t.Fatal("buildAdminHandler with invalid admin origin = nil, want error")
 	}
 }
@@ -331,7 +331,7 @@ func TestServeBothSmoke(t *testing.T) {
 
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	gw := gateway.New(st, cfg, gateway.WithLogger(logger))
-	adminHandler, err := buildAdminHandler(cfg, st, logger, nil)
+	adminHandler, err := buildAdminHandler(cfg, st, logger, nil, nil)
 	if err != nil {
 		t.Fatalf("buildAdminHandler: %v", err)
 	}
@@ -400,7 +400,7 @@ func TestServeBothProxyListenError(t *testing.T) {
 	defer st.Close()
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	gw := gateway.New(st, cfg, gateway.WithLogger(logger))
-	adminHandler, err := buildAdminHandler(cfg, st, logger, nil)
+	adminHandler, err := buildAdminHandler(cfg, st, logger, nil, nil)
 	if err != nil {
 		t.Fatalf("buildAdminHandler: %v", err)
 	}
@@ -419,7 +419,7 @@ func TestServeBothAdminListenError(t *testing.T) {
 	defer st.Close()
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	gw := gateway.New(st, cfg, gateway.WithLogger(logger))
-	adminHandler, err := buildAdminHandler(cfg, st, logger, nil)
+	adminHandler, err := buildAdminHandler(cfg, st, logger, nil, nil)
 	if err != nil {
 		t.Fatalf("buildAdminHandler: %v", err)
 	}
@@ -437,7 +437,7 @@ func TestServeAdminNonLoopbackNotice(t *testing.T) {
 	st := openStoreForTest(t, cfg)
 	defer st.Close()
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	adminHandler, err := buildAdminHandler(cfg, st, logger, nil)
+	adminHandler, err := buildAdminHandler(cfg, st, logger, nil, nil)
 	if err != nil {
 		t.Fatalf("buildAdminHandler: %v", err)
 	}

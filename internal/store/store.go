@@ -240,6 +240,39 @@ CREATE TABLE notify_channels (
 );
 `,
 	},
+	{
+		// v5 — request logs for the real-time monitor (DESIGN.md §15 / §24.1). One
+		// secret-free row per proxied request; indexed on the columns the monitor
+		// filters/streams by (time, api key, model, session, account, status).
+		// Append-only: v1–v4 above are never edited.
+		version: 5,
+		sql: `
+CREATE TABLE request_logs (
+	id            TEXT PRIMARY KEY,
+	at            TEXT NOT NULL,
+	endpoint      TEXT NOT NULL DEFAULT '',
+	policy        TEXT NOT NULL DEFAULT '',
+	account_id    TEXT NOT NULL DEFAULT '',
+	account_label TEXT NOT NULL DEFAULT '',
+	model         TEXT NOT NULL DEFAULT '',
+	api_key_id    TEXT NOT NULL DEFAULT '',
+	api_key_label TEXT NOT NULL DEFAULT '',
+	session_id    TEXT NOT NULL DEFAULT '',
+	status        INTEGER NOT NULL DEFAULT 0,
+	latency_ms    INTEGER NOT NULL DEFAULT 0,
+	tokens_in     INTEGER NOT NULL DEFAULT 0,
+	tokens_out    INTEGER NOT NULL DEFAULT 0,
+	trace         TEXT NOT NULL DEFAULT '',
+	error_type    TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX idx_request_logs_at      ON request_logs(at);
+CREATE INDEX idx_request_logs_apikey  ON request_logs(api_key_id, at);
+CREATE INDEX idx_request_logs_model   ON request_logs(model, at);
+CREATE INDEX idx_request_logs_session ON request_logs(session_id, at);
+CREATE INDEX idx_request_logs_account ON request_logs(account_id, at);
+CREATE INDEX idx_request_logs_status  ON request_logs(status, at);
+`,
+	},
 }
 
 // Migrate applies any migrations whose version is not yet recorded. It is
@@ -846,7 +879,19 @@ func (s *Store) ResolveEndpoint(ctx context.Context, name string) (model.Endpoin
 // timeLayout is the timestamp storage format (RFC3339 with nanoseconds, UTC).
 const timeLayout = "2006-01-02T15:04:05.999999999Z07:00"
 
+// timeLayoutFixed is a FIXED-WIDTH variant (always 9 fractional digits) used for
+// columns that are range-filtered or ORDER BY'd as TEXT under SQLite's byte-wise
+// BINARY collation (e.g. request_logs.at). The variable-width timeLayout drops
+// trailing-zero fractions, so lexical order there is NOT chronological; the
+// zero-padded form makes lexical order equal chronological order. parseTime reads
+// both (its ".999999999" accepts any fraction width).
+const timeLayoutFixed = "2006-01-02T15:04:05.000000000Z07:00"
+
 func formatTime(t time.Time) string { return t.UTC().Format(timeLayout) }
+
+// formatTimeFixed formats t with fixed-width nanoseconds for lexically-orderable
+// storage/comparison (see timeLayoutFixed).
+func formatTimeFixed(t time.Time) string { return t.UTC().Format(timeLayoutFixed) }
 
 func parseTime(s string) time.Time {
 	t, err := time.Parse(timeLayout, s)

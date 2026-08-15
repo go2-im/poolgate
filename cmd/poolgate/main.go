@@ -35,6 +35,7 @@ import (
 	"github.com/go2-im/poolgate/internal/gateway"
 	"github.com/go2-im/poolgate/internal/health"
 	"github.com/go2-im/poolgate/internal/model"
+	"github.com/go2-im/poolgate/internal/monitor"
 	"github.com/go2-im/poolgate/internal/notify"
 	"github.com/go2-im/poolgate/internal/oauth"
 	"github.com/go2-im/poolgate/internal/store"
@@ -417,18 +418,24 @@ func cmdServe(ctx context.Context, _ []string, stdout io.Writer) error {
 	// transitions), the gateway (no-healthy-member), and the admin "test" action.
 	notifier := notify.New(st, notify.WithLogger(logger))
 
+	// Real-time monitor (DESIGN.md §15): records a secret-free per-request log,
+	// fans it out to live SSE subscribers, and prunes old rows. Non-blocking
+	// Record keeps it off the proxy hot path.
+	mon := monitor.New(st, monitor.WithLogger(logger))
+
 	// Health engine: reuse the SAME oauth single-flight refresher the gateway hot
 	// path uses (DESIGN.md §19.3), poll usage for zero-spend quota/recovery, and
 	// gate the probe cost by the configured mode (usage-poll-only by default).
 	refresher := oauth.NewRefresher(st, cfg.Issuer)
 	engine := newHealthEngine(st, refresher, cfg.HealthProbeMode, logger, notifier)
 
-	gw := gateway.New(st, cfg, gateway.WithLogger(logger), gateway.WithHealth(engine), gateway.WithEventSink(notifier))
+	gw := gateway.New(st, cfg, gateway.WithLogger(logger), gateway.WithHealth(engine),
+		gateway.WithEventSink(notifier), gateway.WithRecorder(mon))
 
 	// Admin API handler (loopback listener), wired with the same store so the
 	// bootstrap token issued by `init` / `admin reset-auth` registers the first
 	// passkey through /admin/register/* end-to-end (DESIGN.md §3 / §16 / §17).
-	adminHandler, err := buildAdminHandler(cfg, st, logger, notifier)
+	adminHandler, err := buildAdminHandler(cfg, st, logger, notifier, mon)
 	if err != nil {
 		return err
 	}
@@ -449,6 +456,14 @@ func cmdServe(ctx context.Context, _ []string, stdout io.Writer) error {
 		}
 	}()
 
+	// Monitor recorder goroutine: persists request logs, fans out to SSE
+	// subscribers, and prunes old rows until ctx is cancelled.
+	go func() {
+		if err := mon.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			logger.Warn("monitor recorder stopped", slog.Any("err", err))
+		}
+	}()
+
 	logger.Info("health scheduler started", slog.String("probe_mode", cfg.HealthProbeMode))
 	return serveBoth(ctx, cfg, gw, adminHandler, logger, nil, nil)
 }
@@ -458,7 +473,7 @@ func cmdServe(ctx context.Context, _ []string, stdout io.Writer) error {
 // (RP resolved once from static admin config, gated by that manager as its
 // authorizer), and the admin HTTP server that mounts them. It returns the fully
 // middleware-wrapped handler (strict security headers + CSP + same-origin CORS).
-func buildAdminHandler(cfg model.Config, st *store.Store, logger *slog.Logger, notifier admin.Notifier) (http.Handler, error) {
+func buildAdminHandler(cfg model.Config, st *store.Store, logger *slog.Logger, notifier admin.Notifier, mon admin.MonitorStream) (http.Handler, error) {
 	mgr, err := adminauth.New(st)
 	if err != nil {
 		return nil, fmt.Errorf("admin auth: %w", err)
@@ -467,7 +482,7 @@ func buildAdminHandler(cfg model.Config, st *store.Store, logger *slog.Logger, n
 	if err != nil {
 		return nil, fmt.Errorf("webauthn: %w", err)
 	}
-	srv, err := admin.New(cfg, st, mgr, wa, admin.WithNotifier(notifier))
+	srv, err := admin.New(cfg, st, mgr, wa, admin.WithNotifier(notifier), admin.WithMonitor(mon))
 	if err != nil {
 		return nil, fmt.Errorf("admin api: %w", err)
 	}

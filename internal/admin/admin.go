@@ -30,6 +30,7 @@ import (
 	"github.com/go-webauthn/webauthn/webauthn"
 
 	"github.com/go2-im/poolgate/internal/model"
+	"github.com/go2-im/poolgate/internal/store"
 	"github.com/go2-im/poolgate/internal/webauthnsvc"
 )
 
@@ -73,6 +74,9 @@ type Store interface {
 	ListNotifyChannels(ctx context.Context) ([]model.NotifyChannel, error)
 	UpdateNotifyChannel(ctx context.Context, ch model.NotifyChannel) error
 	DeleteNotifyChannel(ctx context.Context, id string) error
+	// request logs (real-time monitor, DESIGN.md §15)
+	ListRequestLogs(ctx context.Context, f model.RequestLogFilter, limit, offset int) ([]model.RequestLog, error)
+	CountRequestLogs(ctx context.Context, f model.RequestLogFilter) (store.RequestCounters, error)
 }
 
 // Notifier is the optional notification surface used by the channel "send test"
@@ -80,6 +84,14 @@ type Store interface {
 // the test endpoint returns 503.
 type Notifier interface {
 	Test(ctx context.Context, ch model.NotifyChannel) error
+}
+
+// MonitorStream is the optional live request-log feed for the SSE monitor
+// endpoint (DESIGN.md §15). *monitor.Engine satisfies it. Subscribe returns a
+// filtered receive channel plus a cancel func the handler calls on disconnect.
+// When unset, GET /admin/api/monitor/stream returns 503.
+type MonitorStream interface {
+	Subscribe(f model.RequestLogFilter) (<-chan model.RequestLog, func())
 }
 
 // SessionManager is the admin-auth surface for sessions, CSRF and recovery
@@ -110,6 +122,7 @@ type Server struct {
 	sessions SessionManager
 	webauthn Ceremonies
 	notifier Notifier
+	monitor  MonitorStream
 
 	origin   string // canonical admin origin (scheme://host[:port]) for CORS
 	secure   bool   // set the Secure cookie flag (origin is https)
@@ -166,6 +179,13 @@ func WithRecoveryCodeCount(n int) Option {
 // test" action. When unset, POST …/notify/channels/{id}/test returns 503.
 func WithNotifier(n Notifier) Option {
 	return func(s *Server) { s.notifier = n }
+}
+
+// WithMonitor wires the optional live request-log feed for the SSE monitor
+// endpoint. When unset, GET …/monitor/stream returns 503 (history + counters
+// still work directly from the store).
+func WithMonitor(m MonitorStream) Option {
+	return func(s *Server) { s.monitor = m }
 }
 
 // New builds a Server. All three collaborators must be non-nil. The admin origin
@@ -256,6 +276,10 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("PATCH /admin/api/notify/channels/{id}", s.guard(s.handleNotifyChannelPatch))
 	mux.HandleFunc("DELETE /admin/api/notify/channels/{id}", s.guard(s.handleNotifyChannelDelete))
 	mux.HandleFunc("POST /admin/api/notify/channels/{id}/test", s.guard(s.handleNotifyChannelTest))
+
+	mux.HandleFunc("GET /admin/api/monitor/logs", s.guard(s.handleMonitorLogs))
+	mux.HandleFunc("GET /admin/api/monitor/counters", s.guard(s.handleMonitorCounters))
+	mux.HandleFunc("GET /admin/api/monitor/stream", s.guard(s.handleMonitorStream))
 }
 
 // ---- origin resolution ----------------------------------------------------

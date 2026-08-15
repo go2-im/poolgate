@@ -28,8 +28,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -78,6 +80,13 @@ type EventSink interface {
 	Emit(ev model.NotifyEvent)
 }
 
+// Recorder receives a secret-free per-request record for the real-time monitor
+// (DESIGN.md §15). *monitor.Engine satisfies it. Optional; when nil, no request
+// logs are recorded. Record MUST be non-blocking.
+type Recorder interface {
+	Record(l model.RequestLog)
+}
+
 // Gateway is the proxy HTTP handler set.
 type Gateway struct {
 	store        *store.Store
@@ -88,6 +97,7 @@ type Gateway struct {
 	logger       *slog.Logger
 	health       HealthHooks
 	events       EventSink
+	recorder     Recorder
 
 	// cursors holds one round-robin Cursor per policy group id (load-balance
 	// strategy). It persists across requests so rotation is fair over time.
@@ -119,6 +129,11 @@ func WithHealth(h HealthHooks) Option { return func(g *Gateway) { g.health = h }
 // emits a secret-free policy_no_healthy_member event when an endpoint's group has
 // no routable account.
 func WithEventSink(s EventSink) Option { return func(g *Gateway) { g.events = s } }
+
+// WithRecorder wires the real-time monitor recorder (DESIGN.md §15). When set, the
+// gateway records a secret-free per-request log (routing/failover trace, chosen
+// account, status, latency, best-effort token counts) for each proxied request.
+func WithRecorder(r Recorder) Option { return func(g *Gateway) { g.recorder = r } }
 
 // New builds a Gateway over st using cfg (for the upstream allowlist).
 func New(st *store.Store, cfg model.Config, opts ...Option) *Gateway {
@@ -210,9 +225,24 @@ func (g *Gateway) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Per-request monitor record (DESIGN.md §15): secret-free, populated as the
+	// request progresses and emitted at every terminal path via rec.finish.
+	rec := &requestRecord{
+		g:     g,
+		start: time.Now(),
+		log: model.RequestLog{
+			Endpoint:    endpoint,
+			Policy:      group.Name,
+			APIKeyID:    apiKey.ID,
+			APIKeyLabel: apiKey.Label,
+			SessionID:   sessionID(r, apiKey),
+		},
+	}
+
 	eligible := eligibleAccounts(group, accounts)
 	if len(eligible) == 0 {
 		g.emitNoHealthyMember(endpoint, group)
+		rec.finish(http.StatusServiceUnavailable, model.Account{}, "no_healthy_account", 0, 0)
 		writeError(w, http.StatusServiceUnavailable, "poolgate_no_healthy_account",
 			"no_healthy_account", "no healthy account available for endpoint "+endpoint)
 		return
@@ -221,12 +251,15 @@ func (g *Gateway) handleResponses(w http.ResponseWriter, r *http.Request) {
 	// Read and normalize the inbound body once (force stream:true).
 	inBody, err := io.ReadAll(io.LimitReader(r.Body, 32<<20))
 	if err != nil {
+		rec.finish(http.StatusBadRequest, model.Account{}, "bad_request", 0, 0)
 		writeError(w, http.StatusBadRequest, "poolgate_bad_request",
 			"bad_request", "failed to read request body")
 		return
 	}
+	rec.log.Model = model.SanitizeField(extractModel(inBody))
 	upBody, err := forceStream(inBody)
 	if err != nil {
+		rec.finish(http.StatusBadRequest, model.Account{}, "bad_request", 0, 0)
 		writeError(w, http.StatusBadRequest, "poolgate_bad_request",
 			"bad_request", "request body is not valid JSON")
 		return
@@ -235,6 +268,7 @@ func (g *Gateway) handleResponses(w http.ResponseWriter, r *http.Request) {
 	// (4) egress allowlist check (we carry Authorization upstream).
 	target := g.upstreamBase + "/responses"
 	if err := g.checkEgress(target); err != nil {
+		rec.finish(http.StatusBadGateway, model.Account{}, "egress_refused", 0, 0)
 		writeError(w, http.StatusBadGateway, "poolgate_egress_refused",
 			"egress_refused", err.Error())
 		return
@@ -256,10 +290,13 @@ func (g *Gateway) handleResponses(w http.ResponseWriter, r *http.Request) {
 		if serr != nil {
 			break // no remaining healthy candidate for this strategy
 		}
-		streamed, status, retryAfter := g.forward(w, r, target, upBody, acct)
+		streamed, status, retryAfter, tokensIn, tokensOut := g.forward(w, r, target, upBody, acct)
 		if streamed {
+			rec.trace = append(rec.trace, acct.ID+":streamed")
+			rec.finish(status, acct, "", tokensIn, tokensOut)
 			return // response already written to client; do not re-select.
 		}
+		rec.trace = append(rec.trace, fmt.Sprintf("%s:%d", acct.ID, status))
 		lastStatus = status
 		g.logger.Warn("account attempt failed pre-stream",
 			slog.String("endpoint", endpoint), slog.String("account", acct.ID),
@@ -267,8 +304,35 @@ func (g *Gateway) handleResponses(w http.ResponseWriter, r *http.Request) {
 		g.recordFailure(r.Context(), eligible, byID, view, acct, status, retryAfter)
 	}
 
+	rec.finish(http.StatusBadGateway, model.Account{}, "all_exhausted", 0, 0)
 	writeError(w, http.StatusBadGateway, "poolgate_all_exhausted",
 		"all_exhausted", fmt.Sprintf("all accounts failed (last upstream status %d)", lastStatus))
+}
+
+// requestRecord accumulates a monitor RequestLog across a request's lifecycle and
+// emits it once, secret-free, via finish (a no-op when no recorder is wired).
+type requestRecord struct {
+	g     *Gateway
+	start time.Time
+	log   model.RequestLog
+	trace []string
+}
+
+// finish stamps the terminal fields and hands the record to the recorder.
+func (rc *requestRecord) finish(status int, acct model.Account, errType string, tokensIn, tokensOut int) {
+	if rc.g.recorder == nil {
+		return
+	}
+	rc.log.At = rc.start
+	rc.log.Status = status
+	rc.log.AccountID = acct.ID
+	rc.log.AccountLabel = acct.Label
+	rc.log.ErrorType = errType
+	rc.log.TokensIn = tokensIn
+	rc.log.TokensOut = tokensOut
+	rc.log.LatencyMS = int(time.Since(rc.start) / time.Millisecond)
+	rc.log.Trace = model.SanitizeField(strings.Join(rc.trace, "; "))
+	rc.g.recorder.Record(rc.log)
 }
 
 // recordFailure applies the health passive hook for a pre-stream upstream failure
@@ -317,11 +381,13 @@ func (g *Gateway) recordFailure(ctx context.Context, accounts []model.Account, b
 // any byte (headers + status) has been written to the client; in that case the
 // caller MUST NOT re-select. If the upstream errors before streaming, it returns
 // streamed=false, the upstream status (0 on transport error), and any parsed
-// Retry-After so the caller may cooldown-gate and try the next account.
-func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, target string, body []byte, acct model.Account) (streamed bool, status int, retryAfter time.Duration) {
+// Retry-After so the caller may cooldown-gate and try the next account. On a
+// streamed response it also returns best-effort token counts sniffed from the
+// SSE usage event (DESIGN.md §15 / §23.4).
+func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, target string, body []byte, acct model.Account) (streamed bool, status int, retryAfter time.Duration, tokensIn, tokensOut int) {
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, target, bytes.NewReader(body))
 	if err != nil {
-		return false, 0, 0
+		return false, 0, 0, 0, 0
 	}
 
 	// Translation-gateway rewrite: Authorization + ChatGPT-Account-ID TOGETHER.
@@ -339,7 +405,7 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, target string,
 
 	resp, err := g.httpc.Do(req)
 	if err != nil {
-		return false, 0, 0
+		return false, 0, 0, 0, 0
 	}
 
 	// Pre-stream upstream error -> allow re-selection (nothing written yet).
@@ -347,15 +413,15 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, target string,
 		ra := parseRetryAfter(resp.Header.Get("Retry-After"))
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 		_ = resp.Body.Close()
-		return false, resp.StatusCode, ra
+		return false, resp.StatusCode, ra, 0, 0
 	}
 
 	// Commit to this account: relay with per-chunk flush.
 	defer resp.Body.Close()
 	relayHeaders(w, resp)
 	w.WriteHeader(resp.StatusCode)
-	relayStream(w, resp.Body)
-	return true, resp.StatusCode, 0
+	tin, tout := relayStream(w, resp.Body)
+	return true, resp.StatusCode, 0, tin, tout
 }
 
 // authenticate constant-time-compares the presented key against every stored
@@ -629,25 +695,102 @@ func relayHeaders(w http.ResponseWriter, resp *http.Response) {
 
 // relayStream copies the upstream body to the client, flushing each chunk so
 // SSE events reach the caller immediately (DESIGN.md §14 streaming pass-through).
-func relayStream(w http.ResponseWriter, body io.Reader) {
+// It also keeps a bounded tail of the stream and, at EOF, sniffs the final SSE
+// usage event for token counts (best-effort; 0 when absent — DESIGN.md §15/§23.4).
+func relayStream(w http.ResponseWriter, body io.Reader) (tokensIn, tokensOut int) {
 	flusher, _ := w.(http.Flusher)
+	tail := &tailBuffer{max: 64 << 10}
 	buf := make([]byte, 16<<10)
 	for {
 		n, err := body.Read(buf)
 		if n > 0 {
 			if _, werr := w.Write(buf[:n]); werr != nil {
-				return
+				break
 			}
 			if flusher != nil {
 				flusher.Flush()
 			}
+			_, _ = tail.Write(buf[:n])
 		}
 		if err != nil {
-			if err != io.EOF {
-				// Best-effort: propagate nothing extra mid-stream (§19.2).
-				_ = err
-			}
-			return
+			// EOF or transport error: stop. Mid-stream we propagate nothing
+			// extra (§19.2).
+			break
 		}
 	}
+	return parseUsage(tail.bytes())
+}
+
+// tailBuffer retains only the last max bytes written to it — enough to hold the
+// final SSE usage event without buffering the whole (possibly huge) stream.
+type tailBuffer struct {
+	buf []byte
+	max int
+}
+
+func (t *tailBuffer) Write(p []byte) (int, error) {
+	t.buf = append(t.buf, p...)
+	if len(t.buf) > t.max {
+		t.buf = t.buf[len(t.buf)-t.max:]
+	}
+	return len(p), nil
+}
+
+func (t *tailBuffer) bytes() []byte { return t.buf }
+
+var (
+	reInputTokens  = regexp.MustCompile(`"input_tokens"\s*:\s*(\d+)`)
+	reOutputTokens = regexp.MustCompile(`"output_tokens"\s*:\s*(\d+)`)
+)
+
+// parseUsage best-effort extracts token counts from an SSE usage payload. The
+// Responses API emits usage in the terminal event, so the LAST match in the tail
+// is the authoritative total.
+func parseUsage(b []byte) (tokensIn, tokensOut int) {
+	if m := reInputTokens.FindAllSubmatch(b, -1); len(m) > 0 {
+		tokensIn = atoiSafe(m[len(m)-1][1])
+	}
+	if m := reOutputTokens.FindAllSubmatch(b, -1); len(m) > 0 {
+		tokensOut = atoiSafe(m[len(m)-1][1])
+	}
+	return tokensIn, tokensOut
+}
+
+func atoiSafe(b []byte) int {
+	n, err := strconv.Atoi(string(b))
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// sessionID resolves the monitor's session grouping (DESIGN.md §15): a
+// client-supplied X-Session-Id header when present, else a value derived per
+// (api-key + client ip). It is sanitized (control chars stripped, length capped)
+// and is used for logging/monitoring ONLY — never for routing or affinity.
+func sessionID(r *http.Request, k model.ApiKey) string {
+	if s := r.Header.Get("X-Session-Id"); s != "" {
+		return model.SanitizeField(s)
+	}
+	return model.SanitizeField("k:" + k.ID + ":" + clientIP(r))
+}
+
+// clientIP returns the peer IP (host portion of RemoteAddr). Forwarded-header
+// resolution for trusted proxies is a separate concern (§14) and not used here.
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// extractModel best-effort reads the "model" field from the inbound JSON body so
+// the monitor can group by model. Failure yields "".
+func extractModel(body []byte) string {
+	var m struct {
+		Model string `json:"model"`
+	}
+	_ = json.Unmarshal(body, &m)
+	return m.Model
 }
