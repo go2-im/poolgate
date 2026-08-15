@@ -3,31 +3,20 @@ import {
   getHealth,
   getStatus,
   getUsage,
-  logout,
   type AccountHealth,
   type AccountUsage,
-  type Me,
   type StatusSummary,
 } from '../api'
+import { stateClass } from './ui'
 
 // minHeadroom is the smallest remaining headroom across an account's usage
 // windows (100 - used_percent), matching the best-quota metric. 100 when unknown.
 function minHeadroom(u: AccountUsage | undefined): number {
   if (!u || u.windows.length === 0) return 100
-  return Math.max(
-    0,
-    Math.min(...u.windows.map((w) => 100 - w.used_percent)),
-  )
+  return Math.max(0, Math.min(...u.windows.map((w) => 100 - w.used_percent)))
 }
 
-function stateClass(state: string): string {
-  if (state === 'ok') return 'pill ok'
-  if (state === 'unknown') return 'pill'
-  if (state === 'revoked' || state === 'dead' || state === 'expired') return 'pill bad'
-  return 'pill warn'
-}
-
-export function Dashboard({ me, onLogout }: { me: Me; onLogout: () => void }) {
+export function Dashboard() {
   const [status, setStatus] = useState<StatusSummary | null>(null)
   const [usage, setUsage] = useState<AccountUsage[]>([])
   const [health, setHealth] = useState<AccountHealth[]>([])
@@ -48,28 +37,10 @@ export function Dashboard({ me, onLogout }: { me: Me; onLogout: () => void }) {
     }
   }, [])
 
-  async function doLogout() {
-    try {
-      await logout()
-    } finally {
-      onLogout()
-    }
-  }
-
   const usageByID = new Map(usage.map((u) => [u.account_id, u]))
 
   return (
-    <div className="app">
-      <div className="topbar">
-        <div>
-          <span className="brand">poolgate</span>{' '}
-          <span className="muted">· {me.operator}</span>
-        </div>
-        <button className="ghost" onClick={doLogout}>
-          Sign out
-        </button>
-      </div>
-
+    <>
       {err && <p className="err">{err}</p>}
 
       <div className="grid">
@@ -95,7 +66,10 @@ export function Dashboard({ me, onLogout }: { me: Me; onLogout: () => void }) {
         <h2>Accounts</h2>
         <p className="muted">Per-account state and remaining quota headroom.</p>
         {health.length === 0 ? (
-          <p className="muted">No accounts imported yet — run <code>poolgate import &lt;auth.json&gt;</code>.</p>
+          <p className="muted">
+            No accounts imported yet — run <code>poolgate import &lt;auth.json&gt;</code> or use the
+            Accounts tab.
+          </p>
         ) : (
           <table>
             <thead>
@@ -124,6 +98,6 @@ export function Dashboard({ me, onLogout }: { me: Me; onLogout: () => void }) {
           </table>
         )}
       </div>
-    </div>
+    </>
   )
 }

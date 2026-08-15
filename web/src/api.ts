@@ -194,3 +194,73 @@ export const getStatus = () => get<StatusSummary>('/admin/api/status')
 export const getUsage = () => get<{ usage: AccountUsage[] }>('/admin/api/usage')
 export const getHealth = () => get<{ health: AccountHealth[] }>('/admin/api/health')
 
+// ---- resource CRUD (accounts / policy groups / endpoints / api keys) ---------
+//
+// State-changing calls (POST/PATCH/DELETE) fetch a fresh CSRF token bound to the
+// session and send it in X-CSRF-Token, matching the admin middleware.
+
+async function mutate<T>(method: string, path: string, body?: unknown): Promise<T> {
+  const csrf = await csrfToken()
+  return request<T>(method, path, body, csrf)
+}
+
+// accounts
+export interface Account {
+  id: string
+  label: string
+  account_id: string
+  state: string
+  created_at: string
+  updated_at: string
+}
+export const listAccounts = () => get<{ accounts: Account[] }>('/admin/api/accounts')
+export const importAccount = (content: string, label: string) =>
+  mutate<Account>('POST', '/admin/api/accounts/import', { content, label })
+export const deleteAccount = (id: string) =>
+  mutate<void>('DELETE', `/admin/api/accounts/${encodeURIComponent(id)}`)
+
+// policy groups
+export interface PolicyGroup {
+  id: string
+  name: string
+  strategy: string
+  member_account_ids: string[]
+}
+export const STRATEGIES = ['fallback', 'best-quota', 'load-balance'] as const
+export const listPolicyGroups = () => get<{ policy_groups: PolicyGroup[] }>('/admin/api/policy_groups')
+export const createPolicyGroup = (name: string, strategy: string, members: string[]) =>
+  mutate<PolicyGroup>('POST', '/admin/api/policy_groups', {
+    name,
+    strategy,
+    member_account_ids: members,
+  })
+export const patchPolicyGroup = (id: string, patch: { strategy?: string; member_account_ids?: string[] }) =>
+  mutate<PolicyGroup>('PATCH', `/admin/api/policy_groups/${encodeURIComponent(id)}`, patch)
+export const deletePolicyGroup = (id: string) =>
+  mutate<void>('DELETE', `/admin/api/policy_groups/${encodeURIComponent(id)}`)
+
+// endpoints
+export interface Endpoint {
+  name: string
+  group_id: string
+}
+export const listEndpoints = () => get<{ endpoints: Endpoint[] }>('/admin/api/endpoints')
+export const createEndpoint = (name: string, groupID: string) =>
+  mutate<Endpoint>('POST', '/admin/api/endpoints', { name, group_id: groupID })
+export const deleteEndpoint = (name: string) =>
+  mutate<void>('DELETE', `/admin/api/endpoints/${encodeURIComponent(name)}`)
+
+// api keys
+export interface ApiKey {
+  id: string
+  label: string
+  endpoints: string[]
+  key_masked: string
+  key?: string // present only in the one-time create response
+}
+export const listApiKeys = () => get<{ api_keys: ApiKey[] }>('/admin/api/api_keys')
+export const createApiKey = (label: string, endpoints: string[]) =>
+  mutate<ApiKey>('POST', '/admin/api/api_keys', { label, endpoints })
+export const deleteApiKey = (id: string) =>
+  mutate<void>('DELETE', `/admin/api/api_keys/${encodeURIComponent(id)}`)
+

@@ -1,12 +1,18 @@
 import { useCallback, useEffect, useState } from 'react'
 import { currentUser, type Me } from './api'
 import { Login } from './pages/Login'
+import { Layout, type Page } from './pages/Layout'
 import { Dashboard } from './pages/Dashboard'
+import { Accounts } from './pages/Accounts'
+import { PolicyGroups } from './pages/PolicyGroups'
+import { Endpoints } from './pages/Endpoints'
+import { ApiKeys } from './pages/ApiKeys'
 
 type State = { phase: 'loading' } | { phase: 'anon' } | { phase: 'authed'; me: Me }
 
 export function App() {
   const [state, setState] = useState<State>({ phase: 'loading' })
+  const [page, setPage] = useState<Page>('dashboard')
 
   const refresh = useCallback(async () => {
     try {
@@ -33,5 +39,13 @@ export function App() {
   if (state.phase === 'anon') {
     return <Login onAuthed={refresh} />
   }
-  return <Dashboard me={state.me} onLogout={refresh} />
+  return (
+    <Layout me={state.me} active={page} onNav={setPage} onLogout={refresh}>
+      {page === 'dashboard' && <Dashboard />}
+      {page === 'accounts' && <Accounts />}
+      {page === 'policies' && <PolicyGroups />}
+      {page === 'endpoints' && <Endpoints />}
+      {page === 'keys' && <ApiKeys />}
+    </Layout>
+  )
 }
