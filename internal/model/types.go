@@ -57,8 +57,13 @@ type Account struct {
 	AccountID    string       `json:"account_id"` // ChatGPT-Account-ID rewritten on the proxy path
 	IDToken      string       `json:"id_token"`
 	State        AccountState `json:"state"`
-	CreatedAt    time.Time    `json:"created_at"`
-	UpdatedAt    time.Time    `json:"updated_at"`
+	// ConcurrencyCap is the max simultaneous in-flight upstream requests routed to
+	// this account (0 = unlimited). It backs least-in-flight selection + bounded
+	// backpressure (DESIGN.md §23.1). Persisted in the accounts.concurrency_cap
+	// column; also surfaced on AccountTiming for the health engine.
+	ConcurrencyCap int       `json:"concurrency_cap"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 // ApiKey is an inbound `sk-` proxy credential. Key is compared constant-time.

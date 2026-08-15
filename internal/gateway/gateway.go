@@ -99,6 +99,16 @@ type Gateway struct {
 	events       EventSink
 	recorder     Recorder
 
+	// Concurrency control (DESIGN.md §23.1). inflight tracks per-account in-flight
+	// requests; defaultCap applies when an account's own ConcurrencyCap is 0 (0 =
+	// unlimited); queueWait is the bounded-queue window to wait for a free slot
+	// when every healthy member is capped before returning 429; retryAfterSecs is
+	// the Retry-After sent on that 429.
+	inflight       *inflight
+	defaultCap     int
+	queueWait      time.Duration
+	retryAfterSecs int
+
 	// cursors holds one round-robin Cursor per policy group id (load-balance
 	// strategy). It persists across requests so rotation is fair over time.
 	cursorsMu sync.Mutex
@@ -135,6 +145,31 @@ func WithEventSink(s EventSink) Option { return func(g *Gateway) { g.events = s 
 // account, status, latency, best-effort token counts) for each proxied request.
 func WithRecorder(r Recorder) Option { return func(g *Gateway) { g.recorder = r } }
 
+// WithDefaultConcurrencyCap sets a per-account in-flight cap applied to accounts
+// whose own ConcurrencyCap is 0 (DESIGN.md §23.1). 0 (default) means unlimited.
+func WithDefaultConcurrencyCap(n int) Option {
+	return func(g *Gateway) {
+		if n >= 0 {
+			g.defaultCap = n
+		}
+	}
+}
+
+// WithBackpressure configures the bounded-queue behavior when every healthy
+// member is at its concurrency cap: the gateway waits up to queueWait for a slot
+// to free before returning 429 with the given Retry-After (seconds). queueWait 0
+// means fail fast (immediate 429). retryAfterSecs <= 0 keeps the default (1s).
+func WithBackpressure(queueWait time.Duration, retryAfterSecs int) Option {
+	return func(g *Gateway) {
+		if queueWait >= 0 {
+			g.queueWait = queueWait
+		}
+		if retryAfterSecs > 0 {
+			g.retryAfterSecs = retryAfterSecs
+		}
+	}
+}
+
 // New builds a Gateway over st using cfg (for the upstream allowlist).
 func New(st *store.Store, cfg model.Config, opts ...Option) *Gateway {
 	g := &Gateway{
@@ -144,6 +179,8 @@ func New(st *store.Store, cfg model.Config, opts ...Option) *Gateway {
 		allowlist:    cfg.UpstreamAllowlist,
 		logger:       slog.Default(),
 		cursors:      make(map[string]*policy.Cursor),
+		inflight:     newInflight(),
+		retryAfterSecs: 1,
 		// No client Timeout: SSE streams are long-lived; cancellation rides the
 		// request context instead.
 		httpc: &http.Client{},
@@ -285,12 +322,37 @@ func (g *Gateway) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var lastStatus int
+	triedAny := false
+	bpDeadline := time.Now().Add(g.queueWait)
 	for {
 		acct, serr := policy.Select(group.Strategy, eligible, view)
 		if serr != nil {
+			// Nothing selectable. If we haven't tried anyone yet and the members
+			// are state-healthy, the only reason is that every member is at its
+			// concurrency cap → bounded-queue backpressure (DESIGN.md §23.1): wait
+			// briefly for a slot, else 429 + Retry-After.
+			if errors.Is(serr, policy.ErrNoHealthyMember) && !triedAny && g.anyCapped(eligible, view) {
+				if g.waitForSlot(r.Context(), eligible, view, bpDeadline) {
+					continue // a slot freed within the bounded-queue window
+				}
+				rec.finish(http.StatusTooManyRequests, model.Account{}, "backpressure", 0, 0)
+				w.Header().Set("Retry-After", strconv.Itoa(g.retryAfterSecs))
+				writeError(w, http.StatusTooManyRequests, "poolgate_backpressure",
+					"backpressure", "all accounts are at their concurrency limit; retry after a moment")
+				return
+			}
 			break // no remaining healthy candidate for this strategy
 		}
+		// Atomically reserve a slot honoring the account's cap. Losing this race
+		// (another request took the last slot between Select and reserve) means the
+		// account is now at cap: skip it — the next Select's atCap gate (live) will
+		// exclude it, so we either pick another member or fall into backpressure.
+		if !g.inflight.tryAdd(acct.ID, view.caps[acct.ID]) {
+			continue
+		}
+		triedAny = true
 		streamed, status, retryAfter, tokensIn, tokensOut := g.forward(w, r, target, upBody, acct)
+		g.inflight.done(acct.ID)
 		if streamed {
 			rec.trace = append(rec.trace, acct.ID+":streamed")
 			rec.finish(status, acct, "", tokensIn, tokensOut)
@@ -546,19 +608,41 @@ func routable(s model.AccountState) bool {
 }
 
 // routeView is the gateway's per-request policy.View. It filters selection to the
-// still-routable, not-yet-tried members and supplies best-quota headroom from the
-// latest usage snapshot plus the group's persistent round-robin cursor.
+// still-routable, not-yet-tried, not-at-cap members and supplies best-quota
+// headroom from the latest usage snapshot, live in-flight counts for
+// least-in-flight load-balance, and the group's persistent round-robin cursor.
 type routeView struct {
 	healthy   map[string]bool    // base routability (ok/unknown) at request start
 	headroom  map[string]float64 // best-quota min headroom (only populated for that strategy)
 	tried     map[string]bool    // accounts already attempted this request
 	refreshed map[string]bool    // accounts whose token was refreshed once after a 401
+	caps      map[string]int     // effective per-account concurrency cap (0 = unlimited)
+	inflight  *inflight          // live per-account in-flight counts (shared with the gateway)
 	cursor    *policy.Cursor
 }
 
 // IsHealthy reports whether the account is still a selectable candidate: routable
-// at request start and not yet tried in this request.
-func (v *routeView) IsHealthy(id string) bool { return v.healthy[id] && !v.tried[id] }
+// at request start, not yet tried in this request, and not at its concurrency cap.
+func (v *routeView) IsHealthy(id string) bool {
+	return v.healthy[id] && !v.tried[id] && !v.atCap(id)
+}
+
+// atCap reports whether the account is at (or over) its effective concurrency cap.
+func (v *routeView) atCap(id string) bool {
+	cap := v.caps[id]
+	if cap <= 0 || v.inflight == nil {
+		return false // unlimited (or no tracker)
+	}
+	return v.inflight.count(id) >= cap
+}
+
+// InFlight returns the account's live in-flight count (0 when untracked).
+func (v *routeView) InFlight(id string) int {
+	if v.inflight == nil {
+		return 0
+	}
+	return v.inflight.count(id)
+}
 
 // Headroom returns the account's best-quota headroom (default 100 = unconstrained
 // when no usage snapshot exists).
@@ -580,10 +664,13 @@ func (g *Gateway) buildView(ctx context.Context, group model.PolicyGroup, eligib
 		healthy:   make(map[string]bool, len(eligible)),
 		tried:     make(map[string]bool),
 		refreshed: make(map[string]bool),
+		caps:      make(map[string]int, len(eligible)),
+		inflight:  g.inflight,
 		cursor:    g.cursorFor(group.ID),
 	}
 	for _, a := range eligible {
 		v.healthy[a.ID] = routable(a.State)
+		v.caps[a.ID] = g.effectiveCap(a)
 	}
 	if group.Strategy == model.StrategyBestQuota {
 		v.headroom = make(map[string]float64, len(eligible))
@@ -596,6 +683,53 @@ func (g *Gateway) buildView(ctx context.Context, group model.PolicyGroup, eligib
 		}
 	}
 	return v
+}
+
+// effectiveCap is the account's own ConcurrencyCap, or the gateway default when
+// that is 0. 0 means unlimited (DESIGN.md §23.1).
+func (g *Gateway) effectiveCap(a model.Account) int {
+	if a.ConcurrencyCap > 0 {
+		return a.ConcurrencyCap
+	}
+	return g.defaultCap
+}
+
+// anyCapped reports whether at least one eligible member is currently at its
+// concurrency cap (i.e. concurrency limiting is actually in play).
+func (g *Gateway) anyCapped(eligible []model.Account, view *routeView) bool {
+	for _, a := range eligible {
+		if view.atCap(a.ID) {
+			return true
+		}
+	}
+	return false
+}
+
+// waitForSlot blocks until an eligible member drops below its concurrency cap, the
+// deadline passes, or the request is cancelled. It returns true if a slot freed
+// (the caller should re-select). This is the bounded queue of DESIGN.md §23.1.
+func (g *Gateway) waitForSlot(ctx context.Context, eligible []model.Account, view *routeView, deadline time.Time) bool {
+	const poll = 20 * time.Millisecond
+	for {
+		for _, a := range eligible {
+			if !view.atCap(a.ID) {
+				return true
+			}
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return false
+		}
+		wait := poll
+		if remaining < wait {
+			wait = remaining
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(wait):
+		}
+	}
 }
 
 // cursorFor returns the persistent round-robin cursor for a group id, creating it
