@@ -1,14 +1,25 @@
 import type { ReactNode } from 'react'
 import { logout, type Me } from '../api'
 
-export type Page = 'dashboard' | 'accounts' | 'policies' | 'endpoints' | 'keys'
+export type Page =
+  | 'dashboard'
+  | 'accounts'
+  | 'policies'
+  | 'endpoints'
+  | 'keys'
+  | 'notifications'
+  | 'monitor'
+  | 'settings'
 
 const NAV: { id: Page; label: string }[] = [
   { id: 'dashboard', label: 'Dashboard' },
+  { id: 'monitor', label: 'Monitor' },
   { id: 'accounts', label: 'Accounts' },
   { id: 'policies', label: 'Policies' },
   { id: 'endpoints', label: 'Endpoints' },
   { id: 'keys', label: 'API keys' },
+  { id: 'notifications', label: 'Notifications' },
+  { id: 'settings', label: 'Settings' },
 ]
 
 export function Layout({

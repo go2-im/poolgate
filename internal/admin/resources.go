@@ -466,6 +466,21 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleSettings returns the read-only, server-authoritative admin origin +
+// WebAuthn Relying Party ID so the Settings page can display the passkey scope
+// (DESIGN.md §16). These are resolved ONCE at startup from static config (never
+// from per-request headers), so the values shown are exactly what the login /
+// registration ceremonies enforce. It leaks no secrets. external_origin is empty
+// when the origin was synthesized from Host:Port rather than configured.
+func (s *Server) handleSettings(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"origin":          s.origin,
+		"external_origin": s.extOrigin,
+		"rp_id":           s.webauthn.RPID(),
+		"secure":          s.secure,
+	})
+}
+
 // writeStoreErr maps a store error to a not-found or internal response.
 func (s *Server) writeStoreErr(w http.ResponseWriter, err error, what string) {
 	if errors.Is(err, store.ErrNotFound) {

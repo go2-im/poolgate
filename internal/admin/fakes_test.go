@@ -137,6 +137,7 @@ type fakeCeremonies struct {
 	beginLoginErr  error
 	finishLoginErr error
 	lastGate       webauthnsvc.RegisterGate
+	rpID           string
 }
 
 func (f *fakeCeremonies) BeginRegistration(_ context.Context, gate webauthnsvc.RegisterGate) (*protocol.CredentialCreation, string, error) {
@@ -167,6 +168,13 @@ func (f *fakeCeremonies) FinishLogin(context.Context, string, []byte) (webauthn.
 		return nil, f.finishLoginErr
 	}
 	return fakeUser{}, nil
+}
+
+func (f *fakeCeremonies) RPID() string {
+	if f.rpID == "" {
+		return "localhost"
+	}
+	return f.rpID
 }
 
 // ---- fake store -----------------------------------------------------------
