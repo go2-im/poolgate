@@ -261,3 +261,71 @@ th {
 .muted {
   color: var(--muted);
 }
+
+/* ---- forms + tables (management pages) ---- */
+
+textarea,
+select {
+  width: 100%;
+  padding: 10px 12px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 14px;
+}
+
+textarea.mono,
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+}
+
+button.small {
+  width: auto;
+  margin: 0;
+  padding: 5px 10px;
+  font-size: 13px;
+}
+
+button.danger {
+  background: transparent;
+  color: var(--err);
+  border-color: var(--border);
+}
+
+button.danger:hover:not(:disabled) {
+  background: rgba(248, 81, 73, 0.12);
+}
+
+td.right,
+th.right {
+  text-align: right;
+  white-space: nowrap;
+}
+
+.checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  margin-top: 6px;
+}
+
+.check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  color: var(--text);
+  font-size: 14px;
+}
+
+.check input {
+  width: auto;
+  margin: 0;
+}
+
