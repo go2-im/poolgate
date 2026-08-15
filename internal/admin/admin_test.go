@@ -637,6 +637,43 @@ func TestUsageHealthStatus(t *testing.T) {
 	}
 }
 
+func TestSettings(t *testing.T) {
+	h := newHarness(t)
+	h.cer.rpID = "poolgate.example"
+	cookie, _ := h.authed()
+
+	// Guarded: no cookie → 401.
+	if rec := h.do(http.MethodGet, "/admin/api/settings", nil, nil); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated settings = %d, want 401", rec.Code)
+	}
+
+	rec := h.do(http.MethodGet, "/admin/api/settings", nil, func(r *http.Request) { r.AddCookie(cookie) })
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET settings = %d body=%s", rec.Code, rec.Body.String())
+	}
+	m := decodeBody(t, rec)
+	if m["rp_id"] != "poolgate.example" {
+		t.Errorf("rp_id = %v, want poolgate.example", m["rp_id"])
+	}
+	if origin, _ := m["origin"].(string); origin == "" {
+		t.Errorf("origin is empty, want the resolved admin origin")
+	}
+	// The harness config has no external_origin (origin synthesized from Host:Port)
+	// and binds http loopback, so both fields must reflect that exactly.
+	if v, ok := m["external_origin"]; !ok || v != "" {
+		t.Errorf("external_origin = %v (present=%v), want empty string", v, ok)
+	}
+	if v, ok := m["secure"].(bool); !ok || v {
+		t.Errorf("secure = %v (present=%v), want false", m["secure"], ok)
+	}
+	// The response must never carry a secret or token field.
+	for _, k := range []string{"secret", "token", "bootstrap_token", "csrf_token"} {
+		if _, ok := m[k]; ok {
+			t.Errorf("settings response leaked %q", k)
+		}
+	}
+}
+
 // ---- rate-limit / lockout -------------------------------------------------
 
 func TestRecoveryLockout(t *testing.T) {

@@ -264,3 +264,186 @@ export const createApiKey = (label: string, endpoints: string[]) =>
 export const deleteApiKey = (id: string) =>
   mutate<void>('DELETE', `/admin/api/api_keys/${encodeURIComponent(id)}`)
 
+// ---- notifications ------------------------------------------------------------
+//
+// Channel Config carries secrets (webhook URL, signing secret) and is write-only:
+// it is supplied on create/patch but NEVER returned. The list/get response is the
+// secret-free projection below.
+
+export type NotifyChannelType = 'dingtalk' | 'wecom' | 'webhook'
+export const CHANNEL_TYPES: NotifyChannelType[] = ['dingtalk', 'wecom', 'webhook']
+
+// The alertable event kinds (must match model.NotifyEventKind). An empty
+// selection on a channel means "all events".
+export const EVENT_KINDS = [
+  'account_expired',
+  'account_cooldown',
+  'account_quota_exhausted',
+  'account_recovered',
+  'quota_low',
+  'policy_no_healthy_member',
+  'auth_anomaly',
+  'startup_bind_warning',
+] as const
+export type NotifyEventKind = (typeof EVENT_KINDS)[number]
+
+export interface NotifyChannel {
+  id: string
+  type: NotifyChannelType
+  name: string
+  enabled: boolean
+  events: NotifyEventKind[]
+  min_headroom: number
+  dedup_seconds: number
+  created_at: string
+  updated_at: string
+}
+
+// NotifyConfigInput is the secret-carrying config sub-object (write-only).
+export interface NotifyConfigInput {
+  url: string
+  secret?: string
+  method?: string
+  headers?: Record<string, string>
+  template?: string
+}
+
+export interface NotifyChannelCreate {
+  type: NotifyChannelType
+  name: string
+  enabled?: boolean
+  events?: NotifyEventKind[]
+  min_headroom?: number
+  dedup_seconds?: number
+  config: NotifyConfigInput
+}
+
+export const listNotifyChannels = () =>
+  get<{ channels: NotifyChannel[] }>('/admin/api/notify/channels')
+export const createNotifyChannel = (body: NotifyChannelCreate) =>
+  mutate<NotifyChannel>('POST', '/admin/api/notify/channels', body)
+export const deleteNotifyChannel = (id: string) =>
+  mutate<void>('DELETE', `/admin/api/notify/channels/${encodeURIComponent(id)}`)
+export const setNotifyChannelEnabled = (id: string, enabled: boolean) =>
+  mutate<NotifyChannel>('PATCH', `/admin/api/notify/channels/${encodeURIComponent(id)}`, { enabled })
+// testNotifyChannel sends a synthetic alert to verify delivery. 502 = the channel
+// is misconfigured (upstream rejected); 503 = notifications are not enabled.
+export const testNotifyChannel = (id: string) =>
+  mutate<{ ok: boolean }>('POST', `/admin/api/notify/channels/${encodeURIComponent(id)}/test`)
+
+// ---- real-time monitor --------------------------------------------------------
+//
+// Records are secret-free (id/label only). The same filter facets narrow the
+// history query, the counters, and the live SSE stream so the three views agree.
+
+export interface RequestLog {
+  id: string
+  at: string
+  endpoint: string
+  policy: string
+  account_id: string
+  account_label: string
+  model: string
+  api_key_id: string
+  api_key_label: string
+  session_id: string
+  status: number
+  latency_ms: number
+  tokens_in: number
+  tokens_out: number
+  trace: string
+  error_type: string
+}
+
+export interface RequestCounters {
+  total: number
+  success: number
+  error: number
+  tokens_in: number
+  tokens_out: number
+}
+
+export interface MonitorFilter {
+  session?: string
+  api_key?: string
+  model?: string
+  endpoint?: string
+  account?: string
+  status?: string
+  limit?: number
+}
+
+// monitorQuery builds the shared query string; blank facets are omitted so the
+// backend treats them as "no filter".
+function monitorQuery(f: MonitorFilter): string {
+  const q = new URLSearchParams()
+  if (f.session) q.set('session', f.session)
+  if (f.api_key) q.set('api_key', f.api_key)
+  if (f.model) q.set('model', f.model)
+  if (f.endpoint) q.set('endpoint', f.endpoint)
+  if (f.account) q.set('account', f.account)
+  if (f.status) q.set('status', f.status)
+  if (f.limit) q.set('limit', String(f.limit))
+  const s = q.toString()
+  return s ? `?${s}` : ''
+}
+
+export const listRequestLogs = (f: MonitorFilter) =>
+  get<{ logs: RequestLog[] }>('/admin/api/monitor/logs' + monitorQuery(f))
+export const getMonitorCounters = (f: MonitorFilter) =>
+  get<RequestCounters>('/admin/api/monitor/counters' + monitorQuery(f))
+// monitorStreamURL is the same-origin SSE endpoint; EventSource carries the
+// session cookie automatically (GET needs no CSRF).
+export const monitorStreamURL = (f: MonitorFilter) =>
+  '/admin/api/monitor/stream' + monitorQuery(f)
+
+// ---- settings -----------------------------------------------------------------
+
+export interface Settings {
+  origin: string
+  external_origin: string
+  rp_id: string
+  secure: boolean
+}
+export const getSettings = () => get<Settings>('/admin/api/settings')
+
+// revokeAllSessions signs out every session (including this one), so the caller
+// must return to the login screen afterwards.
+export const revokeAllSessions = () =>
+  mutate<{ revoked: number }>('POST', '/admin/sessions/revoke-all', {})
+
+// registerAdditionalPasskey runs the session-gated registration ceremony (no
+// bootstrap token): both begin and finish carry the CSRF header, which the server
+// requires once a session cookie is present. No recovery codes are minted.
+export async function registerAdditionalPasskey(label: string): Promise<void> {
+  const csrf = await csrfToken()
+  const begin = await request<BeginResp>('POST', '/admin/register/begin', { bootstrap_token: '', label }, csrf)
+  const pk = begin.publicKey
+  const options: any = {
+    ...pk,
+    challenge: b64urlToBuf(pk.challenge),
+    user: { ...pk.user, id: b64urlToBuf(pk.user.id) },
+    excludeCredentials: (pk.excludeCredentials || []).map((c: any) => ({ ...c, id: b64urlToBuf(c.id) })),
+  }
+  const cred = (await navigator.credentials.create({ publicKey: options })) as PublicKeyCredential
+  if (!cred) throw new Error('registration was cancelled')
+  const att = cred.response as AuthenticatorAttestationResponse
+  const credential = {
+    id: cred.id,
+    rawId: bufToB64url(cred.rawId),
+    type: cred.type,
+    clientExtensionResults: cred.getClientExtensionResults(),
+    response: {
+      clientDataJSON: bufToB64url(att.clientDataJSON),
+      attestationObject: bufToB64url(att.attestationObject),
+      transports: typeof att.getTransports === 'function' ? att.getTransports() : [],
+    },
+  }
+  await request(
+    'POST',
+    '/admin/register/finish',
+    { challenge_id: begin.challenge_id, bootstrap_token: '', label, credential },
+    csrf,
+  )
+}
+

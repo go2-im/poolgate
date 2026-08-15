@@ -7,6 +7,9 @@ import { Accounts } from './pages/Accounts'
 import { PolicyGroups } from './pages/PolicyGroups'
 import { Endpoints } from './pages/Endpoints'
 import { ApiKeys } from './pages/ApiKeys'
+import { Notifications } from './pages/Notifications'
+import { Monitor } from './pages/Monitor'
+import { Settings } from './pages/Settings'
 
 type State = { phase: 'loading' } | { phase: 'anon' } | { phase: 'authed'; me: Me }
 
@@ -42,10 +45,15 @@ export function App() {
   return (
     <Layout me={state.me} active={page} onNav={setPage} onLogout={refresh}>
       {page === 'dashboard' && <Dashboard />}
+      {page === 'monitor' && <Monitor />}
       {page === 'accounts' && <Accounts />}
       {page === 'policies' && <PolicyGroups />}
       {page === 'endpoints' && <Endpoints />}
       {page === 'keys' && <ApiKeys />}
+      {page === 'notifications' && <Notifications />}
+      {page === 'settings' && (
+        <Settings me={state.me} onSignedOut={refresh} onSessionChanged={refresh} />
+      )}
     </Layout>
   )
 }

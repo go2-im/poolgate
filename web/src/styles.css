@@ -329,3 +329,38 @@ th.right {
   margin: 0;
 }
 
+/* ---- notifications: two-column numeric row ---- */
+
+.row2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+
+/* ---- monitor: filter grid + trace cell ---- */
+
+.filters {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.filters input {
+  margin: 0;
+}
+
+.section .topbar {
+  margin: 0 0 8px;
+  padding: 0;
+  border: none;
+}
+
+td.trace {
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+

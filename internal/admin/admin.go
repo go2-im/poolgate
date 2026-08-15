@@ -114,6 +114,9 @@ type Ceremonies interface {
 	FinishRegistration(ctx context.Context, gate webauthnsvc.RegisterGate, challengeID string, body []byte) (model.WebAuthnCredential, error)
 	BeginLogin(ctx context.Context) (*protocol.CredentialAssertion, string, error)
 	FinishLogin(ctx context.Context, challengeID string, body []byte) (webauthn.User, error)
+	// RPID returns the resolved WebAuthn Relying Party ID, surfaced read-only by
+	// the settings endpoint so the operator can confirm the passkey scope.
+	RPID() string
 }
 
 // Server wires the admin API. Construct with New; the zero value is not usable.
@@ -126,6 +129,7 @@ type Server struct {
 	spa      http.Handler
 
 	origin   string // canonical admin origin (scheme://host[:port]) for CORS
+	extOrigin string // configured external_origin (may be empty when synthesized)
 	secure   bool   // set the Secure cookie flag (origin is https)
 	now      func() time.Time
 	limiter  *limiter
@@ -209,13 +213,14 @@ func New(cfg model.Config, st Store, sessions SessionManager, wa Ceremonies, opt
 		return nil, err
 	}
 	s := &Server{
-		store:    st,
-		sessions: sessions,
-		webauthn: wa,
-		origin:   origin,
-		secure:   secure,
-		now:      func() time.Time { return time.Now().UTC() },
-		recovery: defaultRecoveryCodes,
+		store:     st,
+		sessions:  sessions,
+		webauthn:  wa,
+		origin:    origin,
+		extOrigin: strings.TrimSpace(cfg.Server.Admin.ExternalOrigin),
+		secure:    secure,
+		now:       func() time.Time { return time.Now().UTC() },
+		recovery:  defaultRecoveryCodes,
 	}
 	s.limiterMaxFailures = defaultMaxFailures
 	s.limiterWindow = defaultBruteWindow
@@ -278,6 +283,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /admin/api/usage", s.guard(s.handleUsage))
 	mux.HandleFunc("GET /admin/api/health", s.guard(s.handleHealth))
 	mux.HandleFunc("GET /admin/api/status", s.guard(s.handleStatus))
+	mux.HandleFunc("GET /admin/api/settings", s.guard(s.handleSettings))
 
 	mux.HandleFunc("GET /admin/api/notify/channels", s.guard(s.handleNotifyChannelsList))
 	mux.HandleFunc("POST /admin/api/notify/channels", s.guard(s.handleNotifyChannelCreate))
