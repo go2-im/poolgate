@@ -256,11 +256,24 @@ export interface ApiKey {
   label: string
   endpoints: string[]
   key_masked: string
-  key?: string // present only in the one-time create response
+  expires_at?: string // RFC3339; absent = never expires
+  ip_allowlist: string[] // empty = any IP
+  key?: string // present only in the one-time create/rotate response
 }
 export const listApiKeys = () => get<{ api_keys: ApiKey[] }>('/admin/api/api_keys')
-export const createApiKey = (label: string, endpoints: string[]) =>
-  mutate<ApiKey>('POST', '/admin/api/api_keys', { label, endpoints })
+export const createApiKey = (
+  label: string,
+  endpoints: string[],
+  opts: { expiresAt?: string; ipAllowlist?: string[] } = {},
+) =>
+  mutate<ApiKey>('POST', '/admin/api/api_keys', {
+    label,
+    endpoints,
+    expires_at: opts.expiresAt ?? '',
+    ip_allowlist: opts.ipAllowlist ?? [],
+  })
+export const rotateApiKey = (id: string) =>
+  mutate<ApiKey>('POST', `/admin/api/api_keys/${encodeURIComponent(id)}/rotate`)
 export const deleteApiKey = (id: string) =>
   mutate<void>('DELETE', `/admin/api/api_keys/${encodeURIComponent(id)}`)
 

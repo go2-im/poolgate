@@ -214,6 +214,15 @@ th {
   font-weight: 600;
 }
 
+th.sortable {
+  cursor: pointer;
+  user-select: none;
+}
+
+th.sortable:hover {
+  color: var(--text);
+}
+
 .section {
   margin-top: 28px;
 }

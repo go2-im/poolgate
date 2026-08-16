@@ -4,6 +4,7 @@ import {
   deleteApiKey,
   listApiKeys,
   listEndpoints,
+  rotateApiKey,
   type ApiKey,
   type Endpoint,
 } from '../api'
@@ -16,6 +17,8 @@ export function ApiKeys() {
   const [busy, setBusy] = useState(false)
   const [label, setLabel] = useState('')
   const [scoped, setScoped] = useState<string[]>([])
+  const [expiresAt, setExpiresAt] = useState('')
+  const [allowlist, setAllowlist] = useState('')
   const [freshKey, setFreshKey] = useState('')
 
   async function load() {
@@ -37,19 +40,54 @@ export function ApiKeys() {
     setScoped((s) => (s.includes(name) ? s.filter((x) => x !== name) : [...s, name]))
   }
 
+  // parseAllowlist splits the comma/space/newline-separated IP/CIDR input into a
+  // clean list; empty input means "any IP".
+  function parseAllowlist(raw: string): string[] {
+    return raw
+      .split(/[\s,]+/)
+      .map((x) => x.trim())
+      .filter(Boolean)
+  }
+
+  // toRFC3339 converts a datetime-local value (no timezone) to an RFC3339 UTC
+  // instant the backend accepts; empty means "never expires".
+  function toRFC3339(local: string): string {
+    if (!local) return ''
+    const d = new Date(local)
+    if (isNaN(d.getTime())) return local // let the backend reject a bad value
+    return d.toISOString()
+  }
+
   async function doCreate() {
     setErr('')
     setBusy(true)
     try {
-      const created = await createApiKey(label.trim(), scoped)
+      const created = await createApiKey(label.trim(), scoped, {
+        expiresAt: toRFC3339(expiresAt),
+        ipAllowlist: parseAllowlist(allowlist),
+      })
       setFreshKey(created.key ?? '')
       setLabel('')
       setScoped([])
+      setExpiresAt('')
+      setAllowlist('')
       await load()
     } catch (e) {
       setErr(errMessage(e))
     } finally {
       setBusy(false)
+    }
+  }
+
+  async function doRotate(k: ApiKey) {
+    if (!confirm(`Rotate API key "${k.label || k.id}"? The old secret stops working immediately.`)) return
+    setErr('')
+    try {
+      const rotated = await rotateApiKey(k.id)
+      setFreshKey(rotated.key ?? '')
+      await load()
+    } catch (e) {
+      setErr(errMessage(e))
     }
   }
 
@@ -80,6 +118,27 @@ export function ApiKeys() {
           placeholder="e.g. laptop-cursor"
           autoComplete="off"
         />
+        <label htmlFor="key-expiry">Expires (optional)</label>
+        <input
+          id="key-expiry"
+          type="datetime-local"
+          value={expiresAt}
+          onChange={(e) => setExpiresAt(e.target.value)}
+        />
+        <p className="muted">Leave blank for a key that never expires.</p>
+        <label htmlFor="key-allowlist">IP allowlist (optional)</label>
+        <input
+          id="key-allowlist"
+          type="text"
+          value={allowlist}
+          onChange={(e) => setAllowlist(e.target.value)}
+          placeholder="e.g. 203.0.113.7, 10.0.0.0/8"
+          autoComplete="off"
+        />
+        <p className="muted">
+          Comma/space-separated IPs or CIDRs matched against the direct peer. Blank = any IP. Behind a
+          reverse proxy the peer is the proxy, so prefer restricting at the proxy instead.
+        </p>
         <label>Endpoint scope (optional)</label>
         {endpoints.length === 0 ? (
           <p className="muted">No endpoints yet — the key will allow all endpoints.</p>
@@ -131,6 +190,8 @@ export function ApiKeys() {
                 <th>Label</th>
                 <th>Key</th>
                 <th>Scope</th>
+                <th>Expires</th>
+                <th>IP allowlist</th>
                 <th></th>
               </tr>
             </thead>
@@ -142,7 +203,14 @@ export function ApiKeys() {
                   <td className="muted">
                     {k.endpoints.length === 0 ? 'all endpoints' : k.endpoints.join(', ')}
                   </td>
+                  <td className="muted">{k.expires_at ? formatExpiry(k.expires_at) : 'never'}</td>
+                  <td className="muted">
+                    {k.ip_allowlist.length === 0 ? 'any IP' : k.ip_allowlist.join(', ')}
+                  </td>
                   <td className="right">
+                    <button className="ghost small" onClick={() => doRotate(k)}>
+                      Rotate
+                    </button>
                     <button className="danger small" onClick={() => doDelete(k)}>
                       Delete
                     </button>
@@ -155,4 +223,12 @@ export function ApiKeys() {
       </div>
     </>
   )
+}
+
+// formatExpiry renders an RFC3339 expiry compactly, flagging an already-expired key.
+function formatExpiry(rfc3339: string): string {
+  const d = new Date(rfc3339)
+  if (isNaN(d.getTime())) return rfc3339
+  const label = d.toLocaleString()
+  return d.getTime() < Date.now() ? `${label} (expired)` : label
 }
