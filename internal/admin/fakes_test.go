@@ -298,6 +298,18 @@ func (f *fakeStore) DeleteApiKey(_ context.Context, id string) error {
 	return nil
 }
 
+func (f *fakeStore) RotateApiKey(_ context.Context, id, newKey string) (model.ApiKey, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k, ok := f.keys[id]
+	if !ok {
+		return model.ApiKey{}, store.ErrNotFound
+	}
+	k.Key = newKey
+	f.keys[id] = k
+	return k, nil
+}
+
 func (f *fakeStore) InsertEndpoint(_ context.Context, e model.Endpoint) (model.Endpoint, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

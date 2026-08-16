@@ -52,6 +52,7 @@ type Store interface {
 	InsertApiKey(ctx context.Context, k model.ApiKey) (model.ApiKey, error)
 	ListApiKeys(ctx context.Context) ([]model.ApiKey, error)
 	GetApiKeyByID(ctx context.Context, id string) (model.ApiKey, error)
+	RotateApiKey(ctx context.Context, id, newKey string) (model.ApiKey, error)
 	DeleteApiKey(ctx context.Context, id string) error
 	// endpoints
 	InsertEndpoint(ctx context.Context, e model.Endpoint) (model.Endpoint, error)
@@ -269,6 +270,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 
 	mux.HandleFunc("GET /admin/api/api_keys", s.guard(s.handleApiKeysList))
 	mux.HandleFunc("POST /admin/api/api_keys", s.guard(s.handleApiKeyCreate))
+	mux.HandleFunc("POST /admin/api/api_keys/{id}/rotate", s.guard(s.handleApiKeyRotate))
 	mux.HandleFunc("DELETE /admin/api/api_keys/{id}", s.guard(s.handleApiKeyDelete))
 
 	mux.HandleFunc("GET /admin/api/endpoints", s.guard(s.handleEndpointsList))

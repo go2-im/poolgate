@@ -240,6 +240,19 @@ func (g *Gateway) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// (1a) key lifecycle: reject an expired key and enforce its IP allowlist
+	// (DESIGN.md §22). The allowlist matches the direct peer (RemoteAddr).
+	if apiKey.Expired(time.Now().UTC()) {
+		writeError(w, http.StatusUnauthorized, "poolgate_key_expired",
+			"key_expired", "API key has expired")
+		return
+	}
+	if !keyIPAllowed(apiKey, r) {
+		writeError(w, http.StatusForbidden, "poolgate_key_ip_denied",
+			"key_ip_denied", "client IP is not allowed for this API key")
+		return
+	}
+
 	endpoint := r.PathValue("endpoint")
 
 	// (1b) endpoint scoping: empty scope = all endpoints.
@@ -783,6 +796,42 @@ func keyScopedTo(k model.ApiKey, endpoint string) bool {
 		}
 	}
 	return false
+}
+
+// keyIPAllowed reports whether the request's client IP is permitted by the key's
+// IP allowlist. An empty allowlist permits any IP. Each entry is an IP or CIDR.
+func keyIPAllowed(k model.ApiKey, r *http.Request) bool {
+	if len(k.IPAllowlist) == 0 {
+		return true
+	}
+	ip := net.ParseIP(strings.TrimSpace(clientIP(r)))
+	if ip == nil {
+		return false
+	}
+	for _, entry := range k.IPAllowlist {
+		if ipMatches(ip, entry) {
+			return true
+		}
+	}
+	return false
+}
+
+// ipMatches reports whether ip is covered by a single allowlist entry (an exact
+// IP or a CIDR). A malformed entry never matches.
+func ipMatches(ip net.IP, entry string) bool {
+	entry = strings.TrimSpace(entry)
+	if entry == "" {
+		return false
+	}
+	if strings.Contains(entry, "/") {
+		_, cidr, err := net.ParseCIDR(entry)
+		if err != nil {
+			return false
+		}
+		return cidr.Contains(ip)
+	}
+	e := net.ParseIP(entry)
+	return e != nil && e.Equal(ip)
 }
 
 func headerOrDefault(r *http.Request, name, def string) string {

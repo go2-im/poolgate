@@ -283,6 +283,17 @@ CREATE INDEX idx_request_logs_account ON request_logs(account_id, at);
 CREATE INDEX idx_request_logs_status  ON request_logs(status, at);
 `,
 	},
+	{
+		// v6 — proxy-key lifecycle (DESIGN.md §22): inbound api keys gain an
+		// optional expiry and an optional IP allowlist. Additive columns with safe
+		// defaults ('' = never expires, '[]' = any IP), so existing keys keep
+		// working unchanged. Append-only: v1–v5 above are never edited.
+		version: 6,
+		sql: `
+ALTER TABLE api_keys ADD COLUMN expires_at   TEXT NOT NULL DEFAULT '';
+ALTER TABLE api_keys ADD COLUMN ip_allowlist TEXT NOT NULL DEFAULT '[]';
+`,
+	},
 }
 
 // Migrate applies any migrations whose version is not yet recorded. It is
@@ -797,22 +808,44 @@ func (s *Store) InsertApiKey(ctx context.Context, k model.ApiKey) (model.ApiKey,
 	if k.Endpoints == nil {
 		k.Endpoints = []string{}
 	}
+	if k.IPAllowlist == nil {
+		k.IPAllowlist = []string{}
+	}
 	scopes, err := json.Marshal(k.Endpoints)
 	if err != nil {
 		return model.ApiKey{}, fmt.Errorf("store: marshal key scopes: %w", err)
 	}
+	allow, err := json.Marshal(k.IPAllowlist)
+	if err != nil {
+		return model.ApiKey{}, fmt.Errorf("store: marshal key ip allowlist: %w", err)
+	}
 	if _, err := s.db.ExecContext(ctx,
-		`INSERT INTO api_keys (id, key, label, endpoints) VALUES (?, ?, ?, ?)`,
-		k.ID, k.Key, k.Label, string(scopes)); err != nil {
+		`INSERT INTO api_keys (id, key, label, endpoints, expires_at, ip_allowlist) VALUES (?, ?, ?, ?, ?, ?)`,
+		k.ID, k.Key, k.Label, string(scopes), formatExpiry(k.ExpiresAt), string(allow)); err != nil {
 		return model.ApiKey{}, fmt.Errorf("store: insert api key: %w", err)
 	}
 	return k, nil
 }
 
+// RotateApiKey replaces the secret of an existing key (same id, label, scope,
+// expiry, allowlist), returning the updated key. Used by the admin rotate action.
+func (s *Store) RotateApiKey(ctx context.Context, id, newKey string) (model.ApiKey, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE api_keys SET key = ? WHERE id = ?`, newKey, id)
+	if err != nil {
+		return model.ApiKey{}, fmt.Errorf("store: rotate api key: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return model.ApiKey{}, ErrNotFound
+	}
+	return s.GetApiKeyByID(ctx, id)
+}
+
 // ListApiKeys returns all inbound keys ordered by id.
 func (s *Store) ListApiKeys(ctx context.Context) ([]model.ApiKey, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, key, label, endpoints FROM api_keys ORDER BY id`)
+		`SELECT id, key, label, endpoints, expires_at, ip_allowlist FROM api_keys ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("store: list api keys: %w", err)
 	}
@@ -835,7 +868,7 @@ func (s *Store) ListApiKeys(ctx context.Context) ([]model.ApiKey, error) {
 // single home.
 func (s *Store) GetApiKeyByKey(ctx context.Context, key string) (model.ApiKey, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, key, label, endpoints FROM api_keys WHERE key = ?`, key)
+		`SELECT id, key, label, endpoints, expires_at, ip_allowlist FROM api_keys WHERE key = ?`, key)
 	return scanApiKey(row)
 }
 
@@ -843,8 +876,10 @@ func scanApiKey(sc rowScanner) (model.ApiKey, error) {
 	var (
 		k      model.ApiKey
 		scopes string
+		expiry string
+		allow  string
 	)
-	if err := sc.Scan(&k.ID, &k.Key, &k.Label, &scopes); err != nil {
+	if err := sc.Scan(&k.ID, &k.Key, &k.Label, &scopes, &expiry, &allow); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return model.ApiKey{}, ErrNotFound
 		}
@@ -853,7 +888,25 @@ func scanApiKey(sc rowScanner) (model.ApiKey, error) {
 	if err := json.Unmarshal([]byte(scopes), &k.Endpoints); err != nil {
 		return model.ApiKey{}, fmt.Errorf("store: unmarshal key scopes: %w", err)
 	}
+	if err := json.Unmarshal([]byte(allow), &k.IPAllowlist); err != nil {
+		return model.ApiKey{}, fmt.Errorf("store: unmarshal key ip allowlist: %w", err)
+	}
+	if expiry != "" {
+		t, err := time.Parse(time.RFC3339, expiry)
+		if err != nil {
+			return model.ApiKey{}, fmt.Errorf("store: parse key expiry: %w", err)
+		}
+		k.ExpiresAt = t.UTC()
+	}
 	return k, nil
+}
+
+// formatExpiry renders an expiry timestamp for storage ('' when zero = never).
+func formatExpiry(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
 }
 
 // ---- policy groups & endpoints -------------------------------------------
