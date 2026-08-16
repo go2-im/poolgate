@@ -146,6 +146,14 @@ func (w UsageWindow) Headroom() float64 {
 type Usage struct {
 	PlanType string        `json:"plan_type"`
 	Windows  []UsageWindow `json:"windows"`
+
+	// ClockSkew is the measured difference between the host wall clock and the
+	// upstream usage endpoint's clock (host_now − upstream_now), derived when a
+	// window reports both an absolute reset_at and a relative reset_after_seconds
+	// (DESIGN.md §21.4). It is transient telemetry — never persisted — so it is
+	// excluded from JSON. ClockSkewValid reports whether it could be computed.
+	ClockSkew      time.Duration `json:"-"`
+	ClockSkewValid bool          `json:"-"`
 }
 
 // UsageSnapshot is a persisted point-in-time Usage for one account.

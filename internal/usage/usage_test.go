@@ -96,6 +96,53 @@ func TestFetch_ParsesCapturedFixture(t *testing.T) {
 	}
 }
 
+func TestFetch_MeasuresClockSkew(t *testing.T) {
+	// primary window carries BOTH reset_at (absolute) and reset_after_seconds
+	// (relative): upstream_now = reset_at - reset_after = 1700000000 - 3600 =
+	// 1699996400. With the host clock pinned 30s ahead, skew must be +30s.
+	payload := `{"plan_type":"plus","rate_limit":{"primary_window":` +
+		`{"used_percent":10,"limit_window_seconds":18000,"reset_after_seconds":3600,"reset_at":1700000000}}}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(payload))
+	}))
+	defer srv.Close()
+
+	hostNow := time.Unix(1699996400+30, 0).UTC()
+	c := New(WithHTTPClient(srv.Client()), WithBase(srv.URL), WithClock(func() time.Time { return hostNow }))
+	u, err := c.Fetch(context.Background(), testAccount())
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if !u.ClockSkewValid {
+		t.Fatal("ClockSkewValid = false, want true (both reset_at + reset_after present)")
+	}
+	if u.ClockSkew != 30*time.Second {
+		t.Errorf("ClockSkew = %v, want 30s", u.ClockSkew)
+	}
+}
+
+func TestFetch_NoClockSkewWhenRelativeAbsent(t *testing.T) {
+	// Only the absolute reset_at is present (reset_after_seconds omitted → 0), so
+	// no skew can be anchored.
+	payload := `{"plan_type":"plus","rate_limit":{"primary_window":` +
+		`{"used_percent":10,"limit_window_seconds":18000,"reset_at":1700000000}}}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(payload))
+	}))
+	defer srv.Close()
+
+	c := New(WithHTTPClient(srv.Client()), WithBase(srv.URL))
+	u, err := c.Fetch(context.Background(), testAccount())
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if u.ClockSkewValid {
+		t.Errorf("ClockSkewValid = true, want false (no relative reset_after_seconds)")
+	}
+}
+
 func TestFetch_401ReturnsTokenInvalid(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)

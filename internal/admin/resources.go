@@ -555,12 +555,21 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, errInternal, "could not read status")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"schema_version": version,
 		"accounts":       len(accts),
 		"endpoints":      len(eps),
 		"policy_groups":  len(groups),
-	})
+	}
+	// Clock skew vs the upstream usage endpoint (DESIGN.md §21.4), when a
+	// measurement has been recorded. Reported in seconds (host_now − upstream_now).
+	if s.skew != nil {
+		if skew, at, ok := s.skew.ClockSkew(); ok {
+			resp["clock_skew_seconds"] = skew.Seconds()
+			resp["clock_skew_measured_at"] = at.UTC().Format(rfc3339)
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handleSettings returns the read-only, server-authoritative admin origin +

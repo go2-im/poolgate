@@ -565,7 +565,7 @@ func cmdServe(ctx context.Context, _ []string, stdout io.Writer) error {
 	// Admin API handler (loopback listener), wired with the same store so the
 	// bootstrap token issued by `init` / `admin reset-auth` registers the first
 	// passkey through /admin/register/* end-to-end (DESIGN.md §3 / §16 / §17).
-	adminHandler, err := buildAdminHandler(cfg, st, logger, notifier, mon)
+	adminHandler, err := buildAdminHandler(cfg, st, logger, notifier, mon, engine)
 	if err != nil {
 		return err
 	}
@@ -603,7 +603,7 @@ func cmdServe(ctx context.Context, _ []string, stdout io.Writer) error {
 // (RP resolved once from static admin config, gated by that manager as its
 // authorizer), and the admin HTTP server that mounts them. It returns the fully
 // middleware-wrapped handler (strict security headers + CSP + same-origin CORS).
-func buildAdminHandler(cfg model.Config, st *store.Store, logger *slog.Logger, notifier admin.Notifier, mon admin.MonitorStream) (http.Handler, error) {
+func buildAdminHandler(cfg model.Config, st *store.Store, logger *slog.Logger, notifier admin.Notifier, mon admin.MonitorStream, skew admin.ClockSkewSource) (http.Handler, error) {
 	mgr, err := adminauth.New(st)
 	if err != nil {
 		return nil, fmt.Errorf("admin auth: %w", err)
@@ -613,6 +613,9 @@ func buildAdminHandler(cfg model.Config, st *store.Store, logger *slog.Logger, n
 		return nil, fmt.Errorf("webauthn: %w", err)
 	}
 	opts := []admin.Option{admin.WithNotifier(notifier), admin.WithMonitor(mon), admin.WithLogger(logger)}
+	if skew != nil {
+		opts = append(opts, admin.WithClockSkew(skew))
+	}
 	// Mount the embedded admin SPA when a bundle is present; otherwise run API-only.
 	if spa, serr := webui.Handler(); serr == nil {
 		opts = append(opts, admin.WithSPA(spa))

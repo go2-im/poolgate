@@ -182,7 +182,37 @@ func (c *Client) toUsage(raw rawPayload) model.Usage {
 		}
 		c.appendWindows(&u, name, name+"_secondary", add.RateLimit)
 	}
+	if skew, ok := c.measureSkew(raw); ok {
+		u.ClockSkew, u.ClockSkewValid = skew, true
+	}
 	return u
+}
+
+// measureSkew derives the host↔upstream clock skew (DESIGN.md §21.4) from any
+// window that reports BOTH an absolute reset_at and a relative
+// reset_after_seconds: the upstream's own "now" is reset_at − reset_after_seconds,
+// so skew = host_now − upstream_now. A positive value means the host clock runs
+// ahead of upstream. Windows carrying only one of the two signals cannot anchor a
+// skew estimate; when none do, ok is false.
+func (c *Client) measureSkew(raw rawPayload) (time.Duration, bool) {
+	windows := []*rawWindow{}
+	collect := func(d *rawStatusDetails) {
+		if d != nil {
+			windows = append(windows, d.PrimaryWindow, d.SecondaryWindow)
+		}
+	}
+	collect(raw.RateLimit)
+	for _, add := range raw.AdditionalRateLimits {
+		collect(add.RateLimit)
+	}
+	for _, rw := range windows {
+		if rw == nil || rw.ResetAt <= 0 || rw.ResetAfterSeconds <= 0 {
+			continue
+		}
+		upstreamNow := time.Unix(rw.ResetAt, 0).UTC().Add(-time.Duration(rw.ResetAfterSeconds) * time.Second)
+		return c.now().UTC().Sub(upstreamNow), true
+	}
+	return 0, false
 }
 
 func (c *Client) appendWindows(u *model.Usage, primaryName, secondaryName string, d *rawStatusDetails) {
