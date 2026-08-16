@@ -36,6 +36,7 @@ import (
 	"github.com/go2-im/poolgate/internal/crypto"
 	"github.com/go2-im/poolgate/internal/gateway"
 	"github.com/go2-im/poolgate/internal/health"
+	"github.com/go2-im/poolgate/internal/lock"
 	"github.com/go2-im/poolgate/internal/model"
 	"github.com/go2-im/poolgate/internal/monitor"
 	"github.com/go2-im/poolgate/internal/notify"
@@ -67,6 +68,8 @@ const (
 
 	// masterKeyFile is the keyfile name under the data dir (keyfile source).
 	masterKeyFile = "master.key"
+	// lockFile is the single-instance advisory lockfile under the data dir.
+	lockFile = "poolgate.lock"
 	// configFile is the YAML config name under the data dir.
 	configFile = "config.yaml"
 	// envMasterKey is the env var read when master_key_source=env.
@@ -472,6 +475,20 @@ func cmdServe(ctx context.Context, _ []string, stdout io.Writer) error {
 		return err
 	}
 	defer st.Close()
+
+	// Single-instance guard (DESIGN.md §21): refuse to start a second server
+	// against the same data dir (which would double-bind the listeners and race
+	// on the SQLite WAL). openStore has created the data dir by now. The lock is
+	// held for the process lifetime and released on exit (or by the kernel on a
+	// crash, so it is never left stale).
+	lk, err := lock.Acquire(filepath.Join(cfg.DataDir, lockFile))
+	if err != nil {
+		if errors.Is(err, lock.ErrLocked) {
+			return fmt.Errorf("another poolgate serve is already running for data dir %s", cfg.DataDir)
+		}
+		return fmt.Errorf("acquire single-instance lock: %w", err)
+	}
+	defer lk.Release()
 
 	logger := slog.New(slog.NewJSONHandler(stdout, nil))
 
