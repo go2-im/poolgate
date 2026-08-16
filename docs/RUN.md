@@ -89,6 +89,31 @@ Pick the group's routing **strategy** with `--strategy` (default `fallback`):
 Subsequent imports add the account to the pool only (the existing endpoint/group
 is reused; the strategy is set once at group-creation time).
 
+## 2b. Add an account by signing in (OAuth + PKCE)
+
+Instead of pasting an `auth.json`, sign in interactively through the browser:
+
+```sh
+./poolgate login                       # or: --strategy best-quota
+```
+
+This runs an OAuth **authorization-code + PKCE** flow (S256 challenge, single-use
+`state`): it prints an `auth.openai.com` URL, waits for you to complete sign-in
+(including MFA), and receives the result on a **loopback callback**
+(`http://localhost:1455/auth/callback`, fallback `1457`). On success it stores the
+account exactly like `import` — creating the default group/endpoint/`sk-` key on
+the first account.
+
+Because the callback lands on a loopback port, run `login` **on the poolgate host**
+(at its console, or over `ssh -L 1455:127.0.0.1:1455 <host>` so a remote browser's
+redirect reaches it). This is why login is a CLI command rather than an admin-UI
+button — the redirect_uri is a fixed loopback port that must be co-located with
+whatever finishes the sign-in. The token endpoint and client id are the same
+pinned values the refresh path uses.
+
+Subsequent imports add the account to the pool only (the existing endpoint/group
+is reused; the strategy is set once at group-creation time).
+
 ## 3. Serve
 
 Starts **both listeners** — the proxy (loopback `127.0.0.1:8787` by default)

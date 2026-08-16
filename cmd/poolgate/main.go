@@ -130,6 +130,11 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 			fmt.Fprintf(stderr, "poolgate %s: %v\n", cmd, err)
 			return err
 		}
+	case "login":
+		if err := cmdLogin(ctx, rest, stdout); err != nil {
+			fmt.Fprintf(stderr, "poolgate %s: %v\n", cmd, err)
+			return err
+		}
 	case "serve":
 		if err := cmdServe(ctx, rest, stdout); err != nil {
 			fmt.Fprintf(stderr, "poolgate %s: %v\n", cmd, err)
@@ -167,6 +172,8 @@ func usage(w io.Writer) {
 usage:
   poolgate init                 initialize data dir, master key, and DB
   poolgate import <auth.json>   import a Codex account (explicit, never automatic)
+                                [--strategy fallback|best-quota|load-balance]
+  poolgate login                sign in via browser (OAuth + PKCE) to add an account
                                 [--strategy fallback|best-quota|load-balance]
   poolgate serve                start the proxy + admin listeners + health scheduler
   poolgate admin reset-auth     wipe all passkeys/recovery codes/sessions and
@@ -414,7 +421,14 @@ func cmdImport(args []string, stdout io.Writer) error {
 	}
 	fmt.Fprintf(stdout, "imported account %s (label %q, state %s)\n", acct.ID, acct.Label, acct.State)
 
-	// Create default group + endpoint + key if none exists yet.
+	return bootstrapDefaults(ctx, st, cfg, acct, strategy, stdout)
+}
+
+// bootstrapDefaults creates the default policy group + endpoint + sk- key over
+// acct when the store has no endpoint yet (the first account, however it was
+// added — CLI import or interactive login). When an endpoint already exists it
+// reports that the account joined the pool only. Shared by import and login.
+func bootstrapDefaults(ctx context.Context, st *store.Store, cfg model.Config, acct model.Account, strategy model.Strategy, stdout io.Writer) error {
 	if _, err := st.GetEndpoint(ctx, defaultEndpointName); err == nil {
 		fmt.Fprintf(stdout, "endpoint %q already exists; account added to the pool only.\n", defaultEndpointName)
 		return nil
