@@ -181,6 +181,10 @@ environment:
   POOLGATE_DATA_DIR   override the data directory (default: `+config.DefaultDataDir+`)
   POOLGATE_MASTER_KEY base64 master key (when master_key_source=env)
   POOLGATE_BACKUP_PASSPHRASE  passphrase for backup/restore (or --passphrase-file)
+
+  Any secret env var also accepts a "<NAME>_FILE" variant (Docker/K8s secrets):
+  set e.g. POOLGATE_MASTER_KEY_FILE=/run/secrets/key to read it from a file
+  instead of the process environment.
 `)
 }
 
@@ -221,13 +225,37 @@ func loadConfig() (model.Config, error) {
 	return cfg, nil
 }
 
+// envValue returns the value of the named env var, honoring the Docker/K8s
+// "<NAME>_FILE" secrets convention: if <NAME>_FILE is set, its file contents
+// (trailing newline trimmed) are returned instead — so a secret can be mounted
+// as a file rather than exposed in the process environment. The _FILE variant
+// takes precedence when both are set.
+func envValue(name string) (string, error) {
+	if p := os.Getenv(name + "_FILE"); p != "" {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return "", fmt.Errorf("read %s_FILE (%s): %w", name, p, err)
+		}
+		return strings.TrimRight(string(b), "\r\n"), nil
+	}
+	return os.Getenv(name), nil
+}
+
 // loadMasterKey resolves the raw master key bytes per cfg.MasterKeySource: from
-// POOLGATE_MASTER_KEY (env) or a keyfile under the data dir (default; created if
-// absent). Shared by openStore and the backup/restore commands.
+// POOLGATE_MASTER_KEY / POOLGATE_MASTER_KEY_FILE (env) or a keyfile under the
+// data dir (default; created if absent). Shared by openStore and the
+// backup/restore commands.
 func loadMasterKey(cfg model.Config) ([]byte, error) {
 	switch cfg.MasterKeySource {
 	case "env":
-		return crypto.LoadKeyFromEnv(envMasterKey)
+		v, err := envValue(envMasterKey)
+		if err != nil {
+			return nil, err
+		}
+		if v == "" {
+			return nil, fmt.Errorf("crypto: %s (or %s_FILE) is empty", envMasterKey, envMasterKey)
+		}
+		return crypto.ParseKey(v)
 	default: // keyfile (keychain is a later phase)
 		return crypto.LoadOrCreateKeyfile(filepath.Join(cfg.DataDir, masterKeyFile))
 	}

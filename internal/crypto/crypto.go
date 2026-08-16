@@ -76,9 +76,16 @@ func LoadKeyFromEnv(envVar string) ([]byte, error) {
 	if v == "" {
 		return nil, fmt.Errorf("crypto: env var %q is empty", envVar)
 	}
-	key, err := base64.StdEncoding.DecodeString(v)
+	return ParseKey(v)
+}
+
+// ParseKey decodes a base64 std-encoded master key and validates its length.
+// It is the shared parser behind LoadKeyFromEnv and any other source (e.g. a
+// *_FILE secret) that supplies the key as a base64 string.
+func ParseKey(s string) ([]byte, error) {
+	key, err := base64.StdEncoding.DecodeString(s)
 	if err != nil {
-		return nil, fmt.Errorf("crypto: decode env key: %w", err)
+		return nil, fmt.Errorf("crypto: decode key: %w", err)
 	}
 	if len(key) != KeySize {
 		return nil, ErrKeySize
