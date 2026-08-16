@@ -285,10 +285,9 @@ func parseRestoreArgs(args []string) (bundle, passFile string, force bool, err e
 }
 
 // readPassphrase reads the backup passphrase from --passphrase-file or
-// POOLGATE_BACKUP_PASSPHRASE. Both sources are trimmed of a trailing newline
-// identically (so a passphrase provisioned via a file vs an env var — e.g.
-// `echo pass > f` vs an env-file — resolve to the same value), and a non-empty
-// passphrase is required. The value is never echoed.
+// POOLGATE_BACKUP_PASSPHRASE (or POOLGATE_BACKUP_PASSPHRASE_FILE via the *_FILE
+// convention). All sources are trimmed of a trailing newline identically, and a
+// non-empty passphrase is required. The value is never echoed.
 func readPassphrase(passFile string) ([]byte, error) {
 	var raw string
 	if passFile != "" {
@@ -298,11 +297,15 @@ func readPassphrase(passFile string) ([]byte, error) {
 		}
 		raw = string(b)
 	} else {
-		raw = os.Getenv(envBackupPassphrase)
+		v, err := envValue(envBackupPassphrase)
+		if err != nil {
+			return nil, err
+		}
+		raw = v
 	}
 	pass := []byte(strings.TrimRight(raw, "\r\n"))
 	if len(pass) == 0 {
-		return nil, errors.New("no passphrase (set POOLGATE_BACKUP_PASSPHRASE or pass --passphrase-file)")
+		return nil, errors.New("no passphrase (set POOLGATE_BACKUP_PASSPHRASE[_FILE] or pass --passphrase-file)")
 	}
 	return pass, nil
 }
