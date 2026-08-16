@@ -84,6 +84,8 @@ const (
 	// no such override — keep it loopback/private (DESIGN §3).
 	envProxyHost = "POOLGATE_PROXY_HOST"
 	envProxyPort = "POOLGATE_PROXY_PORT"
+	// envProxyTransport overrides server.transport (both|http-only|ws-only).
+	envProxyTransport = "POOLGATE_PROXY_TRANSPORT"
 	// envBackupPassphrase supplies the passphrase for `backup`/`restore` when
 	// --passphrase-file is not given. It is never written to logs.
 	envBackupPassphrase = "POOLGATE_BACKUP_PASSPHRASE"
@@ -229,6 +231,9 @@ func loadConfig() (model.Config, error) {
 		if p, err := strconv.Atoi(v); err == nil && p > 0 && p <= 65535 {
 			cfg.Server.Proxy.Port = p
 		}
+	}
+	if v := strings.TrimSpace(os.Getenv(envProxyTransport)); v != "" {
+		cfg.Server.Transport = v
 	}
 	return cfg, nil
 }
