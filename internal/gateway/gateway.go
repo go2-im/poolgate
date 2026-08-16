@@ -118,6 +118,10 @@ type Gateway struct {
 	// x-codex-turn-state upgrade header when present (DESIGN.md §0 D3 / §19.1).
 	// Within a single connection the backend is always pinned regardless.
 	wsAff *wsAffinity
+
+	// authFail counts invalid inbound-key attempts and drives EventAuthAnomaly
+	// (DESIGN.md §11) when they cross a threshold within a rolling window.
+	authFail *failWindow
 }
 
 // Option customizes a Gateway.
@@ -186,6 +190,7 @@ func New(st *store.Store, cfg model.Config, opts ...Option) *Gateway {
 		cursors:      make(map[string]*policy.Cursor),
 		inflight:     newInflight(),
 		wsAff:        newWSAffinity(),
+		authFail:     newFailWindow(authAnomalyThreshold, authAnomalyWindow),
 		retryAfterSecs: 1,
 		// No client Timeout: SSE streams are long-lived; cancellation rides the
 		// request context instead.
@@ -241,6 +246,7 @@ func (g *Gateway) authorizeInbound(w http.ResponseWriter, r *http.Request) (apiK
 	}
 	apiKey, matched := g.authenticate(r.Context(), key)
 	if !matched {
+		g.noteAuthFailure()
 		writeError(w, http.StatusUnauthorized, "poolgate_invalid_key",
 			"invalid_api_key", "invalid API key")
 		return model.ApiKey{}, "", model.PolicyGroup{}, nil, false

@@ -13,7 +13,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/go2-im/poolgate/internal/config"
 	"github.com/go2-im/poolgate/internal/gateway"
+	"github.com/go2-im/poolgate/internal/model"
 )
 
 // TestIntegrationInitImportServeProxy is the Phase 2a end-to-end walking-skeleton
@@ -225,4 +227,44 @@ func mustHost(t *testing.T, rawURL string) string {
 		t.Fatalf("parse %q: %v", rawURL, err)
 	}
 	return u.Hostname()
+}
+
+// fakeBindSink records emitted events for the bind-warning test.
+type fakeBindSink struct{ events []model.NotifyEvent }
+
+func (f *fakeBindSink) Emit(ev model.NotifyEvent) { f.events = append(f.events, ev) }
+
+func TestEmitBindWarnings(t *testing.T) {
+	cfg := config.Default()
+
+	// Both loopback → no warnings.
+	cfg.Server.Proxy.Host = "127.0.0.1"
+	cfg.Server.Admin.Host = "127.0.0.1"
+	s := &fakeBindSink{}
+	emitBindWarnings(cfg, s)
+	if len(s.events) != 0 {
+		t.Fatalf("loopback binds emitted %d warnings, want 0", len(s.events))
+	}
+
+	// Proxy non-loopback → exactly one warning naming the proxy.
+	cfg.Server.Proxy.Host = "0.0.0.0"
+	s = &fakeBindSink{}
+	emitBindWarnings(cfg, s)
+	if len(s.events) != 1 || s.events[0].Kind != model.EventStartupBindWarning {
+		t.Fatalf("events = %+v, want 1 startup_bind_warning", s.events)
+	}
+	if !strings.Contains(s.events[0].Message, "proxy") {
+		t.Errorf("message = %q, want it to name the proxy listener", s.events[0].Message)
+	}
+
+	// Both non-loopback → two warnings.
+	cfg.Server.Admin.Host = "0.0.0.0"
+	s = &fakeBindSink{}
+	emitBindWarnings(cfg, s)
+	if len(s.events) != 2 {
+		t.Errorf("both non-loopback emitted %d warnings, want 2", len(s.events))
+	}
+
+	// Nil sink is a no-op (no panic).
+	emitBindWarnings(cfg, nil)
 }
