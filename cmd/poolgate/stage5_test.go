@@ -199,8 +199,10 @@ func TestBootstrapFirstPasskeyEndToEnd(t *testing.T) {
 	jar, _ := cookiejar.New(nil)
 	client := &http.Client{Jar: jar}
 
-	// The RP id/origin come from static admin config (default loopback).
-	auth := newSWAuthenticator(t, "127.0.0.1", "http://127.0.0.1:7070")
+	// The RP id/origin come from static admin config; the default loopback bind
+	// (127.0.0.1) resolves to a "localhost" RP/origin because browsers reject bare
+	// IP RP IDs.
+	auth := newSWAuthenticator(t, "localhost", "http://localhost:7070")
 
 	// (1) register/begin gated by the bootstrap token.
 	var begin beginEnvelope

@@ -122,54 +122,57 @@ func (s *Service) BeginRegistration(ctx context.Context, gate RegisterGate) (*pr
 
 // FinishRegistration completes a registration ceremony: it retrieves the pending
 // challenge (single-use), verifies the attestation, enforces the authorization
-// gate (consuming the bootstrap token for the first passkey, or validating the
-// session for additional ones), and persists the new credential. The stored
-// credential is returned so the caller can rotate/create a session.
+// credential (consuming the bootstrap token for the first passkey, or validating
+// the session for additional ones), and persists the new credential. It returns
+// the stored credential and wasFirst — whether this ceremony was the
+// bootstrap-gated first passkey (i.e. it consumed the bootstrap token) — so the
+// caller mints one-time recovery codes based on the ACTUAL bootstrap path rather
+// than on a client-supplied flag that could disagree.
 //
 // The gate is enforced only after the attestation verifies, so a malformed or
 // forged response never burns the single-use bootstrap token.
-func (s *Service) FinishRegistration(ctx context.Context, gate RegisterGate, challengeID string, responseBody []byte) (model.WebAuthnCredential, error) {
+func (s *Service) FinishRegistration(ctx context.Context, gate RegisterGate, challengeID string, responseBody []byte) (model.WebAuthnCredential, bool, error) {
 	if s.authz == nil {
-		return model.WebAuthnCredential{}, ErrNoAuthorizer
+		return model.WebAuthnCredential{}, false, ErrNoAuthorizer
 	}
 	session, err := s.challenges.Take(challengeID)
 	if err != nil {
-		return model.WebAuthnCredential{}, err
+		return model.WebAuthnCredential{}, false, err
 	}
 	first, err := s.isFirstPasskey(ctx)
 	if err != nil {
-		return model.WebAuthnCredential{}, err
+		return model.WebAuthnCredential{}, false, err
 	}
 
 	user, err := s.OperatorUser(ctx)
 	if err != nil {
-		return model.WebAuthnCredential{}, err
+		return model.WebAuthnCredential{}, false, err
 	}
 	parsed, err := protocol.ParseCredentialCreationResponseBytes(responseBody)
 	if err != nil {
-		return model.WebAuthnCredential{}, fmt.Errorf("webauthnsvc: parse registration response: %w", err)
+		return model.WebAuthnCredential{}, false, fmt.Errorf("webauthnsvc: parse registration response: %w", err)
 	}
 	cred, err := s.wa.CreateCredential(user, *session, parsed)
 	if err != nil {
-		return model.WebAuthnCredential{}, fmt.Errorf("webauthnsvc: verify registration: %w", err)
+		return model.WebAuthnCredential{}, false, fmt.Errorf("webauthnsvc: verify registration: %w", err)
 	}
 
 	// Attestation verified — now spend the single-use gate.
 	if first {
 		if err := s.authz.ConsumeBootstrapToken(ctx, gate.BootstrapToken); err != nil {
-			return model.WebAuthnCredential{}, ErrNotAuthorized
+			return model.WebAuthnCredential{}, false, ErrNotAuthorized
 		}
 	} else if err := s.validateSession(ctx, gate.SessionID); err != nil {
-		return model.WebAuthnCredential{}, err
+		return model.WebAuthnCredential{}, false, err
 	}
 
 	m := credentialToModel(*cred)
 	m.Label = gate.Label
 	stored, err := s.store.InsertWebAuthnCredential(ctx, m)
 	if err != nil {
-		return model.WebAuthnCredential{}, fmt.Errorf("webauthnsvc: store credential: %w", err)
+		return model.WebAuthnCredential{}, false, fmt.Errorf("webauthnsvc: store credential: %w", err)
 	}
-	return stored, nil
+	return stored, first, nil
 }
 
 // BeginLogin starts an assertion ceremony for the operator identity. It requires
@@ -197,8 +200,12 @@ func (s *Service) BeginLogin(ctx context.Context) (*protocol.CredentialAssertion
 
 // FinishLogin completes an assertion ceremony: it retrieves the pending challenge
 // (single-use), validates the assertion against the operator's stored
-// credentials, persists the bumped signature counter (clone-detection guard,
-// §8), and returns the operator identity so the caller can mint a session.
+// credentials, and persists the bumped signature counter. Note: go-webauthn sets
+// Authenticator.CloneWarning when the returned counter does not advance, but a
+// non-advancing counter is EXPECTED for synced/multi-device passkeys (iCloud
+// Keychain, password managers), which poolgate supports — so the warning is
+// advisory and is NOT treated as a hard failure here (doing so would lock out
+// legitimate synced passkeys). The counter is still persisted for observability.
 func (s *Service) FinishLogin(ctx context.Context, challengeID string, responseBody []byte) (webauthn.User, error) {
 	session, err := s.challenges.Take(challengeID)
 	if err != nil {

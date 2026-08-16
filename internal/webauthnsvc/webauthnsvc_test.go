@@ -113,16 +113,22 @@ func TestResolveRP(t *testing.T) {
 			wantOrigins: []string{"https://admin.example.com:8443"},
 		},
 		{
-			name:        "derived loopback origin from host:port",
+			name:        "derived loopback origin maps IP to localhost (browsers reject IP RP IDs)",
 			admin:       model.ListenConfig{Host: "127.0.0.1", Port: 7070},
-			wantRPID:    "127.0.0.1",
-			wantOrigins: []string{"http://127.0.0.1:7070"},
+			wantRPID:    "localhost",
+			wantOrigins: []string{"http://localhost:7070"},
 		},
 		{
-			name:        "empty host and port default to loopback:7070",
+			name:        "empty host and port default to localhost:7070",
 			admin:       model.ListenConfig{},
-			wantRPID:    "127.0.0.1",
-			wantOrigins: []string{"http://127.0.0.1:7070"},
+			wantRPID:    "localhost",
+			wantOrigins: []string{"http://localhost:7070"},
+		},
+		{
+			name:        "explicit non-loopback host is preserved (operator must set a real domain)",
+			admin:       model.ListenConfig{Host: "192.168.1.5", Port: 7070},
+			wantRPID:    "192.168.1.5",
+			wantOrigins: []string{"http://192.168.1.5:7070"},
 		},
 		{
 			name:    "origin without scheme is rejected",

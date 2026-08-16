@@ -1204,3 +1204,15 @@ func newID(prefix string) string {
 	}
 	return prefix + "_" + hex.EncodeToString(b[:])
 }
+
+// newSessionID mints an admin session id. Unlike newID (64-bit, fine for opaque
+// row ids), the session id is ALSO the admin bearer cookie value and the only
+// secret gating authenticated endpoints, so it uses 256 bits of entropy — far
+// beyond any online guessing budget even without a per-request throttle.
+func newSessionID() string {
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("sess_%d", time.Now().UnixNano())
+	}
+	return "sess_" + hex.EncodeToString(b[:])
+}

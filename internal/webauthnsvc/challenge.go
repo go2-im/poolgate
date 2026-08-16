@@ -24,6 +24,14 @@ import (
 // challenge is considered expired.
 const DefaultChallengeTTL = 5 * time.Minute
 
+// DefaultMaxChallenges caps the number of pending challenges held at once. The
+// /admin/*/begin endpoints are unauthenticated (they must be, to bootstrap the
+// first passkey), so without a cap a flood of begin calls could grow the map
+// until the process OOMs. When the cap is reached the oldest entry is evicted to
+// admit the new one, so legitimate ceremonies still proceed while memory stays
+// bounded at roughly cap * sizeof(entry).
+const DefaultMaxChallenges = 4096
+
 // ErrChallengeNotFound is returned by Take when no live (unexpired) challenge
 // matches the id. Expired entries are treated as not found.
 var ErrChallengeNotFound = errors.New("webauthnsvc: challenge not found")
@@ -40,6 +48,7 @@ type ChallengeStore struct {
 	mu    sync.Mutex
 	items map[string]pendingChallenge
 	ttl   time.Duration
+	max   int
 	now   func() time.Time
 	randr io.Reader
 }
@@ -65,6 +74,16 @@ func WithChallengeRand(r io.Reader) ChallengeOption {
 	}
 }
 
+// WithChallengeMax overrides the maximum number of pending challenges (<= 0 uses
+// DefaultMaxChallenges).
+func WithChallengeMax(n int) ChallengeOption {
+	return func(c *ChallengeStore) {
+		if n > 0 {
+			c.max = n
+		}
+	}
+}
+
 // NewChallengeStore builds an empty store with the given TTL (ttl <= 0 uses
 // DefaultChallengeTTL).
 func NewChallengeStore(ttl time.Duration, opts ...ChallengeOption) *ChallengeStore {
@@ -74,6 +93,7 @@ func NewChallengeStore(ttl time.Duration, opts ...ChallengeOption) *ChallengeSto
 	c := &ChallengeStore{
 		items: make(map[string]pendingChallenge),
 		ttl:   ttl,
+		max:   DefaultMaxChallenges,
 		now:   func() time.Time { return time.Now().UTC() },
 		randr: rand.Reader,
 	}
@@ -85,7 +105,9 @@ func NewChallengeStore(ttl time.Duration, opts ...ChallengeOption) *ChallengeSto
 
 // Put stores session under a fresh random id with expiry now+ttl and returns the
 // id. The caller hands the id back to the browser (opaque) and presents it again
-// at Finish time.
+// at Finish time. Put opportunistically sweeps expired entries and enforces the
+// size cap (evicting the oldest entry when full) so an unauthenticated flood of
+// begin calls cannot grow the map without bound.
 func (c *ChallengeStore) Put(session *webauthn.SessionData) (string, error) {
 	if session == nil {
 		return "", errors.New("webauthnsvc: nil session data")
@@ -94,10 +116,42 @@ func (c *ChallengeStore) Put(session *webauthn.SessionData) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	now := c.now().UTC()
 	c.mu.Lock()
-	c.items[id] = pendingChallenge{session: session, expiresAt: c.now().UTC().Add(c.ttl)}
+	c.sweepLocked(now)
+	if len(c.items) >= c.max {
+		c.evictOldestLocked()
+	}
+	c.items[id] = pendingChallenge{session: session, expiresAt: now.Add(c.ttl)}
 	c.mu.Unlock()
 	return id, nil
+}
+
+// sweepLocked removes expired entries. The caller must hold c.mu.
+func (c *ChallengeStore) sweepLocked(now time.Time) {
+	for id, item := range c.items {
+		if !now.Before(item.expiresAt) {
+			delete(c.items, id)
+		}
+	}
+}
+
+// evictOldestLocked removes the entry with the earliest expiry. The caller must
+// hold c.mu and ensure the map is non-empty.
+func (c *ChallengeStore) evictOldestLocked() {
+	var (
+		oldestID string
+		oldestAt time.Time
+		found    bool
+	)
+	for id, item := range c.items {
+		if !found || item.expiresAt.Before(oldestAt) {
+			oldestID, oldestAt, found = id, item.expiresAt, true
+		}
+	}
+	if found {
+		delete(c.items, oldestID)
+	}
 }
 
 // Take retrieves and removes the session for id. It returns ErrChallengeNotFound

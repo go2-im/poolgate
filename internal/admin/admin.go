@@ -125,7 +125,7 @@ type SessionManager interface {
 // Ceremonies is the WebAuthn ceremony surface. *webauthnsvc.Service satisfies it.
 type Ceremonies interface {
 	BeginRegistration(ctx context.Context, gate webauthnsvc.RegisterGate) (*protocol.CredentialCreation, string, error)
-	FinishRegistration(ctx context.Context, gate webauthnsvc.RegisterGate, challengeID string, body []byte) (model.WebAuthnCredential, error)
+	FinishRegistration(ctx context.Context, gate webauthnsvc.RegisterGate, challengeID string, body []byte) (model.WebAuthnCredential, bool, error)
 	BeginLogin(ctx context.Context) (*protocol.CredentialAssertion, string, error)
 	FinishLogin(ctx context.Context, challengeID string, body []byte) (webauthn.User, error)
 	// RPID returns the resolved WebAuthn Relying Party ID, surfaced read-only by
@@ -288,7 +288,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 	// ---- auth / bootstrap (public: no session guard) ----
 	mux.HandleFunc("POST /admin/register/begin", s.brute("register", s.handleRegisterBegin))
 	mux.HandleFunc("POST /admin/register/finish", s.brute("register", s.handleRegisterFinish))
-	mux.HandleFunc("POST /admin/login/begin", s.handleLoginBegin)
+	mux.HandleFunc("POST /admin/login/begin", s.brute("login", s.handleLoginBegin))
 	mux.HandleFunc("POST /admin/login/finish", s.brute("login", s.handleLoginFinish))
 	mux.HandleFunc("POST /admin/login/recovery", s.brute("recovery", s.handleLoginRecovery))
 

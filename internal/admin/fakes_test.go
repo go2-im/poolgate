@@ -149,12 +149,14 @@ func (f *fakeCeremonies) BeginRegistration(_ context.Context, gate webauthnsvc.R
 	return &protocol.CredentialCreation{}, "chal-reg", nil
 }
 
-func (f *fakeCeremonies) FinishRegistration(_ context.Context, gate webauthnsvc.RegisterGate, _ string, _ []byte) (model.WebAuthnCredential, error) {
+func (f *fakeCeremonies) FinishRegistration(_ context.Context, gate webauthnsvc.RegisterGate, _ string, _ []byte) (model.WebAuthnCredential, bool, error) {
 	f.lastGate = gate
 	if f.finishRegErr != nil {
-		return model.WebAuthnCredential{}, f.finishRegErr
+		return model.WebAuthnCredential{}, false, f.finishRegErr
 	}
-	return model.WebAuthnCredential{ID: "cred-1"}, nil
+	// Simulate the ceremony's first-passkey determination: a bootstrap token means
+	// the bootstrap (first) ceremony.
+	return model.WebAuthnCredential{ID: "cred-1"}, gate.BootstrapToken != "", nil
 }
 
 func (f *fakeCeremonies) BeginLogin(context.Context) (*protocol.CredentialAssertion, string, error) {

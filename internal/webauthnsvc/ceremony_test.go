@@ -224,7 +224,7 @@ func TestRegisterFirstPasskeyAndLogin(t *testing.T) {
 		t.Errorf("bootstrap consumed at Begin = %d, want 0 (consume only at Finish)", az.consumed)
 	}
 
-	stored, err := svc.FinishRegistration(ctx, RegisterGate{BootstrapToken: "pgbt_x", Label: "phone"},
+	stored, _, err := svc.FinishRegistration(ctx, RegisterGate{BootstrapToken: "pgbt_x", Label: "phone"},
 		chID, auth.register(t, creation.Response.Challenge.String()))
 	if err != nil {
 		t.Fatalf("FinishRegistration: %v", err)
@@ -284,7 +284,7 @@ func TestRegisterAdditionalPasskeyWithSession(t *testing.T) {
 	if az.consumed != 0 {
 		t.Error("bootstrap should never be consumed on the session path")
 	}
-	stored, err := svc.FinishRegistration(ctx, RegisterGate{SessionID: "sess-1"}, chID,
+	stored, _, err := svc.FinishRegistration(ctx, RegisterGate{SessionID: "sess-1"}, chID,
 		auth.register(t, creation.Response.Challenge.String()))
 	if err != nil {
 		t.Fatalf("FinishRegistration: %v", err)
@@ -371,14 +371,14 @@ func TestFinishRegistrationErrors(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New: %v", err)
 		}
-		if _, err := svc.FinishRegistration(ctx, RegisterGate{}, "id", nil); !errors.Is(err, ErrNoAuthorizer) {
+		if _, _, err := svc.FinishRegistration(ctx, RegisterGate{}, "id", nil); !errors.Is(err, ErrNoAuthorizer) {
 			t.Fatalf("err = %v, want ErrNoAuthorizer", err)
 		}
 	})
 
 	t.Run("unknown challenge", func(t *testing.T) {
 		svc := newCeremonyService(t, &fakeStore{}, &fakeAuthorizer{})
-		if _, err := svc.FinishRegistration(ctx, RegisterGate{BootstrapToken: "x"}, "nope", nil); !errors.Is(err, ErrChallengeNotFound) {
+		if _, _, err := svc.FinishRegistration(ctx, RegisterGate{BootstrapToken: "x"}, "nope", nil); !errors.Is(err, ErrChallengeNotFound) {
 			t.Fatalf("err = %v, want ErrChallengeNotFound", err)
 		}
 	})
@@ -389,7 +389,7 @@ func TestFinishRegistrationErrors(t *testing.T) {
 		if err != nil {
 			t.Fatalf("BeginRegistration: %v", err)
 		}
-		if _, err := svc.FinishRegistration(ctx, RegisterGate{BootstrapToken: "x"}, chID, []byte("not json")); err == nil {
+		if _, _, err := svc.FinishRegistration(ctx, RegisterGate{BootstrapToken: "x"}, chID, []byte("not json")); err == nil {
 			t.Fatal("FinishRegistration with bad body = nil, want error")
 		}
 	})
@@ -403,7 +403,7 @@ func TestFinishRegistrationErrors(t *testing.T) {
 		if err != nil {
 			t.Fatalf("BeginRegistration: %v", err)
 		}
-		_, err = svc.FinishRegistration(ctx, RegisterGate{BootstrapToken: "x"}, chID,
+		_, _, err = svc.FinishRegistration(ctx, RegisterGate{BootstrapToken: "x"}, chID,
 			auth.register(t, creation.Response.Challenge.String()))
 		if !errors.Is(err, ErrNotAuthorized) {
 			t.Fatalf("err = %v, want ErrNotAuthorized", err)
@@ -421,7 +421,7 @@ func TestFinishRegistrationErrors(t *testing.T) {
 		if err != nil {
 			t.Fatalf("BeginRegistration: %v", err)
 		}
-		if _, err := svc.FinishRegistration(ctx, RegisterGate{BootstrapToken: "x"}, chID,
+		if _, _, err := svc.FinishRegistration(ctx, RegisterGate{BootstrapToken: "x"}, chID,
 			auth.register(t, creation.Response.Challenge.String())); err == nil {
 			t.Fatal("FinishRegistration with insert error = nil, want error")
 		}
@@ -435,7 +435,7 @@ func TestFinishRegistrationErrors(t *testing.T) {
 			t.Fatalf("BeginRegistration: %v", err)
 		}
 		// Sign a different challenge than the ceremony expects.
-		if _, err := svc.FinishRegistration(ctx, RegisterGate{BootstrapToken: "x"}, chID,
+		if _, _, err := svc.FinishRegistration(ctx, RegisterGate{BootstrapToken: "x"}, chID,
 			auth.register(t, b64([]byte("wrong-challenge-value-000")))); err == nil {
 			t.Fatal("FinishRegistration with wrong challenge = nil, want error")
 		}
@@ -471,7 +471,7 @@ func TestFinishLoginErrors(t *testing.T) {
 		if err != nil {
 			t.Fatalf("BeginRegistration: %v", err)
 		}
-		if _, err := svc.FinishRegistration(ctx, RegisterGate{BootstrapToken: "x"}, chID,
+		if _, _, err := svc.FinishRegistration(ctx, RegisterGate{BootstrapToken: "x"}, chID,
 			auth.register(t, creation.Response.Challenge.String())); err != nil {
 			t.Fatalf("FinishRegistration: %v", err)
 		}
