@@ -1,0 +1,169 @@
+# .goreleaser.yaml — poolgate release pipeline (DESIGN §18, ROADMAP item 2).
+#
+# Produces, on a pushed `v*` tag (see .github/workflows/release.yml):
+#   - cross-compiled static binaries (linux/darwin × amd64/arm64), pure-Go
+#     (CGO disabled — modernc.org/sqlite is CGO-free), version-stamped via ldflags;
+#   - per-target tar.gz archives + a SHA256SUMS checksum file;
+#   - a cosign keyless (OIDC) signature + certificate over the checksum file;
+#   - a Homebrew formula pushed to go2-im/homebrew-tap;
+#   - multi-arch Docker images published to ghcr.io/go2-im/poolgate.
+#
+# The embedded admin UI (internal/webui/dist) is committed, so a release needs no
+# npm step. Validate locally with `goreleaser check` and
+# `goreleaser build --snapshot --clean --single-target`.
+version: 2
+
+project_name: poolgate
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  - id: poolgate
+    main: ./cmd/poolgate
+    binary: poolgate
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    # Reproducible builds: stamp the binary mtime to the commit time and trim
+    # local paths.
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X main.version={{ .Version }}
+      - -X main.commit={{ .FullCommit }}
+      - -X main.date={{ .CommitDate }}
+
+archives:
+  - id: poolgate
+    ids:
+      - poolgate
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    formats:
+      - tar.gz
+    files:
+      - LICENSE
+      - README.md
+      - src: docs/BUILD.md
+        dst: docs
+
+checksum:
+  name_template: "SHA256SUMS"
+  algorithm: sha256
+
+# cosign keyless signing of the checksum file (Sigstore OIDC via the workflow's
+# id-token permission). Verifiers check every artifact against the signed sums.
+signs:
+  - id: cosign-checksum
+    cmd: cosign
+    artifacts: checksum
+    output: true
+    certificate: "${artifact}.pem"
+    args:
+      - sign-blob
+      - "--output-certificate=${certificate}"
+      - "--output-signature=${signature}"
+      - "${artifact}"
+      - "--yes"
+
+dockers:
+  - id: poolgate-amd64
+    goos: linux
+    goarch: amd64
+    dockerfile: Dockerfile.goreleaser
+    use: buildx
+    image_templates:
+      - "ghcr.io/go2-im/poolgate:{{ .Version }}-amd64"
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.title={{ .ProjectName }}"
+      - "--label=org.opencontainers.image.description=Codex/ChatGPT account pool gateway"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.source=https://github.com/go2-im/poolgate"
+      - "--label=org.opencontainers.image.licenses=MIT"
+  - id: poolgate-arm64
+    goos: linux
+    goarch: arm64
+    dockerfile: Dockerfile.goreleaser
+    use: buildx
+    image_templates:
+      - "ghcr.io/go2-im/poolgate:{{ .Version }}-arm64"
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.title={{ .ProjectName }}"
+      - "--label=org.opencontainers.image.description=Codex/ChatGPT account pool gateway"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.source=https://github.com/go2-im/poolgate"
+      - "--label=org.opencontainers.image.licenses=MIT"
+
+docker_manifests:
+  - name_template: "ghcr.io/go2-im/poolgate:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/go2-im/poolgate:{{ .Version }}-amd64"
+      - "ghcr.io/go2-im/poolgate:{{ .Version }}-arm64"
+  - name_template: "ghcr.io/go2-im/poolgate:latest"
+    image_templates:
+      - "ghcr.io/go2-im/poolgate:{{ .Version }}-amd64"
+      - "ghcr.io/go2-im/poolgate:{{ .Version }}-arm64"
+
+brews:
+  - name: poolgate
+    ids:
+      - poolgate
+    repository:
+      owner: go2-im
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    homepage: "https://github.com/go2-im/poolgate"
+    description: "Single-user manager + OpenAI-compatible reverse proxy for a pool of Codex/ChatGPT accounts"
+    license: "MIT"
+    directory: Formula
+    # Only publish the tap from a real (non-prerelease) tag.
+    skip_upload: auto
+    install: |
+      bin.install "poolgate"
+    test: |
+      system "#{bin}/poolgate", "version"
+
+release:
+  github:
+    owner: go2-im
+    name: poolgate
+  draft: false
+  # A tag like v1.2.3-rc1 is auto-marked prerelease.
+  prerelease: auto
+
+changelog:
+  use: git
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "merge conflict"
+      - Merge pull request
+      - Merge branch
+  groups:
+    - title: Features
+      regexp: '^.*?feat(\(.+\))??!?:.+$'
+      order: 0
+    - title: Bug fixes
+      regexp: '^.*?fix(\(.+\))??!?:.+$'
+      order: 1
+    - title: Others
+      order: 999
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot-{{ .ShortCommit }}"

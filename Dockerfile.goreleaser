@@ -1,0 +1,25 @@
+# Dockerfile.goreleaser — consumed by GoReleaser's `dockers` build. GoReleaser
+# places the already-cross-compiled `poolgate` binary in the build context, so
+# this image does NOT compile anything; it just wraps the static binary in a
+# minimal distroless base.
+#
+# Base: distroless static + nonroot (uid 65532). The binary is pure-Go/static
+# (CGO disabled), so `static` is sufficient — no libc needed.
+FROM gcr.io/distroless/static:nonroot
+
+# The embedded admin UI ships inside the binary (go:embed), so nothing else to copy.
+COPY poolgate /usr/bin/poolgate
+
+# Proxy listener (OpenAI-compatible gateway). Bind it to 0.0.0.0 via config to
+# reach it from outside the container. The admin listener (7070) is intentionally
+# NOT exposed — keep it loopback / private (DESIGN §3) and reach it via an SSH
+# tunnel or a sidecar.
+EXPOSE 8787
+
+# Runtime state (encrypted accounts, master key, DB) lives here; mount a volume.
+ENV POOLGATE_DATA_DIR=/data
+VOLUME ["/data"]
+
+USER nonroot:nonroot
+ENTRYPOINT ["/usr/bin/poolgate"]
+CMD ["serve"]

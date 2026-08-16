@@ -1,0 +1,42 @@
+# Dependabot — keep dependencies + pinned actions current (DESIGN §18).
+# Grouped, weekly PRs to keep the noise low.
+version: 2
+updates:
+  # Go modules (root module).
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "build(deps)"
+    groups:
+      go-deps:
+        patterns:
+          - "*"
+
+  # GitHub Actions — surfaces new SHAs for the pinned actions in ci.yml/release.yml.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci(deps)"
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  # Frontend (admin UI) npm dependencies.
+  - package-ecosystem: npm
+    directory: "/web"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "build(web-deps)"
+    groups:
+      web-deps:
+        patterns:
+          - "*"

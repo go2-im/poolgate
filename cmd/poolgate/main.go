@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -47,6 +48,15 @@ import (
 // errUsage is a sentinel returned by run for a usage error (unknown/missing
 // command). main maps it to exit code 2; genuine failures map to exit code 1.
 var errUsage = errors.New("usage")
+
+// Build metadata, injected at release time via -ldflags -X (see .goreleaser.yaml
+// / docs/BUILD.md). They keep their defaults for `go build` / `go install`
+// (source builds), so `poolgate version` still works without a release toolchain.
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
 
 const (
 	// defaultGroupName / defaultEndpointName are created by `import` when the
@@ -92,6 +102,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	cmd, rest := args[0], args[1:]
 
 	switch cmd {
+	case "version", "--version", "-v":
+		printVersion(stdout)
+		return nil
 	case "init":
 		if err := cmdInit(rest, stdout); err != nil {
 			fmt.Fprintf(stderr, "poolgate %s: %v\n", cmd, err)
@@ -133,11 +146,19 @@ usage:
   poolgate serve                start the proxy + admin listeners + health scheduler
   poolgate admin reset-auth     wipe all passkeys/recovery codes/sessions and
                                 print a fresh single-use bootstrap token
+  poolgate version              print version, commit, and build date
 
 environment:
   POOLGATE_DATA_DIR   override the data directory (default: `+config.DefaultDataDir+`)
   POOLGATE_MASTER_KEY base64 master key (when master_key_source=env)
 `)
+}
+
+// printVersion writes the build metadata as a single line. The values are the
+// ldflags-injected version/commit/date (defaults for source builds).
+func printVersion(w io.Writer) {
+	fmt.Fprintf(w, "poolgate %s (commit %s, built %s, %s)\n",
+		version, commit, date, runtime.Version())
 }
 
 // loadConfig returns the effective config, honoring POOLGATE_DATA_DIR and a

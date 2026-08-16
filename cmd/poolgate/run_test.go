@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -26,6 +27,30 @@ func writeAuthJSON(t *testing.T) string {
 		t.Fatalf("write auth.json: %v", err)
 	}
 	return authPath
+}
+
+// TestRunVersion covers the version subcommand + its flag aliases: each returns
+// nil and prints a single line carrying the injected version string and the Go
+// runtime version, to stdout (not stderr).
+func TestRunVersion(t *testing.T) {
+	for _, args := range [][]string{{"version"}, {"--version"}, {"-v"}} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			var out, errBuf bytes.Buffer
+			if err := run(context.Background(), args, &out, &errBuf); err != nil {
+				t.Fatalf("run(%v) err = %v, want nil", args, err)
+			}
+			got := out.String()
+			if !strings.Contains(got, "poolgate ") || !strings.Contains(got, version) {
+				t.Errorf("stdout missing version: %q", got)
+			}
+			if !strings.Contains(got, runtime.Version()) {
+				t.Errorf("stdout missing go runtime version: %q", got)
+			}
+			if errBuf.Len() != 0 {
+				t.Errorf("version wrote to stderr: %q", errBuf.String())
+			}
+		})
+	}
 }
 
 // TestRunUsage covers the run() dispatcher's usage/help branches: no args and
