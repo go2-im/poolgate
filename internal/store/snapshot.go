@@ -14,8 +14,75 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/go2-im/poolgate/internal/crypto"
 	"github.com/go2-im/poolgate/internal/model"
 )
+
+// CurrentSchemaVersion is the highest migration version this binary knows how to
+// run. A restore bundle newer than this cannot be safely opened by this binary.
+func CurrentSchemaVersion() int { return len(migrations) }
+
+// VerifyRestoreBundle sanity-checks a decrypted backup database image BEFORE it
+// is committed over a live install (DESIGN.md §20). It runs SQLite's
+// integrity_check, refuses a bundle whose schema is newer than this binary
+// supports, and — when the database has any accounts — sample-decrypts one
+// sealed secret with the supplied master key to confirm the key actually matches
+// the database (catching a bundle whose key and ciphertext diverged, e.g. one
+// produced after a lost keyfile was silently regenerated).
+func VerifyRestoreBundle(dbBytes, key []byte) error {
+	cipher, err := crypto.New(key)
+	if err != nil {
+		return fmt.Errorf("store: verify bundle: %w", err)
+	}
+	tmpDir, err := os.MkdirTemp("", "poolgate-verify-")
+	if err != nil {
+		return fmt.Errorf("store: verify tempdir: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+	p := filepath.Join(tmpDir, "bundle.db")
+	if err := os.WriteFile(p, dbBytes, 0o600); err != nil {
+		return fmt.Errorf("store: write bundle for verify: %w", err)
+	}
+
+	db, err := sql.Open("sqlite", "file:"+p+"?mode=ro&_pragma=busy_timeout(5000)")
+	if err != nil {
+		return fmt.Errorf("store: open bundle for verify: %w", err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	ctx := context.Background()
+
+	var integ string
+	if err := db.QueryRowContext(ctx, `PRAGMA integrity_check`).Scan(&integ); err != nil {
+		return fmt.Errorf("store: bundle integrity_check failed to run: %w", err)
+	}
+	if integ != "ok" {
+		return fmt.Errorf("store: bundle database is corrupt (integrity_check: %s)", integ)
+	}
+
+	var ver sql.NullInt64
+	if err := db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&ver); err != nil {
+		return fmt.Errorf("store: read bundle schema version: %w", err)
+	}
+	if ver.Valid && int(ver.Int64) > CurrentSchemaVersion() {
+		return fmt.Errorf("store: bundle schema version %d is newer than this binary supports (%d) — upgrade poolgate before restoring",
+			ver.Int64, CurrentSchemaVersion())
+	}
+
+	// Sample-decrypt one sealed secret to confirm the key matches the ciphertext.
+	var sealed string
+	switch err := db.QueryRowContext(ctx, `SELECT access_token FROM accounts LIMIT 1`).Scan(&sealed); {
+	case errors.Is(err, sql.ErrNoRows):
+		// No accounts to sample — integrity + schema checks are all we can do.
+		return nil
+	case err != nil:
+		return fmt.Errorf("store: read bundle sample secret: %w", err)
+	}
+	if _, err := cipher.Open(sealed); err != nil {
+		return errors.New("store: master key does not match this backup's database (bundle key/ciphertext mismatch)")
+	}
+	return nil
+}
 
 // Snapshot returns a consistent copy of the database under cfg.DataDir as a byte
 // slice (a standalone SQLite file) plus its schema version. It errors if the

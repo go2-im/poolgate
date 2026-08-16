@@ -74,6 +74,29 @@ func TestBackupRestoreRoundTrip(t *testing.T) {
 	}
 }
 
+// TestBackupRefusesToMintKeyWhenMissing asserts that backup errors (rather than
+// minting a fresh key and producing an unrestorable bundle) when the keyfile is
+// absent for a data dir that was never initialized.
+func TestBackupRefusesToMintKeyWhenMissing(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	t.Setenv(envDataDir, dir)
+	t.Setenv(envBackupPassphrase, "pw-123456")
+	bundle := filepath.Join(t.TempDir(), "b.pgbak")
+
+	err := run(ctx, []string{"backup", "--out", bundle}, io.Discard, io.Discard)
+	if err == nil {
+		t.Fatal("backup on an uninitialized data dir should error, not mint a key")
+	}
+	// No stray master.key should have been created as a side effect.
+	if _, statErr := os.Stat(filepath.Join(dir, "master.key")); statErr == nil {
+		t.Fatal("backup created a stray master.key on a data dir with no database")
+	}
+	if _, statErr := os.Stat(bundle); statErr == nil {
+		t.Fatal("backup wrote a bundle despite failing")
+	}
+}
+
 // TestRestoreRefusesOverwrite asserts restore won't clobber an existing install
 // without --force, and succeeds with it.
 func TestRestoreRefusesOverwrite(t *testing.T) {

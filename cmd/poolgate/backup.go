@@ -5,6 +5,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -39,7 +40,7 @@ func cmdBackup(args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	key, err := loadMasterKey(cfg)
+	key, err := loadMasterKeyExisting(cfg)
 	if err != nil {
 		return fmt.Errorf("load master key: %w", err)
 	}
@@ -57,13 +58,24 @@ func cmdBackup(args []string, stdout io.Writer) error {
 		SchemaVersion: schemaVersion,
 		CreatedAtUnix: time.Now().UTC().Unix(),
 	})
+	// Durability: a DR artifact must survive a crash right after it is written.
+	// fsync the bundle before reporting success, then fsync the containing dir so
+	// the new directory entry is durable too.
+	syncErr := f.Sync()
 	closeErr := f.Close()
 	if writeErr != nil {
 		_ = os.Remove(out) // don't leave a partial/corrupt bundle behind
 		return fmt.Errorf("write bundle: %w", writeErr)
 	}
+	if syncErr != nil {
+		_ = os.Remove(out)
+		return fmt.Errorf("fsync bundle: %w", syncErr)
+	}
 	if closeErr != nil {
 		return fmt.Errorf("close bundle: %w", closeErr)
+	}
+	if dir := filepath.Dir(out); dir != "" {
+		syncDir(dir)
 	}
 
 	fmt.Fprintf(stdout, "backup written: %s\n", out)
@@ -99,6 +111,28 @@ func cmdRestore(args []string, stdout io.Writer) error {
 	key, db, meta, err := backup.Read(f, pass)
 	if err != nil {
 		return err
+	}
+
+	// Verify the decrypted bundle BEFORE committing it over a live install:
+	// integrity_check, schema-version compatibility, and a sample decrypt proving
+	// the embedded key actually matches the database.
+	if err := store.VerifyRestoreBundle(db, key); err != nil {
+		return err
+	}
+
+	// Under master_key_source=env the key is NOT written to disk; the running
+	// environment must already carry the matching POOLGATE_MASTER_KEY. If the
+	// current env key differs from the bundle's key, the restored DB would be
+	// undecryptable on next start — refuse now instead of "succeeding" and failing
+	// at the next serve.
+	if cfg.MasterKeySource == "env" {
+		envKey, kerr := loadMasterKeyExisting(cfg)
+		if kerr != nil {
+			return fmt.Errorf("master_key_source=env but the current key is unavailable: %w", kerr)
+		}
+		if !bytes.Equal(envKey, key) {
+			return errors.New("POOLGATE_MASTER_KEY does not match this backup's key; set the env to the backup's master key before restoring (master_key_source=env does not write the key to disk)")
+		}
 	}
 
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
@@ -166,7 +200,7 @@ func cmdRestore(args []string, stdout io.Writer) error {
 	if writeKey {
 		if err := os.Rename(keyTmp, keyPath); err != nil {
 			_ = os.Remove(keyTmp)
-			return fmt.Errorf("commit master key (database already restored — re-run restore): %w", err)
+			return fmt.Errorf("commit master key (database already restored — re-run restore with --force): %w", err)
 		}
 	}
 	// Best-effort durability of the renames.

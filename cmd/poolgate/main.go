@@ -281,6 +281,26 @@ func loadMasterKey(cfg model.Config) ([]byte, error) {
 	}
 }
 
+// loadMasterKeyExisting loads the master key but NEVER creates one. Read-only /
+// DR commands (backup) use it: minting a fresh key when the keyfile is missing
+// would embed a random key in the bundle that cannot decrypt the snapshotted
+// database, producing an unrestorable bundle that still reports success.
+func loadMasterKeyExisting(cfg model.Config) ([]byte, error) {
+	switch cfg.MasterKeySource {
+	case "env":
+		v, err := envValue(envMasterKey)
+		if err != nil {
+			return nil, err
+		}
+		if v == "" {
+			return nil, fmt.Errorf("crypto: %s (or %s_FILE) is empty", envMasterKey, envMasterKey)
+		}
+		return crypto.ParseKey(v)
+	default:
+		return crypto.LoadKeyfile(filepath.Join(cfg.DataDir, masterKeyFile))
+	}
+}
+
 // openStore loads the master key per cfg.MasterKeySource, builds the cipher, and
 // opens the store (running migrations). Used by import and serve.
 func openStore(cfg model.Config) (*store.Store, error) {
