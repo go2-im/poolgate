@@ -6,9 +6,16 @@
 // It must not run while `serve` is live, so it takes the same single-instance
 // lock. The DB re-encryption is one transaction: on failure the DB stays wholly
 // on the old key. The one unavoidable window is between the DB commit and the
-// key swap — if the process dies there, the DB is on the new key; recover from
-// the pre-rotation snapshot, or (keyfile source) the new key is printed so it can
-// be written by hand.
+// key swap:
+//   - On a graceful keyfile-write error (or env-source mode) the new key is
+//     printed so it can be recorded by hand.
+//   - On a HARD crash there (SIGKILL / power loss) the new key is lost from
+//     memory; recover by restoring the pre-rotation snapshot — a raw SQLite
+//     image, NOT a `poolgate restore` bundle: stop poolgate, copy
+//     poolgate-pre-rotate-<ts>.db over <data>/poolgate.db, delete the
+//     poolgate.db-wal / poolgate.db-shm sidecars, and keep the OLD key in place.
+//     (A best-effort fallback: master.key.tmp, if present, holds the fsync'd new
+//     key from the interrupted swap.)
 package main
 
 import (
@@ -17,10 +24,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/go2-im/poolgate/internal/crypto"
 	"github.com/go2-im/poolgate/internal/lock"
+	"github.com/go2-im/poolgate/internal/model"
 	"github.com/go2-im/poolgate/internal/store"
 )
 
@@ -66,8 +75,18 @@ func cmdRotateKey(_ []string, stdout io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("pre-rotation snapshot failed (aborting): %w", err)
 	}
-	if err := os.WriteFile(snapPath, snap, 0o600); err != nil {
+	// O_EXCL: never silently clobber an earlier same-second snapshot.
+	sf, err := os.OpenFile(snapPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("create pre-rotation snapshot: %w", err)
+	}
+	if _, err := sf.Write(snap); err != nil {
+		_ = sf.Close()
+		_ = os.Remove(snapPath)
 		return fmt.Errorf("write pre-rotation snapshot: %w", err)
+	}
+	if err := sf.Close(); err != nil {
+		return fmt.Errorf("close pre-rotation snapshot: %w", err)
 	}
 	fmt.Fprintf(stdout, "pre-rotation snapshot written: %s\n", snapPath)
 
@@ -95,16 +114,38 @@ func cmdRotateKey(_ []string, stdout io.Writer) error {
 
 	keyPath := filepath.Join(cfg.DataDir, masterKeyFile)
 	if err := writeKeyfileAtomic(keyPath, newKey); err != nil {
-		// The DB is on the new key but the keyfile swap failed: surface the key so
-		// the operator can write it manually, and point at the snapshot.
+		// The DB is on the new key but the keyfile swap failed. Surface the key so
+		// the operator can write it manually. (master.key.tmp may also hold it.)
 		fmt.Fprintf(stdout, "\nWARNING: DB re-encrypted but writing %s failed: %v\n"+
-			"Write this NEW key (base64) to that file, or restore the pre-rotation snapshot %s:\n\n  %s\n\n",
-			keyPath, err, snapPath, crypto.EncodeKey(newKey))
+			"Write this NEW key (base64) to that file to finish, e.g.:\n  printf '%%s\\n' <KEY> > %s\n"+
+			"Or restore the pre-rotation snapshot MANUALLY (it is a raw DB, not a `poolgate restore` bundle):\n"+
+			"  stop poolgate; cp %s %s; rm -f %s-wal %s-shm; keep the OLD key.\n\nNEW key: %s\n\n",
+			keyPath, err, keyPath, snapPath, dbPathOf(cfg), dbPathOf(cfg), dbPathOf(cfg), crypto.EncodeKey(newKey))
 		return fmt.Errorf("rotate: persist new keyfile: %w", err)
 	}
 	fmt.Fprintf(stdout, "master key rotated: re-encrypted %d account(s), %d notify channel(s); %s updated.\n",
 		nAcc, nCh, keyPath)
+	pruneOldSnapshots(cfg.DataDir, stdout)
 	return nil
+}
+
+// dbPathOf returns the main SQLite DB path under the data dir.
+func dbPathOf(cfg model.Config) string { return filepath.Join(cfg.DataDir, "poolgate.db") }
+
+// pruneOldSnapshots keeps only the newest keepSnapshots pre-rotation snapshots so
+// repeated rotations don't accumulate standing plaintext-metadata DB images.
+func pruneOldSnapshots(dataDir string, stdout io.Writer) {
+	const keepSnapshots = 3
+	matches, err := filepath.Glob(filepath.Join(dataDir, "poolgate-pre-rotate-*.db"))
+	if err != nil || len(matches) <= keepSnapshots {
+		return
+	}
+	sort.Strings(matches) // timestamped names sort chronologically
+	for _, old := range matches[:len(matches)-keepSnapshots] {
+		if err := os.Remove(old); err == nil {
+			fmt.Fprintf(stdout, "pruned old pre-rotation snapshot: %s\n", old)
+		}
+	}
 }
 
 // writeKeyfileAtomic writes the base64-encoded key to path via a fsync'd temp
