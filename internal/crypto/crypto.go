@@ -79,6 +79,19 @@ func LoadKeyFromEnv(envVar string) ([]byte, error) {
 	return ParseKey(v)
 }
 
+// GenerateKey returns a fresh cryptographically-random master key (KeySize bytes).
+// Used by master-key rotation to mint the new key before re-encrypting.
+func GenerateKey() ([]byte, error) {
+	key := make([]byte, KeySize)
+	if _, err := io.ReadFull(rand.Reader, key); err != nil {
+		return nil, fmt.Errorf("crypto: generate key: %w", err)
+	}
+	return key, nil
+}
+
+// EncodeKey base64 std-encodes a raw master key (the on-disk / env representation).
+func EncodeKey(key []byte) string { return base64.StdEncoding.EncodeToString(key) }
+
 // ParseKey decodes a base64 std-encoded master key and validates its length.
 // It is the shared parser behind LoadKeyFromEnv and any other source (e.g. a
 // *_FILE secret) that supplies the key as a base64 string.

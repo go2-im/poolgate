@@ -57,6 +57,25 @@ short-TTL single-use bootstrap token (hashed at rest, plaintext to the console
 only — never to durable logs). Register a new passkey with that token; consuming
 it invalidates it.
 
+## Rotate the master key
+
+`rotate-key` mints a fresh master key and re-encrypts every secret column
+(account access/refresh tokens, notify-channel config) so a suspected-compromised
+key can be replaced without re-importing accounts:
+
+```sh
+./poolgate rotate-key
+```
+
+It must run while the server is stopped (it takes the single-instance lock). It
+writes a **pre-rotation snapshot** (`poolgate-pre-rotate-<ts>.db`) first, then
+re-encrypts all secrets in one transaction — on any failure the DB stays wholly
+on the old key. For `master_key_source: keyfile` it atomically swaps `master.key`;
+for `master_key_source: env` it prints the new base64 key, which you must set as
+`POOLGATE_MASTER_KEY` before the next start (the old key no longer decrypts the
+DB). Keep the pre-rotation snapshot until you've confirmed the server starts
+cleanly on the new key.
+
 ## 2. Import an account (explicit — never automatic)
 
 Import a Codex `auth.json` (the file with a `tokens` object holding
