@@ -3,6 +3,7 @@ module github.com/go2-im/poolgate
 go 1.25.0
 
 require (
+	github.com/coder/websocket v1.8.15
 	github.com/fxamacker/cbor/v2 v2.9.2
 	github.com/go-webauthn/webauthn v0.17.4
 	golang.org/x/crypto v0.55.0

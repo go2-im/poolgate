@@ -200,7 +200,15 @@ proxy — DESIGN.md §0 D1 / §6):
   (egress allowlist: `chatgpt.com` / `api.openai.com`);
 - relays the SSE stream with per-chunk flush.
 
-WebSocket upgrades are not accepted in v1 (Codex falls back to HTTP POST+SSE).
+WebSocket transport: a `GET` upgrade to the same `/e/<endpoint>/v1/responses` URL
+is accepted and transparently proxied to the pinned upstream account (frames pass
+through unbuffered). The chosen account is pinned for the connection's lifetime
+(turn affinity — a turn is connection-scoped), and an `x-codex-turn-state` value
+sent as an upgrade header additionally re-pins reconnects to the same backend for
+a short TTL. Account failover happens pre-first-frame (before the client upgrade
+is accepted), mirroring the HTTP pre-first-byte boundary; once frames flow, an
+error on either side closes both. Codex still negotiates WS-first and falls back
+to HTTP POST+SSE when a hop doesn't accept the upgrade.
 
 ## 5. Admin API (passkey login + management)
 

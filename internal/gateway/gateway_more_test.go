@@ -147,14 +147,17 @@ func TestHandleResponsesErrorPaths(t *testing.T) {
 		}
 	})
 
-	t.Run("websocket upgrade -> 501", func(t *testing.T) {
+	t.Run("POST with spurious Upgrade headers is treated as HTTP, not WS", func(t *testing.T) {
+		// WS is GET-only; a POST carrying Upgrade headers must NOT be routed to the
+		// WS path. Here the body is invalid JSON so the HTTP path returns 400 before
+		// any upstream dial — proving it went down the HTTP branch.
 		f := newFixture(t)
 		gw := New(f.st, f.cfg)
 		srv := httptest.NewServer(gw.Routes())
 		defer srv.Close()
 
 		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/e/default/v1/responses",
-			strings.NewReader(`{"model":"gpt-5"}`))
+			strings.NewReader(`{not json`))
 		req.Header.Set("Authorization", "Bearer "+f.apiKey)
 		req.Header.Set("Upgrade", "websocket")
 		req.Header.Set("Connection", "Upgrade")
@@ -163,13 +166,13 @@ func TestHandleResponsesErrorPaths(t *testing.T) {
 			t.Fatalf("POST: %v", err)
 		}
 		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusNotImplemented {
-			t.Fatalf("status = %d, want 501", resp.StatusCode)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400 (HTTP path, not WS)", resp.StatusCode)
 		}
 		var eb errorBody
 		_ = json.NewDecoder(resp.Body).Decode(&eb)
-		if eb.Error.Type != "poolgate_websocket_unsupported" {
-			t.Errorf("type = %q, want poolgate_websocket_unsupported", eb.Error.Type)
+		if eb.Error.Type != "poolgate_bad_request" {
+			t.Errorf("type = %q, want poolgate_bad_request", eb.Error.Type)
 		}
 	})
 

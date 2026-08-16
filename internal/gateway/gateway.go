@@ -113,6 +113,11 @@ type Gateway struct {
 	// strategy). It persists across requests so rotation is fair over time.
 	cursorsMu sync.Mutex
 	cursors   map[string]*policy.Cursor
+
+	// wsAff pins a WebSocket turn to one backend across reconnects, keyed on the
+	// x-codex-turn-state upgrade header when present (DESIGN.md §0 D3 / §19.1).
+	// Within a single connection the backend is always pinned regardless.
+	wsAff *wsAffinity
 }
 
 // Option customizes a Gateway.
@@ -180,6 +185,7 @@ func New(st *store.Store, cfg model.Config, opts ...Option) *Gateway {
 		logger:       slog.Default(),
 		cursors:      make(map[string]*policy.Cursor),
 		inflight:     newInflight(),
+		wsAff:        newWSAffinity(),
 		retryAfterSecs: 1,
 		// No client Timeout: SSE streams are long-lived; cancellation rides the
 		// request context instead.
@@ -196,6 +202,8 @@ func (g *Gateway) Routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	// Primary inbound Responses API route (DESIGN.md §23.5).
 	mux.HandleFunc("POST /e/{endpoint}/v1/responses", g.handleResponses)
+	// WebSocket transport (DESIGN.md §0 D2/D3): the WS upgrade is a GET.
+	mux.HandleFunc("GET /e/{endpoint}/v1/responses", g.handleResponsesWS)
 	mux.HandleFunc("/healthz", g.handleHealthz)
 	mux.HandleFunc("/readyz", g.handleReadyz)
 	return mux
@@ -218,26 +226,24 @@ func writeError(w http.ResponseWriter, status int, typ, code, msg string) {
 	_ = json.NewEncoder(w).Encode(errorBody{Error: errorDetail{Message: msg, Type: typ, Code: code}})
 }
 
-func (g *Gateway) handleResponses(w http.ResponseWriter, r *http.Request) {
-	// v1 does not accept WebSocket upgrades — Codex falls back to HTTP+SSE.
-	if isWebSocketUpgrade(r) {
-		writeError(w, http.StatusNotImplemented, "poolgate_websocket_unsupported",
-			"websocket_unsupported", "websocket upgrade is not supported; use HTTP POST + SSE")
-		return
-	}
-
+// authorizeInbound runs the shared inbound checks for a /responses request
+// (HTTP or WebSocket): sk- key auth (constant-time), key lifecycle (expiry + IP
+// allowlist), endpoint scoping, and endpoint→group→member-accounts resolution.
+// On any failure it writes the error response and returns ok=false, so both
+// transports enforce identical authorization with no divergence.
+func (g *Gateway) authorizeInbound(w http.ResponseWriter, r *http.Request) (apiKey model.ApiKey, endpoint string, group model.PolicyGroup, accounts []model.Account, ok bool) {
 	// (1) inbound sk- key auth, constant-time.
-	key, ok := bearerToken(r)
-	if !ok {
+	key, has := bearerToken(r)
+	if !has {
 		writeError(w, http.StatusUnauthorized, "poolgate_missing_key",
 			"missing_api_key", "missing or malformed Authorization: Bearer sk-... header")
-		return
+		return model.ApiKey{}, "", model.PolicyGroup{}, nil, false
 	}
-	apiKey, ok := g.authenticate(r.Context(), key)
-	if !ok {
+	apiKey, matched := g.authenticate(r.Context(), key)
+	if !matched {
 		writeError(w, http.StatusUnauthorized, "poolgate_invalid_key",
 			"invalid_api_key", "invalid API key")
-		return
+		return model.ApiKey{}, "", model.PolicyGroup{}, nil, false
 	}
 
 	// (1a) key lifecycle: reject an expired key and enforce its IP allowlist
@@ -245,21 +251,21 @@ func (g *Gateway) handleResponses(w http.ResponseWriter, r *http.Request) {
 	if apiKey.Expired(time.Now().UTC()) {
 		writeError(w, http.StatusUnauthorized, "poolgate_key_expired",
 			"key_expired", "API key has expired")
-		return
+		return model.ApiKey{}, "", model.PolicyGroup{}, nil, false
 	}
 	if !keyIPAllowed(apiKey, r) {
 		writeError(w, http.StatusForbidden, "poolgate_key_ip_denied",
 			"key_ip_denied", "client IP is not allowed for this API key")
-		return
+		return model.ApiKey{}, "", model.PolicyGroup{}, nil, false
 	}
 
-	endpoint := r.PathValue("endpoint")
+	endpoint = r.PathValue("endpoint")
 
 	// (1b) endpoint scoping: empty scope = all endpoints.
 	if !keyScopedTo(apiKey, endpoint) {
 		writeError(w, http.StatusForbidden, "poolgate_key_unscoped",
 			"key_unscoped", "API key is not scoped to endpoint "+endpoint)
-		return
+		return model.ApiKey{}, "", model.PolicyGroup{}, nil, false
 	}
 
 	// (2) resolve endpoint -> group -> ordered member accounts.
@@ -268,10 +274,20 @@ func (g *Gateway) handleResponses(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "poolgate_unknown_endpoint",
 				"unknown_endpoint", "no such endpoint: "+endpoint)
-			return
+			return model.ApiKey{}, "", model.PolicyGroup{}, nil, false
 		}
 		writeError(w, http.StatusInternalServerError, "poolgate_internal",
 			"internal_error", "failed to resolve endpoint")
+		return model.ApiKey{}, "", model.PolicyGroup{}, nil, false
+	}
+	return apiKey, endpoint, group, accounts, true
+}
+
+func (g *Gateway) handleResponses(w http.ResponseWriter, r *http.Request) {
+	// WebSocket upgrades are a GET and are served by handleResponsesWS via the
+	// GET route (DESIGN.md §0 D2/D3); this POST path is HTTP+SSE only.
+	apiKey, endpoint, group, accounts, ok := g.authorizeInbound(w, r)
+	if !ok {
 		return
 	}
 
