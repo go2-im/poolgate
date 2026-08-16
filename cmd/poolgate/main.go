@@ -609,7 +609,47 @@ func cmdServe(ctx context.Context, _ []string, stdout io.Writer) error {
 	}()
 
 	logger.Info("health scheduler started", slog.String("probe_mode", cfg.HealthProbeMode))
+	// Emit a startup_bind_warning alert for any listener bound to a non-loopback
+	// address (DESIGN.md §11) — the notify dispatcher is running by now.
+	emitBindWarnings(cfg, notifier)
 	return serveBoth(ctx, cfg, gw, adminHandler, logger, nil, nil)
+}
+
+// bindEventSink is the minimal notify surface emitBindWarnings needs (satisfied
+// by *notify.Engine); it keeps the helper unit-testable with a fake.
+type bindEventSink interface {
+	Emit(ev model.NotifyEvent)
+}
+
+// isLoopbackHost reports whether host is a loopback bind (no alert needed).
+func isLoopbackHost(host string) bool {
+	switch host {
+	case "127.0.0.1", "localhost", "::1", "":
+		return true
+	}
+	return false
+}
+
+// emitBindWarnings emits one EventStartupBindWarning per listener bound to a
+// non-loopback address. Secret-free; best-effort.
+func emitBindWarnings(cfg model.Config, sink bindEventSink) {
+	if sink == nil {
+		return
+	}
+	for _, l := range []struct{ name, host string }{
+		{"proxy", cfg.Server.Proxy.Host},
+		{"admin", cfg.Server.Admin.Host},
+	} {
+		if isLoopbackHost(l.host) {
+			continue
+		}
+		sink.Emit(model.NotifyEvent{
+			Kind: model.EventStartupBindWarning,
+			Message: fmt.Sprintf("poolgate: the %s listener is bound to a non-loopback address (%s); "+
+				"front it with a reverse proxy and keep access controlled", l.name, l.host),
+			At: time.Now().UTC(),
+		})
+	}
 }
 
 // buildAdminHandler constructs the loopback admin API handler: the admin-auth
