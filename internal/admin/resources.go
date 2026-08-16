@@ -10,7 +10,11 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"net"
 	"net/http"
+	"strings"
+	"time"
 
 	"github.com/go2-im/poolgate/internal/authimport"
 	"github.com/go2-im/poolgate/internal/model"
@@ -45,20 +49,31 @@ const rfc3339 = "2006-01-02T15:04:05Z07:00"
 // apiKeyView masks the secret; Key is populated (unmasked) only in the one-time
 // create response.
 type apiKeyView struct {
-	ID        string   `json:"id"`
-	Label     string   `json:"label"`
-	Endpoints []string `json:"endpoints"`
-	KeyMasked string   `json:"key_masked"`
-	Key       string   `json:"key,omitempty"`
+	ID          string   `json:"id"`
+	Label       string   `json:"label"`
+	Endpoints   []string `json:"endpoints"`
+	KeyMasked   string   `json:"key_masked"`
+	ExpiresAt   string   `json:"expires_at,omitempty"`
+	IPAllowlist []string `json:"ip_allowlist"`
+	Key         string   `json:"key,omitempty"`
 }
 
 func toApiKeyView(k model.ApiKey) apiKeyView {
-	return apiKeyView{
-		ID:        k.ID,
-		Label:     k.Label,
-		Endpoints: k.Endpoints,
-		KeyMasked: maskKey(k.Key),
+	allow := k.IPAllowlist
+	if allow == nil {
+		allow = []string{}
 	}
+	v := apiKeyView{
+		ID:          k.ID,
+		Label:       k.Label,
+		Endpoints:   k.Endpoints,
+		KeyMasked:   maskKey(k.Key),
+		IPAllowlist: allow,
+	}
+	if !k.ExpiresAt.IsZero() {
+		v.ExpiresAt = k.ExpiresAt.Format(rfc3339)
+	}
+	return v
 }
 
 // maskKey shows only a short suffix of an sk- key, e.g. "sk-…a1b2".
@@ -154,6 +169,10 @@ func (s *Server) handleAccountDelete(w http.ResponseWriter, r *http.Request) {
 type apiKeyCreateReq struct {
 	Label     string   `json:"label"`
 	Endpoints []string `json:"endpoints"`
+	// ExpiresAt is an optional RFC3339 expiry; empty/omitted = never expires.
+	ExpiresAt string `json:"expires_at"`
+	// IPAllowlist is an optional list of IPs/CIDRs; empty = any IP.
+	IPAllowlist []string `json:"ip_allowlist"`
 }
 
 // handleApiKeysList returns every inbound key with its secret masked.
@@ -171,11 +190,21 @@ func (s *Server) handleApiKeysList(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleApiKeyCreate mints a fresh sk- key, stores it, and returns the full
-// secret exactly once (subsequent reads are masked).
+// secret exactly once (subsequent reads are masked). Optional expiry + IP
+// allowlist are validated at the boundary.
 func (s *Server) handleApiKeyCreate(w http.ResponseWriter, r *http.Request) {
 	var req apiKeyCreateReq
 	if err := decodeJSON(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, errBadRequest, "invalid request body")
+		return
+	}
+	expiresAt, err := parseOptionalExpiry(req.ExpiresAt)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, errBadRequest, err.Error())
+		return
+	}
+	if err := validateIPAllowlist(req.IPAllowlist); err != nil {
+		writeErr(w, http.StatusBadRequest, errBadRequest, err.Error())
 		return
 	}
 	secret, err := newSecretKey()
@@ -186,8 +215,12 @@ func (s *Server) handleApiKeyCreate(w http.ResponseWriter, r *http.Request) {
 	if req.Endpoints == nil {
 		req.Endpoints = []string{}
 	}
+	if req.IPAllowlist == nil {
+		req.IPAllowlist = []string{}
+	}
 	created, err := s.store.InsertApiKey(r.Context(), model.ApiKey{
 		Key: secret, Label: req.Label, Endpoints: req.Endpoints,
+		ExpiresAt: expiresAt, IPAllowlist: req.IPAllowlist,
 	})
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, errInternal, "could not store api key")
@@ -196,6 +229,56 @@ func (s *Server) handleApiKeyCreate(w http.ResponseWriter, r *http.Request) {
 	view := toApiKeyView(created)
 	view.Key = created.Key // shown once
 	writeJSON(w, http.StatusCreated, view)
+}
+
+// handleApiKeyRotate mints a new secret for an existing key (same id/label/scope/
+// expiry/allowlist) and returns it once. The old secret stops working.
+func (s *Server) handleApiKeyRotate(w http.ResponseWriter, r *http.Request) {
+	secret, err := newSecretKey()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, errInternal, "could not generate key")
+		return
+	}
+	rotated, err := s.store.RotateApiKey(r.Context(), r.PathValue("id"), secret)
+	if err != nil {
+		s.writeStoreErr(w, err, "api key")
+		return
+	}
+	view := toApiKeyView(rotated)
+	view.Key = rotated.Key // shown once
+	writeJSON(w, http.StatusOK, view)
+}
+
+// parseOptionalExpiry parses an optional RFC3339 timestamp; "" = zero (never).
+func parseOptionalExpiry(s string) (time.Time, error) {
+	if strings.TrimSpace(s) == "" {
+		return time.Time{}, nil
+	}
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("expires_at must be RFC3339 (e.g. 2027-01-02T15:04:05Z)")
+	}
+	return t.UTC(), nil
+}
+
+// validateIPAllowlist rejects malformed entries (each must be an IP or CIDR).
+func validateIPAllowlist(entries []string) error {
+	for _, e := range entries {
+		e = strings.TrimSpace(e)
+		if e == "" {
+			return fmt.Errorf("ip_allowlist entries must be non-empty")
+		}
+		if strings.Contains(e, "/") {
+			if _, _, err := net.ParseCIDR(e); err != nil {
+				return fmt.Errorf("ip_allowlist entry %q is not a valid CIDR", e)
+			}
+			continue
+		}
+		if net.ParseIP(e) == nil {
+			return fmt.Errorf("ip_allowlist entry %q is not a valid IP or CIDR", e)
+		}
+	}
+	return nil
 }
 
 // handleApiKeyDelete removes one inbound key by id.

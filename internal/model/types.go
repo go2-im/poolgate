@@ -73,6 +73,18 @@ type ApiKey struct {
 	Key       string   `json:"key"`
 	Label     string   `json:"label"`
 	Endpoints []string `json:"endpoints"`
+	// ExpiresAt is when the key stops being accepted; zero = never expires.
+	ExpiresAt time.Time `json:"expires_at,omitempty"`
+	// IPAllowlist restricts which client IPs may use the key. Each entry is an IP
+	// or CIDR (e.g. "203.0.113.4" or "10.0.0.0/8"); empty = any IP. Matched
+	// against the direct peer (RemoteAddr), so behind a reverse proxy the proxy's
+	// IP is what is checked.
+	IPAllowlist []string `json:"ip_allowlist,omitempty"`
+}
+
+// Expired reports whether the key has an expiry that is at or before now.
+func (k ApiKey) Expired(now time.Time) bool {
+	return !k.ExpiresAt.IsZero() && !now.Before(k.ExpiresAt)
 }
 
 // Endpoint is a named inbound route bound to one PolicyGroup, surfaced at
