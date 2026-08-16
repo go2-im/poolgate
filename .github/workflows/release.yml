@@ -1,0 +1,72 @@
+name: Release
+
+# Fires on a pushed semver tag. GoReleaser builds/signs/publishes; nothing here
+# runs on branch pushes or PRs (CI is the separate ci.yml).
+on:
+  push:
+    tags:
+      - "v*"
+
+# Least privilege, scoped to what a release needs:
+#   contents      — create the GitHub Release + upload assets
+#   packages      — push the Docker image to ghcr.io
+#   id-token      — mint the OIDC token cosign uses for keyless signing
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+
+# Single-flight: a fixed group (not ${{ github.ref }}, which differs per tag)
+# serializes releases so two tags pushed close together can't race on the mutable
+# ghcr :latest manifest. Never cancel — a half-finished release must complete.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      # actions/checkout v4 — full history + tags so the changelog/version resolve.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+
+      # actions/setup-go v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version: "stable"
+          cache: true
+
+      # docker/setup-qemu-action v3 — emulation so the arm64 image builds on the
+      # amd64 runner.
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130
+
+      # docker/setup-buildx-action v3 — buildx driver for the multi-arch images.
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+
+      # docker/login-action v3 — authenticate to ghcr with the workflow token.
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # sigstore/cosign-installer v3 — provides the cosign binary GoReleaser calls
+      # for keyless checksum signing.
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac
+
+      # goreleaser/goreleaser-action v6 — run the full release on the tag.
+      # GoReleaser itself is pinned to an exact version for reproducible releases
+      # (bump deliberately; Dependabot pins the action SHA, not this input).
+      - uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a
+        with:
+          distribution: goreleaser
+          version: "v2.8.2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Personal-access token with `contents:write` on go2-im/homebrew-tap, so
+          # GoReleaser can push the formula to the tap repo. Configure it as a repo
+          # secret; the brews step is skipped for prerelease tags.
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}

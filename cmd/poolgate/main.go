@@ -23,6 +23,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -48,6 +50,15 @@ import (
 // command). main maps it to exit code 2; genuine failures map to exit code 1.
 var errUsage = errors.New("usage")
 
+// Build metadata, injected at release time via -ldflags -X (see .goreleaser.yaml
+// / docs/BUILD.md). They keep their defaults for `go build` / `go install`
+// (source builds), so `poolgate version` still works without a release toolchain.
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
 const (
 	// defaultGroupName / defaultEndpointName are created by `import` when the
 	// store has no policy group / endpoint yet.
@@ -62,6 +73,13 @@ const (
 	envMasterKey = "POOLGATE_MASTER_KEY"
 	// envDataDir overrides the data dir for all subcommands.
 	envDataDir = "POOLGATE_DATA_DIR"
+	// envProxyHost / envProxyPort override the proxy listener bind. The proxy
+	// default is loopback (127.0.0.1), which is unreachable from outside a
+	// container; setting POOLGATE_PROXY_HOST=0.0.0.0 (as the Docker image does)
+	// makes the published port reachable. The admin listener intentionally has
+	// no such override — keep it loopback/private (DESIGN §3).
+	envProxyHost = "POOLGATE_PROXY_HOST"
+	envProxyPort = "POOLGATE_PROXY_PORT"
 )
 
 func main() {
@@ -92,6 +110,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	cmd, rest := args[0], args[1:]
 
 	switch cmd {
+	case "version", "--version", "-v":
+		printVersion(stdout)
+		return nil
 	case "init":
 		if err := cmdInit(rest, stdout); err != nil {
 			fmt.Fprintf(stderr, "poolgate %s: %v\n", cmd, err)
@@ -133,11 +154,19 @@ usage:
   poolgate serve                start the proxy + admin listeners + health scheduler
   poolgate admin reset-auth     wipe all passkeys/recovery codes/sessions and
                                 print a fresh single-use bootstrap token
+  poolgate version              print version, commit, and build date
 
 environment:
   POOLGATE_DATA_DIR   override the data directory (default: `+config.DefaultDataDir+`)
   POOLGATE_MASTER_KEY base64 master key (when master_key_source=env)
 `)
+}
+
+// printVersion writes the build metadata as a single line. The values are the
+// ldflags-injected version/commit/date (defaults for source builds).
+func printVersion(w io.Writer) {
+	fmt.Fprintf(w, "poolgate %s (commit %s, built %s, %s)\n",
+		version, commit, date, runtime.Version())
 }
 
 // loadConfig returns the effective config, honoring POOLGATE_DATA_DIR and a
@@ -157,6 +186,15 @@ func loadConfig() (model.Config, error) {
 	}
 	if dataDir != "" {
 		cfg.DataDir = dataDir
+	}
+	// Env overrides for the proxy bind (containers need a non-loopback host).
+	if v := strings.TrimSpace(os.Getenv(envProxyHost)); v != "" {
+		cfg.Server.Proxy.Host = v
+	}
+	if v := strings.TrimSpace(os.Getenv(envProxyPort)); v != "" {
+		if p, err := strconv.Atoi(v); err == nil && p > 0 && p <= 65535 {
+			cfg.Server.Proxy.Port = p
+		}
 	}
 	return cfg, nil
 }

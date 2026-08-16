@@ -1,0 +1,37 @@
+# Dockerfile.goreleaser — consumed by GoReleaser's `dockers` build. GoReleaser
+# places the already-cross-compiled `poolgate` binary in the build context, so
+# this image does NOT compile anything; it just wraps the static binary in a
+# minimal distroless base.
+#
+# Base: distroless static + nonroot (uid 65532). The binary is pure-Go/static
+# (CGO disabled), so `static` is sufficient — no libc needed.
+
+# Prep stage: create the /data mountpoint owned by the nonroot uid. distroless
+# has no shell, so we cannot `RUN mkdir/chown` in the final image — and a bare
+# VOLUME mountpoint is created root:root, which the nonroot process could not
+# write (serve writes master.key + the DB there on first run). A fresh named
+# volume inherits this dir's ownership, so owning it here fixes first-run EACCES.
+FROM busybox:1.37.0 AS prep
+RUN mkdir -p /data && chown 65532:65532 /data
+
+FROM gcr.io/distroless/static:nonroot
+
+# The embedded admin UI ships inside the binary (go:embed), so nothing else to copy.
+COPY poolgate /usr/bin/poolgate
+
+# Writable, nonroot-owned runtime state dir (encrypted accounts, master key, DB).
+COPY --from=prep --chown=65532:65532 /data /data
+ENV POOLGATE_DATA_DIR=/data
+VOLUME ["/data"]
+
+# The proxy default is loopback (unreachable from outside the container); bind it
+# to all interfaces so a published port works. The admin listener is left
+# loopback (no override) and is intentionally NOT exposed — reach it via an SSH
+# tunnel or a sidecar (DESIGN §3).
+ENV POOLGATE_PROXY_HOST=0.0.0.0
+EXPOSE 8787
+
+USER nonroot:nonroot
+ENTRYPOINT ["/usr/bin/poolgate"]
+# First run needs `init` (prints a bootstrap token) then `import`; see docs/BUILD.md.
+CMD ["serve"]
