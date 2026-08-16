@@ -47,9 +47,22 @@ const (
 
 // Store wraps a SQLite handle plus the field-encryption cipher.
 type Store struct {
-	db     *sql.DB
-	cipher *crypto.Cipher
+	db      *sql.DB
+	cipher  *crypto.Cipher
+	dataDir string // where the DB lives; used for the pre-migration snapshot
 }
+
+// migration is one ordered schema step. Versions are contiguous and append-only.
+type migration struct {
+	version int
+	sql     string
+}
+
+// ErrSchemaTooNew is returned by Migrate when the database's recorded schema
+// version is higher than the newest migration this binary knows — i.e. an older
+// binary is being run against a database migrated by a newer one. Opening would
+// risk misreading/corrupting data, so it is refused (DESIGN.md §20/§21).
+var ErrSchemaTooNew = errors.New("store: database schema is newer than this binary supports")
 
 // Open opens (creating if needed) the SQLite database under cfg.DataDir, enables
 // WAL + a busy timeout + foreign keys, and runs pending migrations. The cipher
@@ -78,7 +91,7 @@ func Open(cfg model.Config, cipher *crypto.Cipher) (*Store, error) {
 	// writer connection keeps WAL semantics simple and avoids write contention.
 	db.SetMaxOpenConns(1)
 
-	s := &Store{db: db, cipher: cipher}
+	s := &Store{db: db, cipher: cipher, dataDir: cfg.DataDir}
 	if err := s.Migrate(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -95,10 +108,7 @@ func (s *Store) DB() *sql.DB { return s.db }
 // migrations is the ordered list of schema versions. Each entry is applied once
 // (tracked in schema_migrations) inside a transaction. Append-only: never edit
 // or reorder a shipped migration.
-var migrations = []struct {
-	version int
-	sql     string
-}{
+var migrations = []migration{
 	{
 		version: 1,
 		sql: `
@@ -286,14 +296,51 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 		return fmt.Errorf("store: create schema_migrations: %w", err)
 	}
 
+	// Load the set of already-applied versions in one scan; used for both the
+	// downgrade guard and the per-version apply check below.
+	applied, err := s.appliedVersions(ctx)
+	if err != nil {
+		return err
+	}
+	current := 0
+	for v := range applied {
+		if v > current {
+			current = v
+		}
+	}
+	newest := newestMigrationVersion()
+
+	// Downgrade guard: refuse to run when the DB was migrated by a newer binary
+	// (its recorded version exceeds what we know). Applying our older migrations
+	// or reading newer schema could corrupt/misread data (DESIGN.md §20/§21).
+	if current > newest {
+		return fmt.Errorf("%w: database is at v%d but this poolgate supports up to v%d — upgrade the binary",
+			ErrSchemaTooNew, current, newest)
+	}
+
+	// Determine whether any known migration is unrecorded — the SAME condition
+	// the apply loop uses, so the snapshot is taken whenever the loop is about to
+	// mutate the DB (including an out-of-order gap at/below MAX, not just MAX<newest).
+	hasPending := false
 	for _, m := range migrations {
-		var exists int
-		if err := s.db.QueryRowContext(ctx,
-			`SELECT 1 FROM schema_migrations WHERE version = ?`, m.version,
-		).Scan(&exists); err == nil {
+		if !applied[m.version] {
+			hasPending = true
+			break
+		}
+	}
+
+	// Pre-migration snapshot: before applying pending migrations to a non-empty
+	// database, capture a consistent copy so a botched migration can be rolled
+	// back. A fresh DB (current == 0) has nothing to preserve.
+	if current > 0 && hasPending {
+		if err := s.preMigrationSnapshot(ctx, current); err != nil {
+			return fmt.Errorf("store: pre-migration snapshot: %w", err)
+		}
+	}
+
+	for _, m := range migrations {
+		if applied[m.version] {
 			continue // already applied
-		} else if !errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("store: check migration %d: %w", m.version, err)
 		}
 
 		tx, err := s.db.BeginTx(ctx, nil)
@@ -318,6 +365,28 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 	return nil
 }
 
+// appliedVersions returns the set of migration versions recorded in
+// schema_migrations (which must already exist).
+func (s *Store) appliedVersions(ctx context.Context) (map[int]bool, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT version FROM schema_migrations`)
+	if err != nil {
+		return nil, fmt.Errorf("store: read applied migrations: %w", err)
+	}
+	defer rows.Close()
+	set := make(map[int]bool)
+	for rows.Next() {
+		var v int
+		if err := rows.Scan(&v); err != nil {
+			return nil, fmt.Errorf("store: scan migration version: %w", err)
+		}
+		set[v] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate migrations: %w", err)
+	}
+	return set, nil
+}
+
 // SchemaVersion returns the highest applied migration version (0 if none).
 func (s *Store) SchemaVersion(ctx context.Context) (int, error) {
 	var v sql.NullInt64
@@ -330,6 +399,56 @@ func (s *Store) SchemaVersion(ctx context.Context) (int, error) {
 		return 0, nil
 	}
 	return int(v.Int64), nil
+}
+
+// newestMigrationVersion is the highest version this binary can migrate to.
+func newestMigrationVersion() int {
+	max := 0
+	for _, m := range migrations {
+		if m.version > max {
+			max = m.version
+		}
+	}
+	return max
+}
+
+// preMigrationSnapshot writes a consistent copy of the current database to
+// poolgate.pre-migration-v<fromVersion>.db in the data dir (0600) so a failed
+// migration can be recovered. It publishes atomically — VACUUM INTO a temp file,
+// chmod 0600, then rename into place — so an interrupted/failed snapshot never
+// leaves a partial file under the real name (which the next run could mistake
+// for a valid backup) and the published file is 0600 the instant it exists. It
+// always writes a FRESH image reflecting the current data (overwriting any prior
+// snapshot for this from-version), since migrations are atomic so the DB is
+// always at fromVersion when this runs.
+func (s *Store) preMigrationSnapshot(ctx context.Context, fromVersion int) error {
+	if s.dataDir == "" {
+		return nil
+	}
+	final := filepath.Join(s.dataDir, fmt.Sprintf("poolgate.pre-migration-v%d.db", fromVersion))
+	tmp := final + ".tmp"
+	// Clear any leftover temp from a prior interrupted run (VACUUM INTO requires
+	// the target not to pre-exist).
+	if err := os.Remove(tmp); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	// VACUUM INTO produces a single consistent file with no -wal/-shm sidecars,
+	// safe on the live WAL connection.
+	if _, err := s.db.ExecContext(ctx, "VACUUM INTO ?", tmp); err != nil {
+		_ = os.Remove(tmp) // never leave a partial file behind
+		return err
+	}
+	// The snapshot is an unencrypted SQLite image (field-encrypted secrets, but
+	// plaintext metadata) — restrict it before publishing under the real name.
+	if err := os.Chmod(tmp, 0o600); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("chmod snapshot: %w", err)
+	}
+	if err := os.Rename(tmp, final); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // ---- accounts -------------------------------------------------------------
