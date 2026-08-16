@@ -521,10 +521,13 @@ func cmdServe(ctx context.Context, _ []string, stdout io.Writer) error {
 	logger := slog.New(slog.NewJSONHandler(stdout, nil))
 
 	// Memory hygiene (DESIGN.md §22): disable core dumps and lock memory against
-	// swap BEFORE the master key is loaded into memory, so the key never has a
-	// window where a crash core file or a swapped page could persist it. Both are
-	// best-effort — a warning is logged and serve continues if a mitigation can't
-	// be applied (e.g. memory locking under a tight RLIMIT_MEMLOCK).
+	// swap BEFORE the master key is read into the process, so for the keyfile and
+	// POOLGATE_MASTER_KEY_FILE sources the key never has an in-memory window a
+	// crash core file or a swapped page could persist. (A plain POOLGATE_MASTER_KEY
+	// env var is already resident in the environment block before Harden runs —
+	// use the _FILE variant to avoid that pre-Harden exposure; see docs/DEPLOY.md.)
+	// Both mitigations are best-effort — a warning is logged and serve continues if
+	// one can't be applied (e.g. memory locking under a tight RLIMIT_MEMLOCK).
 	mg := memguard.Harden()
 	for _, w := range mg.Warnings {
 		logger.Warn("memory hygiene not fully applied", slog.String("detail", w))

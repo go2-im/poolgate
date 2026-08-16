@@ -7,6 +7,12 @@
 //   - The process's memory is locked (mlockall MCL_CURRENT|MCL_FUTURE) so secret
 //     pages are never paged out to swap.
 //
+// Applied at the top of serve, before the store (and thus the master key) is
+// opened, these precede the key entering memory for the keyfile and
+// POOLGATE_MASTER_KEY_FILE sources. A plain POOLGATE_MASTER_KEY env var is an
+// exception: it is resident in the process environment block before any Go code
+// runs, so use the _FILE convention to avoid that pre-Harden exposure.
+//
 // Both are hardening measures, not correctness requirements. Where they cannot be
 // applied — an unsupported platform, or (for memory locking) an insufficient
 // RLIMIT_MEMLOCK such as the ~64 KiB container default without the IPC_LOCK
