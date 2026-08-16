@@ -160,3 +160,37 @@ func TestListUpdateDeletePolicyGroups(t *testing.T) {
 		t.Fatalf("DeletePolicyGroup(twice) = %v, want ErrNotFound", err)
 	}
 }
+
+func TestPolicyGroupWeightsRoundTrip(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	a1, _ := s.InsertAccount(ctx, model.Account{AccessToken: "a", RefreshToken: "r"})
+	a2, _ := s.InsertAccount(ctx, model.Account{AccessToken: "a", RefreshToken: "r"})
+
+	g, err := s.InsertPolicyGroup(ctx, model.PolicyGroup{
+		Name: "w", Strategy: model.StrategyWeighted,
+		MemberAccountIDs: []string{a1.ID, a2.ID},
+		MemberWeights:    map[string]int{a1.ID: 3}, // a2 defaults to 1 (omitted)
+	})
+	if err != nil {
+		t.Fatalf("InsertPolicyGroup: %v", err)
+	}
+
+	got, err := s.GetPolicyGroup(ctx, g.ID)
+	if err != nil {
+		t.Fatalf("GetPolicyGroup: %v", err)
+	}
+	if got.Weight(a1.ID) != 3 || got.Weight(a2.ID) != 1 {
+		t.Errorf("weights = a1:%d a2:%d, want 3/1", got.Weight(a1.ID), got.Weight(a2.ID))
+	}
+
+	// Update changes weights.
+	got.MemberWeights = map[string]int{a2.ID: 5}
+	if err := s.UpdatePolicyGroup(ctx, got); err != nil {
+		t.Fatalf("UpdatePolicyGroup: %v", err)
+	}
+	after, _ := s.GetPolicyGroup(ctx, g.ID)
+	if after.Weight(a1.ID) != 1 || after.Weight(a2.ID) != 5 {
+		t.Errorf("after update: a1:%d a2:%d, want 1/5", after.Weight(a1.ID), after.Weight(a2.ID))
+	}
+}

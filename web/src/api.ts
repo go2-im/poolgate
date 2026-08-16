@@ -228,17 +228,26 @@ export interface PolicyGroup {
   name: string
   strategy: string
   member_account_ids: string[]
+  member_weights?: Record<string, number>
 }
-export const STRATEGIES = ['fallback', 'best-quota', 'load-balance'] as const
+export const STRATEGIES = ['fallback', 'best-quota', 'load-balance', 'weighted'] as const
 export const listPolicyGroups = () => get<{ policy_groups: PolicyGroup[] }>('/admin/api/policy_groups')
-export const createPolicyGroup = (name: string, strategy: string, members: string[]) =>
+export const createPolicyGroup = (
+  name: string,
+  strategy: string,
+  members: string[],
+  memberWeights?: Record<string, number>,
+) =>
   mutate<PolicyGroup>('POST', '/admin/api/policy_groups', {
     name,
     strategy,
     member_account_ids: members,
+    member_weights: memberWeights,
   })
-export const patchPolicyGroup = (id: string, patch: { strategy?: string; member_account_ids?: string[] }) =>
-  mutate<PolicyGroup>('PATCH', `/admin/api/policy_groups/${encodeURIComponent(id)}`, patch)
+export const patchPolicyGroup = (
+  id: string,
+  patch: { strategy?: string; member_account_ids?: string[]; member_weights?: Record<string, number> },
+) => mutate<PolicyGroup>('PATCH', `/admin/api/policy_groups/${encodeURIComponent(id)}`, patch)
 export const deletePolicyGroup = (id: string) =>
   mutate<void>('DELETE', `/admin/api/policy_groups/${encodeURIComponent(id)}`)
 

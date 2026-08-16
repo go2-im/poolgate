@@ -104,6 +104,9 @@ const (
 	StrategyBestQuota Strategy = "best-quota"
 	// StrategyLoadBalance — distribute across healthy members (round-robin default).
 	StrategyLoadBalance Strategy = "load-balance"
+	// StrategyWeighted — distribute across healthy members proportionally to each
+	// member's weight (smooth weighted round-robin; DESIGN.md §0 D7).
+	StrategyWeighted Strategy = "weighted"
 )
 
 // PolicyGroup is a named strategy over an ordered member account list.
@@ -113,6 +116,18 @@ type PolicyGroup struct {
 	Name             string   `json:"name"`
 	Strategy         Strategy `json:"strategy"`
 	MemberAccountIDs []string `json:"member_account_ids"`
+	// MemberWeights maps an account id to its weighted-load-balance weight (>=1;
+	// a missing entry means the default weight 1). Only meaningful for the
+	// "weighted" strategy; carried for all groups.
+	MemberWeights map[string]int `json:"member_weights,omitempty"`
+}
+
+// Weight returns the weighted-LB weight for account id (>=1; default 1).
+func (g PolicyGroup) Weight(accountID string) int {
+	if w, ok := g.MemberWeights[accountID]; ok && w >= 1 {
+		return w
+	}
+	return 1
 }
 
 // UsageWindow is one generic rate-limit window read from the upstream usage

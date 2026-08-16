@@ -54,6 +54,9 @@ type View interface {
 	// load-balance). Callers keep one Cursor per group; it is only consulted by
 	// the load-balance strategy.
 	Cursor() *Cursor
+	// Weight returns the account's weighted-load-balance weight (>=1; default 1).
+	// Only consulted by the weighted strategy.
+	Weight(accountID string) int
 }
 
 // Select picks an account from members for the given strategy using view.
@@ -71,6 +74,8 @@ func Select(strategy model.Strategy, members []model.Account, view View) (model.
 		return selectBestQuota(members, view)
 	case model.StrategyLoadBalance:
 		return selectLoadBalance(members, view)
+	case model.StrategyWeighted:
+		return selectWeighted(members, view)
 	default:
 		return model.Account{}, fmt.Errorf("policy: unknown strategy %q", strategy)
 	}
@@ -157,6 +162,24 @@ func selectLoadBalance(members []model.Account, view View) (model.Account, error
 	return tied[idx], nil
 }
 
+// selectWeighted distributes across the healthy members proportionally to their
+// weights using smooth weighted round-robin (SWRR, DESIGN.md §0 D7). Over N
+// selections a member with weight w receives ~w/Σw of the traffic, spread evenly
+// (no bursts). Weights come from view.Weight; a member with weight 1 among equal
+// peers behaves like plain round-robin.
+func selectWeighted(members []model.Account, view View) (model.Account, error) {
+	healthy := make([]model.Account, 0, len(members))
+	for _, a := range members {
+		if view.IsHealthy(a.ID) {
+			healthy = append(healthy, a)
+		}
+	}
+	if len(healthy) == 0 {
+		return model.Account{}, ErrNoHealthyMember
+	}
+	return view.Cursor().weightedNext(healthy, view.Weight), nil
+}
+
 // Cursor is the per-group round-robin state. The zero value is ready to use.
 // It is an explicit, caller-held value (one per group) rather than a global, so
 // rotation is deterministic and independently testable. It is safe for
@@ -164,6 +187,10 @@ func selectLoadBalance(members []model.Account, view View) (model.Account, error
 type Cursor struct {
 	mu sync.Mutex
 	n  uint64
+	// cw holds the smooth-weighted-round-robin current-weight accumulator per
+	// account id (lazily created). Entries for members no longer selected linger
+	// harmlessly (bounded by the group's account count).
+	cw map[string]int
 }
 
 // next returns the index into a slice of the given length for the current
@@ -178,6 +205,36 @@ func (c *Cursor) next(mod int) int {
 	i := int(c.n % uint64(mod))
 	c.n++
 	return i
+}
+
+// weightedNext advances the smooth weighted round-robin over members and returns
+// the selected account. Standard SWRR: each round add each member's weight to its
+// current-weight accumulator, pick the max (ties → lowest id for determinism),
+// then subtract the total weight from the winner. weight() must return >=1.
+func (c *Cursor) weightedNext(members []model.Account, weight func(string) int) model.Account {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cw == nil {
+		c.cw = make(map[string]int)
+	}
+	total := 0
+	best := members[0]
+	bestVal := 0
+	first := true
+	for _, a := range members {
+		w := weight(a.ID)
+		if w < 1 {
+			w = 1
+		}
+		total += w
+		c.cw[a.ID] += w
+		cur := c.cw[a.ID]
+		if first || cur > bestVal || (cur == bestVal && a.ID < best.ID) {
+			best, bestVal, first = a, cur, false
+		}
+	}
+	c.cw[best.ID] -= total
+	return best
 }
 
 // MinHeadroom is the canonical best-quota headroom for an account: the minimum
@@ -204,6 +261,7 @@ type StaticView struct {
 	Healthy      map[string]bool
 	HeadroomByID map[string]float64
 	InFlightByID map[string]int
+	WeightByID   map[string]int
 	cursor       Cursor
 }
 
@@ -218,3 +276,11 @@ func (v *StaticView) InFlight(accountID string) int { return v.InFlightByID[acco
 
 // Cursor returns the view's round-robin cursor.
 func (v *StaticView) Cursor() *Cursor { return &v.cursor }
+
+// Weight reports the recorded weight of the account (missing/<1 = 1).
+func (v *StaticView) Weight(accountID string) int {
+	if w, ok := v.WeightByID[accountID]; ok && w >= 1 {
+		return w
+	}
+	return 1
+}

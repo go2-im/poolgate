@@ -503,7 +503,7 @@ func parseImportArgs(args []string) (path string, strategy model.Strategy, err e
 // validStrategy reports whether s is one of the three v1 strategies.
 func validStrategy(s model.Strategy) bool {
 	switch s {
-	case model.StrategyFallback, model.StrategyBestQuota, model.StrategyLoadBalance:
+	case model.StrategyFallback, model.StrategyBestQuota, model.StrategyLoadBalance, model.StrategyWeighted:
 		return true
 	default:
 		return false

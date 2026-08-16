@@ -325,3 +325,54 @@ func TestSelect_LoadBalance_Concurrent(t *testing.T) {
 		}
 	}
 }
+
+func TestSelectWeightedDistributesByWeight(t *testing.T) {
+	members := []model.Account{{ID: "a"}, {ID: "b"}, {ID: "c"}}
+	view := &StaticView{
+		Healthy:    map[string]bool{"a": true, "b": true, "c": true},
+		WeightByID: map[string]int{"a": 1, "b": 2, "c": 3}, // total 6
+	}
+	counts := map[string]int{}
+	for i := 0; i < 12; i++ { // two full cycles
+		got, err := Select(model.StrategyWeighted, members, view)
+		if err != nil {
+			t.Fatalf("select %d: %v", i, err)
+		}
+		counts[got.ID]++
+	}
+	if counts["a"] != 2 || counts["b"] != 4 || counts["c"] != 6 {
+		t.Errorf("counts = %v, want a=2 b=4 c=6 (proportional to weights)", counts)
+	}
+}
+
+func TestSelectWeightedDefaultsToEqualRoundRobin(t *testing.T) {
+	members := []model.Account{{ID: "a"}, {ID: "b"}, {ID: "c"}}
+	// No WeightByID → every weight defaults to 1 → even distribution.
+	view := &StaticView{Healthy: map[string]bool{"a": true, "b": true, "c": true}}
+	counts := map[string]int{}
+	for i := 0; i < 9; i++ {
+		got, _ := Select(model.StrategyWeighted, members, view)
+		counts[got.ID]++
+	}
+	if counts["a"] != 3 || counts["b"] != 3 || counts["c"] != 3 {
+		t.Errorf("counts = %v, want 3/3/3", counts)
+	}
+}
+
+func TestSelectWeightedSkipsUnhealthyAndErrsWhenNone(t *testing.T) {
+	members := []model.Account{{ID: "a"}, {ID: "b"}}
+	view := &StaticView{
+		Healthy:    map[string]bool{"a": false, "b": true},
+		WeightByID: map[string]int{"a": 5, "b": 1},
+	}
+	for i := 0; i < 3; i++ {
+		got, err := Select(model.StrategyWeighted, members, view)
+		if err != nil || got.ID != "b" {
+			t.Fatalf("select = %v (err %v), want b (a is unhealthy)", got.ID, err)
+		}
+	}
+	none := &StaticView{Healthy: map[string]bool{"a": false, "b": false}}
+	if _, err := Select(model.StrategyWeighted, members, none); !errors.Is(err, ErrNoHealthyMember) {
+		t.Errorf("no healthy → err %v, want ErrNoHealthyMember", err)
+	}
+}
