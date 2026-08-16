@@ -74,9 +74,10 @@ func WithBase(base string) Option {
 	return func(cl *Client) { cl.base = strings.TrimRight(base, "/") }
 }
 
-// WithClock injects a clock (default time.Now). It is used only to resolve a
-// window's ResetsAt from reset_after_seconds when the absolute reset_at is
-// absent, keeping tests deterministic.
+// WithClock injects a clock (default time.Now). It is used to resolve a window's
+// ResetsAt from reset_after_seconds when the absolute reset_at is absent, and to
+// anchor the host↔upstream clock-skew measurement (DESIGN.md §21.4,
+// host_now − upstream_now). Injecting it keeps both deterministic in tests.
 func WithClock(now func() time.Time) Option { return func(cl *Client) { cl.now = now } }
 
 // WithOriginator overrides the originator header value.
@@ -188,12 +189,19 @@ func (c *Client) toUsage(raw rawPayload) model.Usage {
 	return u
 }
 
+// maxWindowSeconds bounds a plausible rate-limit window (a generous ~32 days;
+// real windows top out at a week). Values above it are treated as malformed and
+// ignored, so a garbage/hostile reset_after_seconds cannot overflow the
+// time.Duration multiplications below.
+const maxWindowSeconds = 32 * 24 * 3600
+
 // measureSkew derives the host↔upstream clock skew (DESIGN.md §21.4) from any
 // window that reports BOTH an absolute reset_at and a relative
 // reset_after_seconds: the upstream's own "now" is reset_at − reset_after_seconds,
 // so skew = host_now − upstream_now. A positive value means the host clock runs
-// ahead of upstream. Windows carrying only one of the two signals cannot anchor a
-// skew estimate; when none do, ok is false.
+// ahead of upstream. Windows carrying only one of the two signals (or an
+// implausibly large offset) cannot anchor a skew estimate; when none do, ok is
+// false.
 func (c *Client) measureSkew(raw rawPayload) (time.Duration, bool) {
 	windows := []*rawWindow{}
 	collect := func(d *rawStatusDetails) {
@@ -206,7 +214,7 @@ func (c *Client) measureSkew(raw rawPayload) (time.Duration, bool) {
 		collect(add.RateLimit)
 	}
 	for _, rw := range windows {
-		if rw == nil || rw.ResetAt <= 0 || rw.ResetAfterSeconds <= 0 {
+		if rw == nil || rw.ResetAt <= 0 || rw.ResetAfterSeconds <= 0 || rw.ResetAfterSeconds > maxWindowSeconds {
 			continue
 		}
 		upstreamNow := time.Unix(rw.ResetAt, 0).UTC().Add(-time.Duration(rw.ResetAfterSeconds) * time.Second)
@@ -242,12 +250,13 @@ func (c *Client) toWindow(name string, rw *rawWindow) *model.UsageWindow {
 
 // resolveReset prefers the absolute reset_at (unix seconds); when it is absent
 // (0) it derives the reset time from reset_after_seconds relative to the
-// injected clock. When neither is present, ResetsAt is the zero time.
+// injected clock (ignoring an implausibly large offset that would overflow the
+// duration multiply). When neither is usable, ResetsAt is the zero time.
 func (c *Client) resolveReset(rw *rawWindow) time.Time {
 	if rw.ResetAt > 0 {
 		return time.Unix(rw.ResetAt, 0).UTC()
 	}
-	if rw.ResetAfterSeconds > 0 {
+	if rw.ResetAfterSeconds > 0 && rw.ResetAfterSeconds <= maxWindowSeconds {
 		return c.now().UTC().Add(time.Duration(rw.ResetAfterSeconds) * time.Second)
 	}
 	return time.Time{}

@@ -143,6 +143,27 @@ func TestFetch_NoClockSkewWhenRelativeAbsent(t *testing.T) {
 	}
 }
 
+func TestFetch_NoClockSkewOnAbsurdWindow(t *testing.T) {
+	// A hostile/garbage reset_after_seconds beyond the sanity cap must not anchor
+	// a skew (guards against the duration-multiply overflow).
+	payload := `{"plan_type":"plus","rate_limit":{"primary_window":` +
+		`{"used_percent":10,"limit_window_seconds":18000,"reset_after_seconds":99999999999,"reset_at":1700000000}}}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(payload))
+	}))
+	defer srv.Close()
+
+	c := New(WithHTTPClient(srv.Client()), WithBase(srv.URL))
+	u, err := c.Fetch(context.Background(), testAccount())
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if u.ClockSkewValid {
+		t.Error("ClockSkewValid = true for an implausible reset_after_seconds, want false")
+	}
+}
+
 func TestFetch_401ReturnsTokenInvalid(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
