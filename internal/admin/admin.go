@@ -143,6 +143,7 @@ type Server struct {
 
 	origin   string // canonical admin origin (scheme://host[:port]) for CORS
 	extOrigin string // configured external_origin (may be empty when synthesized)
+	proxyBase string // configured proxy base URL (http://host:port), a hint for the client-config generator
 	secure   bool   // set the Secure cookie flag (origin is https)
 	now      func() time.Time
 	logger   *slog.Logger
@@ -250,6 +251,7 @@ func New(cfg model.Config, st Store, sessions SessionManager, wa Ceremonies, opt
 		webauthn:  wa,
 		origin:    origin,
 		extOrigin: strings.TrimSpace(cfg.Server.Admin.ExternalOrigin),
+		proxyBase: proxyBaseURL(cfg.Server.Proxy),
 		secure:    secure,
 		now:       func() time.Time { return time.Now().UTC() },
 		logger:    slog.Default(),
@@ -365,6 +367,22 @@ func resolveOrigin(admin model.ListenConfig) (origin string, secure bool, err er
 		return "", false, fmt.Errorf("admin: invalid admin origin %q", origin)
 	}
 	return origin, u.Scheme == "https", nil
+}
+
+// proxyBaseURL synthesizes the proxy listener's base URL (always http — the
+// proxy listener is plain, TLS is expected to be terminated by a front proxy) as
+// a starting hint for the client-config generator. It is not authoritative: when
+// poolgate is fronted, the operator edits it to their external hostname.
+func proxyBaseURL(proxy model.ListenConfig) string {
+	host := strings.TrimSpace(proxy.Host)
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	port := proxy.Port
+	if port == 0 {
+		port = 8787
+	}
+	return fmt.Sprintf("http://%s:%d", host, port)
 }
 
 // ---- JSON + error helpers -------------------------------------------------

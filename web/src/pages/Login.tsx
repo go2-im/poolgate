@@ -140,7 +140,7 @@ export function Login({ onAuthed }: { onAuthed: () => void }) {
             <button disabled={busy || !supported || bootstrap.trim() === ''} onClick={doSetup}>
               {busy ? 'Registering…' : 'Register first passkey'}
             </button>
-            <p className="hint">Use the one-time token printed by the CLI to register the first passkey.</p>
+            <p className="hint">Use the one-time token printed by the CLI to register the first passkey. To use a phone, pick your browser's cross-device / QR option.</p>
           </>
         )}
 

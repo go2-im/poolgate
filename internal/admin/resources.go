@@ -584,6 +584,7 @@ func (s *Server) handleSettings(w http.ResponseWriter, _ *http.Request) {
 		"external_origin": s.extOrigin,
 		"rp_id":           s.webauthn.RPID(),
 		"secure":          s.secure,
+		"proxy_base":      s.proxyBase,
 	})
 }
 
