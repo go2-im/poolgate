@@ -1,8 +1,12 @@
 // audit.go implements the append-only, tamper-evident audit log store (DESIGN.md
 // §22). Only Insert and List are exposed — there is intentionally no update or
 // delete. Each row additionally stores a hash that chains the previous row's
-// hash over the row's canonical fields, so any tampering, deletion, or
-// reordering of the persisted log is detectable via VerifyAuditChain.
+// hash over the row's canonical fields, so accidental corruption and mid-log
+// tampering, deletion, or reordering of the persisted log are detectable via
+// VerifyAuditChain. The chain is a keyless SHA-256 hash chain: it does NOT
+// detect deletion of the most-recent (tail) entries, nor tampering by an
+// adversary who can recompute the tail with the public algorithm — see
+// VerifyAuditChain for the precise guarantee.
 package store
 
 import (
@@ -67,9 +71,19 @@ func (s *Store) InsertAuditEntry(ctx context.Context, e model.AuditEntry) error 
 }
 
 // VerifyAuditChain recomputes the hash chain over every row in insertion order
-// (rowid) and reports whether the persisted log is intact. On a mismatch it
-// returns valid=false and the id of the first row whose stored hash does not
-// match the recomputed one (tampered, or a row was deleted/reordered before it).
+// (rowid) and reports whether the persisted log is intact. Rows written before
+// the hash column existed (migration v9) carry an empty hash; a leading
+// contiguous run of such rows is the pre-chain baseline and is skipped, with the
+// chain verified from the first hashed row (whose predecessor tip was the empty
+// baseline, matching how InsertAuditEntry chained it). On a mismatch it returns
+// valid=false and the id of the first row whose stored hash does not match.
+//
+// This detects accidental corruption and mid-log tampering, deletion, or
+// reordering (each breaks a downstream row). It does NOT detect deletion of the
+// most-recent (tail) entries — a prefix of a valid chain is itself valid — nor
+// tampering by an adversary who can recompute the tail with the public hash;
+// stronger guarantees would need a key held outside the DB or external
+// notarization of the tip.
 func (s *Store) VerifyAuditChain(ctx context.Context) (valid bool, count int, brokenID string, err error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, at, actor, action, target, detail, hash FROM audit_log ORDER BY rowid ASC`)
@@ -79,12 +93,19 @@ func (s *Store) VerifyAuditChain(ctx context.Context) (valid bool, count int, br
 	defer rows.Close()
 
 	prev := ""
+	started := false
 	for rows.Next() {
 		var id, at, actor, action, target, detail, hash string
 		if err := rows.Scan(&id, &at, &actor, &action, &target, &detail, &hash); err != nil {
 			return false, count, "", fmt.Errorf("store: scan audit row: %w", err)
 		}
 		count++
+		if !started {
+			if hash == "" {
+				continue // pre-v9 baseline row (no hash); skip until the chain begins
+			}
+			started = true // first hashed row: its tip was the empty baseline (prev "")
+		}
 		if auditHash(prev, id, at, actor, action, target, detail) != hash {
 			return false, count, id, nil
 		}

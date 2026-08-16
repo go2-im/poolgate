@@ -141,3 +141,42 @@ func TestAuditChainDetectsDeletion(t *testing.T) {
 		t.Error("chain verified as intact after a mid-row deletion, want broken")
 	}
 }
+
+func TestAuditChainSkipsLegacyBaselineAndVerifiesNewRows(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	base := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	// Simulate pre-v9 rows: inserted directly with empty hash (as migration v9's
+	// column default leaves them on an upgraded DB).
+	for i := 0; i < 3; i++ {
+		if _, err := s.db.ExecContext(ctx,
+			`INSERT INTO audit_log (id, at, actor, action, target, detail, hash) VALUES (?, ?, 'system', 'legacy', '', '', '')`,
+			"legacy_"+string(rune('0'+i)), formatTimeFixed(base.Add(time.Duration(i)*time.Second))); err != nil {
+			t.Fatalf("seed legacy %d: %v", i, err)
+		}
+	}
+	// New (v9) rows chain onto the empty baseline tip.
+	for i := 0; i < 3; i++ {
+		if err := s.InsertAuditEntry(ctx, model.AuditEntry{Actor: model.AuditActorOperator, Action: "new.act"}); err != nil {
+			t.Fatalf("insert new %d: %v", i, err)
+		}
+	}
+
+	ok, count, broken, err := s.VerifyAuditChain(ctx)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if !ok || count != 6 || broken != "" {
+		t.Fatalf("upgraded chain: ok=%v count=%d broken=%q, want true/6/''", ok, count, broken)
+	}
+
+	// Tampering a NEW (hashed) row is still detected past the baseline.
+	var victim string
+	_ = s.db.QueryRowContext(ctx, `SELECT id FROM audit_log WHERE hash != '' ORDER BY rowid ASC LIMIT 1 OFFSET 1`).Scan(&victim)
+	if _, err := s.db.ExecContext(ctx, `UPDATE audit_log SET detail = 'X' WHERE id = ?`, victim); err != nil {
+		t.Fatalf("tamper: %v", err)
+	}
+	if ok, _, broken, _ := s.VerifyAuditChain(ctx); ok || broken != victim {
+		t.Errorf("post-baseline tamper: ok=%v broken=%q, want false/%s", ok, broken, victim)
+	}
+}
