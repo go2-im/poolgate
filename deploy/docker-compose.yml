@@ -1,0 +1,74 @@
+# docker-compose.yml — a production-shaped poolgate deployment fronted by a
+# reverse proxy for TLS. See ../docs/DEPLOY.md for the full walkthrough.
+#
+# Topology:
+#   caddy      — the ONLY container that publishes host ports (80/443). It
+#                terminates TLS and reverse-proxies two hostnames:
+#                  api.example.com   -> poolgate proxy   (:8787)  OpenAI-compatible
+#                  admin.example.com -> poolgate admin   (:7070)  passkey UI + REST
+#   poolgate   — publishes NO host ports; reachable only on the internal network.
+#                Both listeners bind 0.0.0.0 *inside the container* so caddy (a
+#                different container) can reach them; they are never exposed to
+#                the host or LAN directly.
+#
+# WebAuthn/passkeys require a secure context, so the admin surface MUST be served
+# over HTTPS with a stable hostname — hence the reverse proxy in front of it and
+# server.admin.{external_origin,rp_id} in config.yaml.
+#
+# First run is a one-shot bootstrap (prints a single-use token); see DEPLOY.md:
+#   docker compose run --rm poolgate init
+
+services:
+  poolgate:
+    image: ghcr.io/go2-im/poolgate:latest
+    restart: unless-stopped
+    # No `ports:` — the proxy and admin listeners are reached only via caddy on
+    # the internal network. Publish nothing to the host.
+    environment:
+      # The image already sets POOLGATE_PROXY_HOST=0.0.0.0; the admin host is set
+      # to 0.0.0.0 in config.yaml so caddy can reach it across the network.
+      POOLGATE_DATA_DIR: /data
+    volumes:
+      - poolgate-data:/data
+      # config.yaml lives inside the data dir; bind it read-only so the running
+      # container cannot rewrite its own config.
+      - ./config.yaml:/data/config.yaml:ro
+    # Hardening: the binary is distroless/nonroot and writes only to /data, so the
+    # root filesystem can be read-only. /tmp is a small tmpfs for scratch use.
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # No container-level healthcheck: the distroless image has no shell/curl and
+    # poolgate has no self-probe subcommand. Caddy does active upstream health
+    # checks against /readyz instead (see Caddyfile), and /readyz is reachable
+    # through the api hostname once ≥1 endpoint has an eligible account.
+    networks:
+      - edge
+
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    depends_on:
+      - poolgate
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data     # ACME certificates + account keys (persist these!)
+      - caddy-config:/config
+    networks:
+      - edge
+
+networks:
+  edge:
+    driver: bridge
+
+volumes:
+  poolgate-data:   # encrypted account pool, master.key (keyfile mode), SQLite DB
+  caddy-data:      # Let's Encrypt certs — losing this forces re-issuance
+  caddy-config:
