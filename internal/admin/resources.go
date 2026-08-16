@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,22 +25,24 @@ import (
 // accountView is the secret-free projection of an account returned by the API.
 // It deliberately omits access_token / refresh_token / id_token.
 type accountView struct {
-	ID        string             `json:"id"`
-	Label     string             `json:"label"`
-	AccountID string             `json:"account_id"`
-	State     model.AccountState `json:"state"`
-	CreatedAt string             `json:"created_at"`
-	UpdatedAt string             `json:"updated_at"`
+	ID             string             `json:"id"`
+	Label          string             `json:"label"`
+	AccountID      string             `json:"account_id"`
+	State          model.AccountState `json:"state"`
+	ConcurrencyCap int                `json:"concurrency_cap"`
+	CreatedAt      string             `json:"created_at"`
+	UpdatedAt      string             `json:"updated_at"`
 }
 
 func toAccountView(a model.Account) accountView {
 	return accountView{
-		ID:        a.ID,
-		Label:     a.Label,
-		AccountID: a.AccountID,
-		State:     a.State,
-		CreatedAt: a.CreatedAt.Format(rfc3339),
-		UpdatedAt: a.UpdatedAt.Format(rfc3339),
+		ID:             a.ID,
+		Label:          a.Label,
+		AccountID:      a.AccountID,
+		State:          a.State,
+		ConcurrencyCap: a.ConcurrencyCap,
+		CreatedAt:      a.CreatedAt.Format(rfc3339),
+		UpdatedAt:      a.UpdatedAt.Format(rfc3339),
 	}
 }
 
@@ -152,6 +155,44 @@ func (s *Server) handleAccountGet(w http.ResponseWriter, r *http.Request) {
 		s.writeStoreErr(w, err, "account")
 		return
 	}
+	writeJSON(w, http.StatusOK, toAccountView(a))
+}
+
+// accountPatchReq is the body of PATCH /admin/api/accounts/{id}: editable,
+// non-secret metadata. A nil pointer leaves that field unchanged.
+type accountPatchReq struct {
+	Label          *string `json:"label"`
+	ConcurrencyCap *int    `json:"concurrency_cap"`
+}
+
+// handleAccountPatch updates an account's label and/or concurrency cap. Tokens
+// and state are never touched here.
+func (s *Server) handleAccountPatch(w http.ResponseWriter, r *http.Request) {
+	var req accountPatchReq
+	if err := decodeJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, errBadRequest, "invalid request body")
+		return
+	}
+	if req.ConcurrencyCap != nil && *req.ConcurrencyCap < 0 {
+		writeErr(w, http.StatusBadRequest, errBadRequest, "concurrency_cap must be >= 0 (0 = unlimited)")
+		return
+	}
+	a, err := s.store.GetAccount(r.Context(), r.PathValue("id"))
+	if err != nil {
+		s.writeStoreErr(w, err, "account")
+		return
+	}
+	if req.Label != nil {
+		a.Label = *req.Label
+	}
+	if req.ConcurrencyCap != nil {
+		a.ConcurrencyCap = *req.ConcurrencyCap
+	}
+	if err := s.store.UpdateAccountMeta(r.Context(), a.ID, a.Label, a.ConcurrencyCap); err != nil {
+		s.writeStoreErr(w, err, "account")
+		return
+	}
+	s.audit(r.Context(), "account.update", a.ID, "cap="+strconv.Itoa(a.ConcurrencyCap))
 	writeJSON(w, http.StatusOK, toAccountView(a))
 }
 

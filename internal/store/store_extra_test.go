@@ -462,3 +462,32 @@ func TestGetEndpointQueryError(t *testing.T) {
 		t.Fatal("GetEndpoint on closed db: want error, got nil")
 	}
 }
+
+func TestUpdateAccountMeta(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	a, err := s.InsertAccount(ctx, model.Account{
+		Label: "old", AccessToken: "at", RefreshToken: "rt", AccountID: "acc-1",
+		State: model.StateOK, ConcurrencyCap: 1,
+	})
+	if err != nil {
+		t.Fatalf("InsertAccount: %v", err)
+	}
+	if err := s.UpdateAccountMeta(ctx, a.ID, "new", 7); err != nil {
+		t.Fatalf("UpdateAccountMeta: %v", err)
+	}
+	got, err := s.GetAccount(ctx, a.ID)
+	if err != nil {
+		t.Fatalf("GetAccount: %v", err)
+	}
+	if got.Label != "new" || got.ConcurrencyCap != 7 {
+		t.Errorf("after update: label=%q cap=%d, want new/7", got.Label, got.ConcurrencyCap)
+	}
+	// Tokens must be untouched by a meta update.
+	if got.AccessToken != "at" || got.RefreshToken != "rt" {
+		t.Errorf("meta update disturbed tokens: %q/%q", got.AccessToken, got.RefreshToken)
+	}
+	if err := s.UpdateAccountMeta(ctx, "missing", "x", 0); err != ErrNotFound {
+		t.Errorf("UpdateAccountMeta(missing) = %v, want ErrNotFound", err)
+	}
+}
