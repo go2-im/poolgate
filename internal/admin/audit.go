@@ -42,6 +42,24 @@ type auditEntryView struct {
 	Detail string `json:"detail"`
 }
 
+// handleAuditVerify recomputes the audit log's hash chain and reports whether it
+// is intact (DESIGN.md §22). A broken chain means a persisted entry was tampered
+// with, or a mid-log entry was deleted/reordered. (Deletion of the most-recent
+// tail entries is not detectable by an in-band keyless chain; see
+// store.VerifyAuditChain.) The response names the first broken entry id.
+func (s *Server) handleAuditVerify(w http.ResponseWriter, r *http.Request) {
+	valid, count, brokenID, err := s.store.VerifyAuditChain(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, errInternal, "could not verify audit log")
+		return
+	}
+	resp := map[string]any{"ok": valid, "count": count}
+	if !valid {
+		resp["broken_at"] = brokenID
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
 // handleAuditList returns recent audit entries, newest-first, paginated via
 // ?limit=&offset=.
 func (s *Server) handleAuditList(w http.ResponseWriter, r *http.Request) {

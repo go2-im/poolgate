@@ -195,6 +195,23 @@ type fakeStore struct {
 	audit    []model.AuditEntry
 	seq      int
 	failList bool // force list operations to error
+	// auditBrokenAt, when set, makes VerifyAuditChain report a broken chain at
+	// that entry id (empty = intact).
+	auditBrokenAt string
+}
+
+// VerifyAuditChain reports the in-memory audit count and, when auditBrokenAt is
+// set, a broken chain at that id (test scaffolding for the verify endpoint).
+func (f *fakeStore) VerifyAuditChain(_ context.Context) (bool, int, string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failList {
+		return false, 0, "", errors.New("verify failed")
+	}
+	if f.auditBrokenAt != "" {
+		return false, len(f.audit), f.auditBrokenAt, nil
+	}
+	return true, len(f.audit), "", nil
 }
 
 func newFakeStore() *fakeStore {

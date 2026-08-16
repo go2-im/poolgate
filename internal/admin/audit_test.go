@@ -55,3 +55,32 @@ func TestAuditLogRecordsActions(t *testing.T) {
 		t.Errorf("newest entry action = %v, want auth.revoke_all_sessions", first["action"])
 	}
 }
+
+// TestAuditVerifyEndpoint checks the hash-chain verify endpoint reports intact
+// and broken states (DESIGN.md §22).
+func TestAuditVerifyEndpoint(t *testing.T) {
+	h := newHarness(t)
+	cookie, _ := h.authed()
+	get := func(r *http.Request) { r.AddCookie(cookie) }
+
+	// Intact (fake default).
+	rec := h.do(http.MethodGet, "/admin/api/audit/verify", nil, get)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("verify = %d body=%s", rec.Code, rec.Body.String())
+	}
+	m := decodeBody(t, rec)
+	if m["ok"] != true {
+		t.Errorf("ok = %v, want true", m["ok"])
+	}
+	if _, present := m["broken_at"]; present {
+		t.Errorf("broken_at present on an intact chain: %v", m["broken_at"])
+	}
+
+	// Broken: scripted.
+	h.store.auditBrokenAt = "audit_42"
+	rec = h.do(http.MethodGet, "/admin/api/audit/verify", nil, get)
+	m = decodeBody(t, rec)
+	if m["ok"] != false || m["broken_at"] != "audit_42" {
+		t.Errorf("broken response = %v, want ok=false broken_at=audit_42", m)
+	}
+}
