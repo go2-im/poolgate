@@ -257,6 +257,19 @@ func (f *fakeStore) DeleteAccount(_ context.Context, id string) error {
 	return nil
 }
 
+func (f *fakeStore) UpdateAccountMeta(_ context.Context, id, label string, cap int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	a, ok := f.accounts[id]
+	if !ok {
+		return store.ErrNotFound
+	}
+	a.Label = label
+	a.ConcurrencyCap = cap
+	f.accounts[id] = a
+	return nil
+}
+
 func (f *fakeStore) InsertApiKey(_ context.Context, k model.ApiKey) (model.ApiKey, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

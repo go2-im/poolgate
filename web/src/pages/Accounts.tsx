@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { deleteAccount, importAccount, listAccounts, type Account } from '../api'
+import { deleteAccount, importAccount, listAccounts, patchAccount, type Account } from '../api'
 import { errMessage, stateClass } from './ui'
 
 type SortKey = 'label' | 'state' | 'account_id' | 'created_at'
@@ -13,6 +13,10 @@ export function Accounts() {
   const [query, setQuery] = useState('')
   const [sortKey, setSortKey] = useState<SortKey>('label')
   const [sortDesc, setSortDesc] = useState(false)
+  // Inline edit state (label + concurrency cap) for one row at a time.
+  const [editId, setEditId] = useState('')
+  const [editLabel, setEditLabel] = useState('')
+  const [editCap, setEditCap] = useState('')
 
   async function load() {
     setErr('')
@@ -86,6 +90,32 @@ export function Accounts() {
     }
   }
 
+  function startEdit(a: Account) {
+    setEditId(a.id)
+    setEditLabel(a.label)
+    setEditCap(String(a.concurrency_cap))
+  }
+
+  function cancelEdit() {
+    setEditId('')
+  }
+
+  async function saveEdit(id: string) {
+    const cap = parseInt(editCap, 10)
+    if (isNaN(cap) || cap < 0) {
+      setErr('Concurrency cap must be a non-negative integer (0 = unlimited).')
+      return
+    }
+    setErr('')
+    try {
+      await patchAccount(id, { label: editLabel.trim(), concurrency_cap: cap })
+      setEditId('')
+      await load()
+    } catch (e) {
+      setErr(errMessage(e))
+    }
+  }
+
   return (
     <>
       <div className="section">
@@ -148,25 +178,65 @@ export function Accounts() {
                     <th className="sortable" onClick={() => toggleSort('state')}>
                       State{sortArrow('state')}
                     </th>
+                    <th>Concurrency cap</th>
                     <th></th>
                   </tr>
                 </thead>
                 <tbody>
-                  {visible.map((a) => (
-                    <tr key={a.id}>
-                      <td className="mono">{a.id}</td>
-                      <td>{a.label || '—'}</td>
-                      <td className="mono">{a.account_id || '—'}</td>
-                      <td>
-                        <span className={stateClass(a.state)}>{a.state}</span>
-                      </td>
-                      <td className="right">
-                        <button className="danger small" onClick={() => doDelete(a.id)}>
-                          Delete
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
+                  {visible.map((a) =>
+                    editId === a.id ? (
+                      <tr key={a.id}>
+                        <td className="mono">{a.id}</td>
+                        <td>
+                          <input
+                            type="text"
+                            value={editLabel}
+                            onChange={(e) => setEditLabel(e.target.value)}
+                            aria-label="Label"
+                          />
+                        </td>
+                        <td className="mono">{a.account_id || '—'}</td>
+                        <td>
+                          <span className={stateClass(a.state)}>{a.state}</span>
+                        </td>
+                        <td>
+                          <input
+                            type="number"
+                            min={0}
+                            value={editCap}
+                            onChange={(e) => setEditCap(e.target.value)}
+                            aria-label="Concurrency cap (0 = unlimited)"
+                          />
+                        </td>
+                        <td className="right">
+                          <button className="small" onClick={() => saveEdit(a.id)}>
+                            Save
+                          </button>{' '}
+                          <button className="ghost small" onClick={cancelEdit}>
+                            Cancel
+                          </button>
+                        </td>
+                      </tr>
+                    ) : (
+                      <tr key={a.id}>
+                        <td className="mono">{a.id}</td>
+                        <td>{a.label || '—'}</td>
+                        <td className="mono">{a.account_id || '—'}</td>
+                        <td>
+                          <span className={stateClass(a.state)}>{a.state}</span>
+                        </td>
+                        <td>{a.concurrency_cap === 0 ? 'unlimited' : a.concurrency_cap}</td>
+                        <td className="right">
+                          <button className="ghost small" onClick={() => startEdit(a)}>
+                            Edit
+                          </button>{' '}
+                          <button className="danger small" onClick={() => doDelete(a.id)}>
+                            Delete
+                          </button>
+                        </td>
+                      </tr>
+                    ),
+                  )}
                 </tbody>
               </table>
             )}

@@ -210,12 +210,15 @@ export interface Account {
   label: string
   account_id: string
   state: string
+  concurrency_cap: number
   created_at: string
   updated_at: string
 }
 export const listAccounts = () => get<{ accounts: Account[] }>('/admin/api/accounts')
 export const importAccount = (content: string, label: string) =>
   mutate<Account>('POST', '/admin/api/accounts/import', { content, label })
+export const patchAccount = (id: string, patch: { label?: string; concurrency_cap?: number }) =>
+  mutate<Account>('PATCH', `/admin/api/accounts/${encodeURIComponent(id)}`, patch)
 export const deleteAccount = (id: string) =>
   mutate<void>('DELETE', `/admin/api/accounts/${encodeURIComponent(id)}`)
 

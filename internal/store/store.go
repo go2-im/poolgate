@@ -606,6 +606,26 @@ func (s *Store) UpdateState(ctx context.Context, id string, state model.AccountS
 	return nil
 }
 
+// UpdateAccountMeta updates an account's editable, non-secret metadata (label and
+// concurrency cap). Tokens/state are untouched. Returns ErrNotFound if no row
+// matches.
+func (s *Store) UpdateAccountMeta(ctx context.Context, id, label string, concurrencyCap int) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE accounts SET label = ?, concurrency_cap = ?, updated_at = ? WHERE id = ?`,
+		label, concurrencyCap, formatTime(time.Now().UTC()), id)
+	if err != nil {
+		return fmt.Errorf("store: update account meta: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: update account meta rows: %w", err)
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // rowScanner is satisfied by both *sql.Row and *sql.Rows.
 type rowScanner interface {
 	Scan(dest ...any) error

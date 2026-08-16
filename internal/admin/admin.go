@@ -49,6 +49,7 @@ type Store interface {
 	GetAccount(ctx context.Context, id string) (model.Account, error)
 	ListAccounts(ctx context.Context) ([]model.Account, error)
 	DeleteAccount(ctx context.Context, id string) error
+	UpdateAccountMeta(ctx context.Context, id, label string, concurrencyCap int) error
 	// api keys
 	InsertApiKey(ctx context.Context, k model.ApiKey) (model.ApiKey, error)
 	ListApiKeys(ctx context.Context) ([]model.ApiKey, error)
@@ -300,6 +301,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /admin/api/accounts/import", s.guard(s.handleAccountImport))
 	mux.HandleFunc("GET /admin/api/accounts", s.guard(s.handleAccountsList))
 	mux.HandleFunc("GET /admin/api/accounts/{id}", s.guard(s.handleAccountGet))
+	mux.HandleFunc("PATCH /admin/api/accounts/{id}", s.guard(s.handleAccountPatch))
 	mux.HandleFunc("DELETE /admin/api/accounts/{id}", s.guard(s.handleAccountDelete))
 
 	mux.HandleFunc("GET /admin/api/api_keys", s.guard(s.handleApiKeysList))

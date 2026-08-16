@@ -471,6 +471,53 @@ func TestAccountListGetDeleteNoSecrets(t *testing.T) {
 	}
 }
 
+func TestAccountPatchUpdatesLabelAndCap(t *testing.T) {
+	h := newHarness(t)
+	cookie, csrf := h.authed()
+	mut := func(r *http.Request) { r.AddCookie(cookie); r.Header.Set(CSRFHeaderName, csrf) }
+	a, _ := h.store.InsertAccount(context.Background(), model.Account{
+		Label: "old", AccessToken: "at", RefreshToken: "rt", AccountID: "acc-1",
+		State: model.StateOK, ConcurrencyCap: 0, CreatedAt: h.now, UpdatedAt: h.now,
+	})
+
+	// Happy path: update label + cap.
+	rec := h.do(http.MethodPatch, "/admin/api/accounts/"+a.ID,
+		map[string]any{"label": "new", "concurrency_cap": 5}, mut)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("patch = %d body=%s", rec.Code, rec.Body.String())
+	}
+	m := decodeBody(t, rec)
+	if m["label"] != "new" || m["concurrency_cap"].(float64) != 5 {
+		t.Errorf("view = %v, want label=new cap=5", m)
+	}
+	// Persisted?
+	got, _ := h.store.GetAccount(context.Background(), a.ID)
+	if got.Label != "new" || got.ConcurrencyCap != 5 {
+		t.Errorf("stored = %q/%d, want new/5", got.Label, got.ConcurrencyCap)
+	}
+
+	// Negative cap → 400.
+	rec = h.do(http.MethodPatch, "/admin/api/accounts/"+a.ID,
+		map[string]any{"concurrency_cap": -1}, mut)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("negative cap = %d, want 400", rec.Code)
+	}
+
+	// Missing account → 404.
+	rec = h.do(http.MethodPatch, "/admin/api/accounts/missing",
+		map[string]any{"label": "x"}, mut)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("patch missing = %d, want 404", rec.Code)
+	}
+
+	// CSRF required (no header) → 403.
+	rec = h.do(http.MethodPatch, "/admin/api/accounts/"+a.ID,
+		map[string]any{"label": "y"}, func(r *http.Request) { r.AddCookie(cookie) })
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("patch without CSRF = %d, want 403", rec.Code)
+	}
+}
+
 func TestApiKeyCreateShowsSecretOnceThenMasks(t *testing.T) {
 	h := newHarness(t)
 	cookie, csrf := h.authed()
