@@ -200,6 +200,10 @@ usage:
 environment:
   POOLGATE_DATA_DIR   override the data directory (default: `+config.DefaultDataDir+`)
   POOLGATE_MASTER_KEY base64 master key (when master_key_source=env)
+  POOLGATE_PROXY_HOST / POOLGATE_PROXY_PORT   override the proxy listener bind
+  POOLGATE_PROXY_TRANSPORT   both|http-only|ws-only (default both)
+  POOLGATE_TRUSTED_PROXIES   comma-separated reverse-proxy IPs/CIDRs whose
+                             X-Forwarded-For is trusted (default: none)
   POOLGATE_BACKUP_PASSPHRASE  passphrase for backup/restore (or --passphrase-file)
 
   Any secret env var also accepts a "<NAME>_FILE" variant (Docker/K8s secrets):
