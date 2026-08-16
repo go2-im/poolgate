@@ -635,6 +635,49 @@ func TestUsageHealthStatus(t *testing.T) {
 	if m["schema_version"].(float64) != 3 {
 		t.Errorf("status schema_version = %v, want 3", m["schema_version"])
 	}
+	if _, present := m["clock_skew_seconds"]; present {
+		t.Error("clock_skew_seconds present with no skew source wired")
+	}
+}
+
+// fakeSkew is a scriptable ClockSkewSource.
+type fakeSkew struct {
+	skew time.Duration
+	at   time.Time
+	ok   bool
+}
+
+func (f fakeSkew) ClockSkew() (time.Duration, time.Time, bool) { return f.skew, f.at, f.ok }
+
+// TestStatusIncludesClockSkew confirms the status endpoint surfaces a recorded
+// host↔upstream skew (DESIGN.md §21.4) when a source is wired.
+func TestStatusIncludesClockSkew(t *testing.T) {
+	at := time.Date(2026, 8, 16, 10, 0, 0, 0, time.UTC)
+	h := newHarness(t, WithClockSkew(fakeSkew{skew: 90 * time.Second, at: at, ok: true}))
+	cookie, _ := h.authed()
+	rec := h.do(http.MethodGet, "/admin/api/status", nil, func(r *http.Request) { r.AddCookie(cookie) })
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	m := decodeBody(t, rec)
+	if got, _ := m["clock_skew_seconds"].(float64); got != 90 {
+		t.Errorf("clock_skew_seconds = %v, want 90", m["clock_skew_seconds"])
+	}
+	if _, ok := m["clock_skew_measured_at"].(string); !ok {
+		t.Errorf("clock_skew_measured_at missing; body=%s", rec.Body.String())
+	}
+}
+
+// TestStatusOmitsClockSkewWhenUnmeasured confirms the fields are absent when the
+// source reports no measurement yet.
+func TestStatusOmitsClockSkewWhenUnmeasured(t *testing.T) {
+	h := newHarness(t, WithClockSkew(fakeSkew{ok: false}))
+	cookie, _ := h.authed()
+	rec := h.do(http.MethodGet, "/admin/api/status", nil, func(r *http.Request) { r.AddCookie(cookie) })
+	m := decodeBody(t, rec)
+	if _, present := m["clock_skew_seconds"]; present {
+		t.Error("clock_skew_seconds present but source reported no measurement")
+	}
 }
 
 func TestSettings(t *testing.T) {

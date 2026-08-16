@@ -258,6 +258,12 @@ curl -s http://127.0.0.1:7070/admin/sessions/revoke-all \
   -b cookies.txt -H "X-CSRF-Token: $CSRF" -X POST
 ```
 
+`GET /admin/api/status` also reports `clock_skew_seconds` (host clock minus the
+upstream usage endpoint's clock) plus `clock_skew_measured_at` once a usage poll
+has measured it (DESIGN.md §21.4). Usage windows are anchored to the upstream
+absolute `reset_at`; a large reported skew means the host clock has drifted (fix
+NTP). The health engine also logs a warning past a threshold (default 2m).
+
 ## Configuration
 
 `config.yaml` is optional and lives in the data dir; missing keys fall back to

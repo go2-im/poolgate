@@ -229,6 +229,59 @@ func newTestEngine(t *testing.T, st Store, up UsageProbe, rf Refresher, opts ...
 	return New(st, up, rf, base...), clk
 }
 
+// TestUsagePollRecordsClockSkew confirms a usage poll carrying a valid skew
+// measurement records it (DESIGN.md §21.4) and that a healthy window still yields
+// a healthy probe result.
+func TestUsagePollRecordsClockSkew(t *testing.T) {
+	u := model.Usage{
+		PlanType:       "plus",
+		Windows:        []model.UsageWindow{{Name: "primary", UsedPercent: 10, WindowSeconds: 18000}},
+		ClockSkew:      90 * time.Second,
+		ClockSkewValid: true,
+	}
+	e, _ := newTestEngine(t, newFakeStore(), &fakeUsage{u: u}, &fakeRefresher{}, WithClockSkewWarn(time.Second))
+	ev, _, _, ok, _ := e.runUsagePoll(context.Background(), model.Account{ID: "a1"})
+	if !ok || ev != evProbeHealthy {
+		t.Fatalf("usage poll ev=%v ok=%v, want healthy", ev, ok)
+	}
+	skew, at, have := e.ClockSkew()
+	if !have || skew != 90*time.Second {
+		t.Errorf("ClockSkew = (%v, recorded=%v), want 90s recorded", skew, have)
+	}
+	if at.IsZero() {
+		t.Error("skew measured-at is zero")
+	}
+}
+
+// TestClockSkewUnsetInitially confirms the getter reports no measurement before
+// any usage poll has recorded one.
+func TestClockSkewUnsetInitially(t *testing.T) {
+	e, _ := newTestEngine(t, newFakeStore(), &fakeUsage{}, &fakeRefresher{})
+	if _, _, have := e.ClockSkew(); have {
+		t.Error("ClockSkew reported a measurement before any poll")
+	}
+}
+
+// TestRecordSkewThresholds exercises the warn / no-warn / disabled branches of
+// recordSkew; all record the value and update the getter.
+func TestRecordSkewThresholds(t *testing.T) {
+	e, _ := newTestEngine(t, newFakeStore(), &fakeUsage{}, &fakeRefresher{}, WithClockSkewWarn(time.Minute))
+	e.recordSkew(10 * time.Second) // below threshold → no warn
+	if s, _, ok := e.ClockSkew(); !ok || s != 10*time.Second {
+		t.Fatalf("below-threshold: got (%v, %v)", s, ok)
+	}
+	e.recordSkew(-2 * time.Minute) // magnitude above threshold → warn (negative)
+	if s, _, _ := e.ClockSkew(); s != -2*time.Minute {
+		t.Fatalf("above-threshold: got %v", s)
+	}
+
+	e2, _ := newTestEngine(t, newFakeStore(), &fakeUsage{}, &fakeRefresher{}, WithClockSkewWarn(0))
+	e2.recordSkew(10 * time.Hour) // threshold disabled → recorded, never warns
+	if s, _, ok := e2.ClockSkew(); !ok || s != 10*time.Hour {
+		t.Fatalf("disabled-threshold: got (%v, %v)", s, ok)
+	}
+}
+
 func healthyUsage() model.Usage {
 	return model.Usage{PlanType: "plus", Windows: []model.UsageWindow{
 		{Name: "primary", UsedPercent: 20, WindowSeconds: 18000},

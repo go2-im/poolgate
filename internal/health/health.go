@@ -43,6 +43,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/go2-im/poolgate/internal/model"
@@ -164,6 +165,15 @@ type Engine struct {
 	rnd    func() float64
 	sleep  SleepFunc
 	logger *slog.Logger
+
+	// clock-skew telemetry (DESIGN.md §21.4): the most recent host↔upstream skew
+	// measured from a usage poll, guarded for concurrent read by the admin status
+	// endpoint. skewWarn is the |skew| above which a warning is logged.
+	skewMu   sync.Mutex
+	skew     time.Duration
+	skewAt   time.Time
+	haveSkew bool
+	skewWarn time.Duration
 }
 
 // Option customizes an Engine.
@@ -206,6 +216,15 @@ func WithSleep(fn SleepFunc) Option { return func(e *Engine) { e.sleep = fn } }
 // WithLogger sets the structured logger.
 func WithLogger(l *slog.Logger) Option { return func(e *Engine) { e.logger = l } }
 
+// DefaultClockSkewWarn is the |host↔upstream skew| above which the engine logs a
+// warning (DESIGN.md §21.4). Small skews are normal; a large one indicates the
+// host clock has drifted from the upstream usage endpoint (fix NTP).
+const DefaultClockSkewWarn = 2 * time.Minute
+
+// WithClockSkewWarn overrides the |skew| warning threshold. A value <= 0 disables
+// the warning log (the skew is still measured and exposed via ClockSkew).
+func WithClockSkewWarn(d time.Duration) Option { return func(e *Engine) { e.skewWarn = d } }
+
 // New builds an Engine over st using the usage prober and the shared refresher.
 func New(st Store, up UsageProbe, rf Refresher, opts ...Option) *Engine {
 	e := &Engine{
@@ -218,6 +237,7 @@ func New(st Store, up UsageProbe, rf Refresher, opts ...Option) *Engine {
 		rnd:         rand.Float64,
 		sleep:       realSleep,
 		logger:      slog.Default(),
+		skewWarn:    DefaultClockSkewWarn,
 	}
 	for _, o := range opts {
 		o(e)
@@ -626,6 +646,9 @@ func (e *Engine) runUsagePoll(ctx context.Context, acct model.Account) (eventKin
 		Windows:    u.Windows,
 		CapturedAt: e.now(),
 	})
+	if u.ClockSkewValid {
+		e.recordSkew(u.ClockSkew)
+	}
 	h := policy.MinHeadroom(u)
 	if h <= 0 {
 		return evQuotaZero, 0, bindingReset(u), false, "quota exhausted"
@@ -705,6 +728,30 @@ func bindingReset(u model.Usage) time.Time {
 		}
 	}
 	return t
+}
+
+// recordSkew stores the latest measured host↔upstream clock skew (DESIGN.md
+// §21.4) and logs a warning when its magnitude exceeds the configured threshold.
+// Usage windows are anchored to the upstream absolute reset_at; this skew is the
+// monitoring signal that surfaces host-clock drift against that anchor.
+func (e *Engine) recordSkew(skew time.Duration) {
+	e.skewMu.Lock()
+	e.skew, e.skewAt, e.haveSkew = skew, e.now(), true
+	e.skewMu.Unlock()
+
+	if e.skewWarn > 0 && (skew > e.skewWarn || skew < -e.skewWarn) {
+		e.logger.Warn("clock skew vs upstream usage endpoint exceeds threshold",
+			slog.Duration("skew", skew), slog.Duration("threshold", e.skewWarn))
+	}
+}
+
+// ClockSkew returns the most recently measured host↔upstream clock skew
+// (host_now − upstream_now), the time it was measured, and whether any
+// measurement has been recorded yet. It is safe for concurrent use.
+func (e *Engine) ClockSkew() (skew time.Duration, at time.Time, ok bool) {
+	e.skewMu.Lock()
+	defer e.skewMu.Unlock()
+	return e.skew, e.skewAt, e.haveSkew
 }
 
 // ---- scheduler loop (thin) -------------------------------------------------

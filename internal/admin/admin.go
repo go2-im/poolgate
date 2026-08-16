@@ -99,6 +99,13 @@ type MonitorStream interface {
 	Subscribe(f model.RequestLogFilter) (<-chan model.RequestLog, func())
 }
 
+// ClockSkewSource optionally reports the most recently measured host↔upstream
+// clock skew (DESIGN.md §21.4) for the status endpoint. *health.Engine satisfies
+// it. When unset, GET /admin/api/status simply omits the clock-skew fields.
+type ClockSkewSource interface {
+	ClockSkew() (skew time.Duration, at time.Time, ok bool)
+}
+
 // SessionManager is the admin-auth surface for sessions, CSRF and recovery
 // codes. *adminauth.Manager satisfies it.
 type SessionManager interface {
@@ -131,6 +138,7 @@ type Server struct {
 	webauthn Ceremonies
 	notifier Notifier
 	monitor  MonitorStream
+	skew     ClockSkewSource
 	spa      http.Handler
 
 	origin   string // canonical admin origin (scheme://host[:port]) for CORS
@@ -197,6 +205,13 @@ func WithNotifier(n Notifier) Option {
 // still work directly from the store).
 func WithMonitor(m MonitorStream) Option {
 	return func(s *Server) { s.monitor = m }
+}
+
+// WithClockSkew wires the optional clock-skew reporter surfaced by the status
+// endpoint (DESIGN.md §21.4). When unset, the status response omits the skew
+// fields.
+func WithClockSkew(src ClockSkewSource) Option {
+	return func(s *Server) { s.skew = src }
 }
 
 // WithLogger injects the structured logger (default slog.Default()). It is used
