@@ -182,9 +182,9 @@ func usage(w io.Writer) {
 usage:
   poolgate init                 initialize data dir, master key, and DB
   poolgate import <auth.json>   import a Codex account (explicit, never automatic)
-                                [--strategy fallback|best-quota|load-balance]
+                                [--strategy fallback|best-quota|load-balance|weighted]
   poolgate login                sign in via browser (OAuth + PKCE) to add an account
-                                [--strategy fallback|best-quota|load-balance]
+                                [--strategy fallback|best-quota|load-balance|weighted]
   poolgate serve                start the proxy + admin listeners + health scheduler
   poolgate admin reset-auth     wipe all passkeys/recovery codes/sessions and
                                 print a fresh single-use bootstrap token
@@ -524,7 +524,7 @@ func parseImportArgs(args []string) (path string, strategy model.Strategy, err e
 		switch {
 		case a == "--strategy" || a == "-strategy":
 			if i+1 >= len(args) {
-				return "", "", errors.New("usage: poolgate import <auth.json> [--strategy fallback|best-quota|load-balance]")
+				return "", "", errors.New("usage: poolgate import <auth.json> [--strategy fallback|best-quota|load-balance|weighted]")
 			}
 			strategy = model.Strategy(args[i+1])
 			i++
@@ -539,10 +539,10 @@ func parseImportArgs(args []string) (path string, strategy model.Strategy, err e
 		}
 	}
 	if path == "" {
-		return "", "", errors.New("usage: poolgate import <auth.json> [--strategy fallback|best-quota|load-balance]")
+		return "", "", errors.New("usage: poolgate import <auth.json> [--strategy fallback|best-quota|load-balance|weighted]")
 	}
 	if !validStrategy(strategy) {
-		return "", "", fmt.Errorf("invalid --strategy %q (want fallback, best-quota, or load-balance)", strategy)
+		return "", "", fmt.Errorf("invalid --strategy %q (want fallback, best-quota, load-balance, or weighted)", strategy)
 	}
 	return path, strategy, nil
 }
