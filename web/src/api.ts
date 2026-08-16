@@ -417,6 +417,7 @@ export interface Settings {
   external_origin: string
   rp_id: string
   secure: boolean
+  proxy_base: string
 }
 export const getSettings = () => get<Settings>('/admin/api/settings')
 

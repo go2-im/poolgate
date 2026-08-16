@@ -709,6 +709,11 @@ func TestSettings(t *testing.T) {
 	if v, ok := m["secure"].(bool); !ok || v {
 		t.Errorf("secure = %v (present=%v), want false", m["secure"], ok)
 	}
+	// proxy_base is a client-config hint synthesized from the proxy listener; it
+	// must be a non-empty http URL for the harness's loopback proxy config.
+	if pb, _ := m["proxy_base"].(string); !strings.HasPrefix(pb, "http://") {
+		t.Errorf("proxy_base = %v, want an http:// URL", m["proxy_base"])
+	}
 	// The response must never carry a secret or token field.
 	for _, k := range []string{"secret", "token", "bootstrap_token", "csrf_token"} {
 		if _, ok := m[k]; ok {

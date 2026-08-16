@@ -1,7 +1,8 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
   createEndpoint,
   deleteEndpoint,
+  getSettings,
   listEndpoints,
   listPolicyGroups,
   type Endpoint,
@@ -16,14 +17,21 @@ export function Endpoints() {
   const [busy, setBusy] = useState(false)
   const [name, setName] = useState('')
   const [groupID, setGroupID] = useState('')
+  // Client-config generator state. base is seeded from the server's proxy_base
+  // hint but stays editable (operators fronting poolgate use their own hostname).
+  const [base, setBase] = useState('')
+  const [cfgEndpoint, setCfgEndpoint] = useState('')
+  const [cfgKey, setCfgKey] = useState('')
 
   async function load() {
     setErr('')
     try {
-      const [e, g] = await Promise.all([listEndpoints(), listPolicyGroups()])
+      const [e, g, s] = await Promise.all([listEndpoints(), listPolicyGroups(), getSettings()])
       setEndpoints(e.endpoints)
       setGroups(g.policy_groups)
       if (!groupID && g.policy_groups.length > 0) setGroupID(g.policy_groups[0].id)
+      setBase((b) => b || s.proxy_base || '')
+      setCfgEndpoint((c) => c || e.endpoints[0]?.name || '')
     } catch (ex) {
       setErr(errMessage(ex))
     }
@@ -60,9 +68,28 @@ export function Endpoints() {
   }
 
   const groupName = (id: string) => groups.find((g) => g.id === id)?.name || id
-  // The proxy listens on its own port (default 8787), separate from this admin
-  // origin — show a copyable base URL with the host to fill in.
-  const proxyURL = (n: string) => `http://<proxy-host>:8787/e/${n}/v1`
+  const trimmedBase = base.replace(/\/+$/, '')
+  const endpointURL = (n: string) => `${trimmedBase}/e/${n}/v1`
+
+  // The generated client config: a curl invocation plus the OpenAI-compatible
+  // env vars, for the chosen endpoint + key. The key stays client-side (it is
+  // never sent anywhere by this page).
+  const snippet = useMemo(() => {
+    const url = endpointURL(cfgEndpoint || '<endpoint>')
+    const key = cfgKey.trim() || 'sk-...your-key...'
+    return [
+      `# OpenAI-compatible base URL + key`,
+      `export OPENAI_BASE_URL="${url}"`,
+      `export OPENAI_API_KEY="${key}"`,
+      ``,
+      `# Example request (streaming responses):`,
+      `curl -N "${url}/responses" \\`,
+      `  -H "Authorization: Bearer ${key}" \\`,
+      `  -H "Content-Type: application/json" \\`,
+      `  -d '{"model":"gpt-5","input":"hello"}'`,
+    ].join('\n')
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [trimmedBase, cfgEndpoint, cfgKey])
 
   return (
     <>
@@ -118,9 +145,9 @@ export function Endpoints() {
                 <tr key={e.name}>
                   <td>{e.name}</td>
                   <td>{groupName(e.group_id)}</td>
-                  <td className="mono">{proxyURL(e.name)}</td>
+                  <td className="mono">{endpointURL(e.name)}</td>
                   <td className="right">
-                    <button className="ghost small" onClick={() => copy(proxyURL(e.name))}>
+                    <button className="ghost small" onClick={() => copy(endpointURL(e.name))}>
                       Copy
                     </button>{' '}
                     <button className="danger small" onClick={() => doDelete(e.name)}>
@@ -133,6 +160,48 @@ export function Endpoints() {
           </table>
         )}
       </div>
+
+      {endpoints.length > 0 && (
+        <div className="section">
+          <h2>Client configuration</h2>
+          <p className="muted">
+            Generate a copy-paste config to point an OpenAI-compatible client (Codex, Cursor, the
+            OpenAI SDK) at an endpoint. The base URL is seeded from the proxy listener — edit it to
+            your external hostname when poolgate is fronted by a reverse proxy. The key is used only
+            to build the snippet here; it is not sent anywhere.
+          </p>
+          <label htmlFor="cfg-base">Base URL</label>
+          <input
+            id="cfg-base"
+            type="text"
+            value={base}
+            onChange={(e) => setBase(e.target.value)}
+            placeholder="https://api.example.com"
+            autoComplete="off"
+          />
+          <label htmlFor="cfg-endpoint">Endpoint</label>
+          <select id="cfg-endpoint" value={cfgEndpoint} onChange={(e) => setCfgEndpoint(e.target.value)}>
+            {endpoints.map((e) => (
+              <option key={e.name} value={e.name}>
+                {e.name}
+              </option>
+            ))}
+          </select>
+          <label htmlFor="cfg-key">API key (optional)</label>
+          <input
+            id="cfg-key"
+            type="text"
+            value={cfgKey}
+            onChange={(e) => setCfgKey(e.target.value)}
+            placeholder="sk-… (paste one from API keys)"
+            autoComplete="off"
+          />
+          <pre className="codes">{snippet}</pre>
+          <button className="ghost" onClick={() => copy(snippet)}>
+            Copy config
+          </button>
+        </div>
+      )}
     </>
   )
 }

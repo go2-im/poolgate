@@ -96,7 +96,8 @@ export function Settings({
         <h2>Add a passkey</h2>
         <p className="muted">
           Register an additional passkey (e.g. a second device or a hardware key) for this operator.
-          You stay signed in.
+          You stay signed in. To enroll a phone, choose your browser's cross-device / “use a phone”
+          option and scan the QR it shows.
         </p>
         {!webauthnSupported() ? (
           <p className="err">This browser does not support WebAuthn.</p>
