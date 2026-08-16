@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/go2-im/poolgate/internal/backup"
+	"github.com/go2-im/poolgate/internal/lock"
 	"github.com/go2-im/poolgate/internal/store"
 )
 
@@ -103,6 +104,20 @@ func cmdRestore(args []string, stdout io.Writer) error {
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		return fmt.Errorf("create data dir: %w", err)
 	}
+
+	// Refuse to restore into a data dir that a live `poolgate serve` is using:
+	// restore renames the DB and deletes the -wal/-shm sidecars out from under the
+	// running server, silently losing its writes / risking corruption. The
+	// single-instance lock (held by serve) makes that detectable.
+	lk, err := lock.Acquire(filepath.Join(cfg.DataDir, lockFile))
+	if err != nil {
+		if errors.Is(err, lock.ErrLocked) {
+			return fmt.Errorf("a poolgate serve is running for %s — stop it before restoring", cfg.DataDir)
+		}
+		return fmt.Errorf("acquire lock: %w", err)
+	}
+	defer lk.Release()
+
 	dbPath := filepath.Join(cfg.DataDir, store.DBFileName)
 	keyPath := filepath.Join(cfg.DataDir, masterKeyFile)
 

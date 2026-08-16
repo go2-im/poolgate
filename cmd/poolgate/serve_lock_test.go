@@ -38,3 +38,31 @@ func TestServeSingleInstance(t *testing.T) {
 		t.Fatalf("serve error = %v, want an 'already running' message", err)
 	}
 }
+
+// TestRestoreRefusesWhileServing asserts restore won't run against a data dir a
+// live server is using (it would delete the server's WAL sidecars).
+func TestRestoreRefusesWhileServing(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	t.Setenv(envDataDir, dir)
+	if err := run(ctx, []string{"init"}, io.Discard, io.Discard); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	t.Setenv(envBackupPassphrase, "pw-abcdef")
+	bundle := filepath.Join(t.TempDir(), "b.pgbak")
+	if err := run(ctx, []string{"backup", "--out", bundle}, io.Discard, io.Discard); err != nil {
+		t.Fatalf("backup: %v", err)
+	}
+
+	// Simulate a live server by holding the lock.
+	held, err := lock.Acquire(filepath.Join(dir, lockFile))
+	if err != nil {
+		t.Fatalf("hold lock: %v", err)
+	}
+	defer held.Release()
+
+	err = run(ctx, []string{"restore", bundle, "--force"}, io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "stop it before restoring") {
+		t.Fatalf("restore-while-serving error = %v, want a 'stop it before restoring' message", err)
+	}
+}

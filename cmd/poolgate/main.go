@@ -470,17 +470,16 @@ func cmdServe(ctx context.Context, _ []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	st, err := openStore(cfg)
-	if err != nil {
-		return err
-	}
-	defer st.Close()
 
-	// Single-instance guard (DESIGN.md §21): refuse to start a second server
-	// against the same data dir (which would double-bind the listeners and race
-	// on the SQLite WAL). openStore has created the data dir by now. The lock is
-	// held for the process lifetime and released on exit (or by the kernel on a
-	// crash, so it is never left stale).
+	// Single-instance guard (DESIGN.md §21): acquire BEFORE opening the store, so
+	// the lock also gates store open + migrations — two servers starting against
+	// the same data dir would otherwise race the migration runner on the shared
+	// SQLite WAL. Acquire only needs the data dir to exist. The lock is held for
+	// the process lifetime and released on exit (or by the kernel on a crash, so
+	// it is never left stale).
+	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
+		return fmt.Errorf("create data dir: %w", err)
+	}
 	lk, err := lock.Acquire(filepath.Join(cfg.DataDir, lockFile))
 	if err != nil {
 		if errors.Is(err, lock.ErrLocked) {
@@ -489,6 +488,12 @@ func cmdServe(ctx context.Context, _ []string, stdout io.Writer) error {
 		return fmt.Errorf("acquire single-instance lock: %w", err)
 	}
 	defer lk.Release()
+
+	st, err := openStore(cfg)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
 
 	logger := slog.New(slog.NewJSONHandler(stdout, nil))
 
