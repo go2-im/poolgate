@@ -117,16 +117,47 @@ func cmdRestore(args []string, stdout io.Writer) error {
 		}
 	}
 
-	// Write the keyfile (base64, matching crypto.LoadOrCreateKeyfile's format).
-	enc := base64.StdEncoding.EncodeToString(key)
-	if err := os.WriteFile(keyPath, []byte(enc+"\n"), 0o600); err != nil {
-		return fmt.Errorf("write master key: %w", err)
+	// Under master_key_source=env the operator deliberately keeps the key OUT of
+	// the filesystem, so restoring only the DB and NOT writing a plaintext keyfile
+	// respects that choice (the matching key must already be in POOLGATE_MASTER_KEY).
+	writeKey := cfg.MasterKeySource != "env"
+
+	// Stage both artifacts to temp files (write + fsync) BEFORE committing either,
+	// then rename into place — never truncate the live DB in-place, and never
+	// leave a partially-written database on a mid-write failure.
+	dbTmp := dbPath + ".tmp"
+	keyTmp := keyPath + ".tmp"
+	if err := stageTemp(dbTmp, db, 0o600); err != nil {
+		return fmt.Errorf("stage database: %w", err)
 	}
-	// Write the DB and remove any stale WAL sidecars so the restored file is the
-	// single source of truth on next open.
-	if err := os.WriteFile(dbPath, db, 0o600); err != nil {
-		return fmt.Errorf("write database: %w", err)
+	if writeKey {
+		// base64, matching crypto.LoadOrCreateKeyfile's format.
+		enc := base64.StdEncoding.EncodeToString(key) + "\n"
+		if err := stageTemp(keyTmp, []byte(enc), 0o600); err != nil {
+			_ = os.Remove(dbTmp)
+			return fmt.Errorf("stage master key: %w", err)
+		}
 	}
+	// Commit: rename the DB first (a rename never truncates the existing file),
+	// then the keyfile. On the vanishingly rare partial-rename failure, re-running
+	// restore recovers.
+	if err := os.Rename(dbTmp, dbPath); err != nil {
+		_ = os.Remove(dbTmp)
+		if writeKey {
+			_ = os.Remove(keyTmp)
+		}
+		return fmt.Errorf("commit database: %w", err)
+	}
+	if writeKey {
+		if err := os.Rename(keyTmp, keyPath); err != nil {
+			_ = os.Remove(keyTmp)
+			return fmt.Errorf("commit master key (database already restored — re-run restore): %w", err)
+		}
+	}
+	// Best-effort durability of the renames.
+	syncDir(cfg.DataDir)
+	// Remove any stale WAL sidecars so the restored file is the single source of
+	// truth on next open.
 	for _, sidecar := range []string{dbPath + "-wal", dbPath + "-shm"} {
 		if err := os.Remove(sidecar); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("remove stale %s: %w", sidecar, err)
@@ -139,10 +170,46 @@ func cmdRestore(args []string, stdout io.Writer) error {
 		fmt.Fprintf(stdout, "  backup taken:   %s\n", time.Unix(meta.CreatedAtUnix, 0).UTC().Format(time.RFC3339))
 	}
 	if cfg.MasterKeySource == "env" {
-		fmt.Fprintf(stdout, "\nNote: master_key_source is \"env\"; the restored keyfile will not be used\nunless you switch back to the keyfile source, or set POOLGATE_MASTER_KEY to\nthe original key.\n")
+		fmt.Fprintf(stdout, "\nNote: master_key_source is \"env\" — the master key was NOT written to disk.\nEnsure POOLGATE_MASTER_KEY is set to the key this backup was made with,\notherwise the restored database cannot be decrypted.\n")
 	}
 	fmt.Fprintf(stdout, "\nNext: `poolgate serve`.\n")
 	return nil
+}
+
+// stageTemp writes data to a temp file (0600), fsyncs it, and closes it, WITHOUT
+// renaming into place — the caller commits with os.Rename after all temps are
+// durable. On any error the temp file is removed.
+func stageTemp(tmpPath string, data []byte, perm os.FileMode) error {
+	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, perm)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
+}
+
+// syncDir best-effort fsyncs a directory so a rename into it is durable across a
+// crash. Errors are ignored (not all platforms/filesystems support it).
+func syncDir(dir string) {
+	d, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	defer d.Close()
+	_ = d.Sync()
 }
 
 // parseBackupArgs parses `backup` flags (order-independent).
@@ -202,20 +269,23 @@ func parseRestoreArgs(args []string) (bundle, passFile string, force bool, err e
 	return bundle, passFile, force, nil
 }
 
-// readPassphrase reads the backup passphrase from --passphrase-file (trailing
-// newline trimmed) or POOLGATE_BACKUP_PASSPHRASE. It never echoes the value and
-// requires a non-empty passphrase.
+// readPassphrase reads the backup passphrase from --passphrase-file or
+// POOLGATE_BACKUP_PASSPHRASE. Both sources are trimmed of a trailing newline
+// identically (so a passphrase provisioned via a file vs an env var — e.g.
+// `echo pass > f` vs an env-file — resolve to the same value), and a non-empty
+// passphrase is required. The value is never echoed.
 func readPassphrase(passFile string) ([]byte, error) {
-	var pass []byte
+	var raw string
 	if passFile != "" {
 		b, err := os.ReadFile(passFile)
 		if err != nil {
 			return nil, fmt.Errorf("read passphrase file: %w", err)
 		}
-		pass = []byte(strings.TrimRight(string(b), "\r\n"))
+		raw = string(b)
 	} else {
-		pass = []byte(os.Getenv(envBackupPassphrase))
+		raw = os.Getenv(envBackupPassphrase)
 	}
+	pass := []byte(strings.TrimRight(raw, "\r\n"))
 	if len(pass) == 0 {
 		return nil, errors.New("no passphrase (set POOLGATE_BACKUP_PASSPHRASE or pass --passphrase-file)")
 	}

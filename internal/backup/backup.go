@@ -45,6 +45,16 @@ const (
 	argonMemKiB  = 64 * 1024 // 64 MiB
 	argonThreads = 4
 
+	// Upper bounds on the header-supplied KDF parameters. The header is NOT
+	// authenticated (the secretbox tag covers only the sealed payload), so a
+	// forged/tampered bundle could otherwise set MemKiB/Time to their uint32 max
+	// and force a multi-TiB allocation / unbounded CPU in argon2.IDKey BEFORE any
+	// passphrase check — a trivial pre-auth DoS. These caps are comfortably above
+	// the defaults above while bounding attacker-forced work.
+	maxArgonMemKiB  = 512 * 1024 // 512 MiB
+	maxArgonTime    = 16
+	maxArgonThreads = 16
+
 	// maxHeader / maxSealed bound the sizes read from an untrusted bundle so a
 	// corrupt/hostile length prefix cannot trigger a huge allocation.
 	maxHeader = 4 << 10  // 4 KiB — the header is tiny
@@ -61,6 +71,11 @@ var ErrFormat = errors.New("backup: not a poolgate backup bundle")
 // ErrEmptyPassphrase is returned by Write/Read when the passphrase is empty; an
 // empty passphrase would provide no protection for the master key.
 var ErrEmptyPassphrase = errors.New("backup: passphrase must not be empty")
+
+// ErrTooLarge is returned when the sealed payload exceeds maxSealed — a distinct
+// error from ErrPassphrase so an oversized (but otherwise valid) bundle is not
+// misdiagnosed as a wrong passphrase.
+var ErrTooLarge = errors.New("backup: bundle payload exceeds the maximum size")
 
 // Meta is the non-secret metadata carried in a bundle.
 type Meta struct {
@@ -110,6 +125,7 @@ func Write(w io.Writer, passphrase, masterKey, db []byte, meta Meta) error {
 
 	var key [32]byte
 	deriveKey(&key, passphrase, salt)
+	defer wipe(key[:])
 
 	pl, err := cbor.Marshal(payload{
 		MasterKey:     masterKey,
@@ -121,6 +137,11 @@ func Write(w io.Writer, passphrase, masterKey, db []byte, meta Meta) error {
 		return fmt.Errorf("backup: encode payload: %w", err)
 	}
 	sealed := secretbox.Seal(nil, pl, &nonce, &key)
+	// Never produce a bundle that Read would refuse as too large (which would
+	// otherwise be an unrestorable backup — a silent availability failure).
+	if len(sealed) > maxSealed {
+		return ErrTooLarge
+	}
 
 	hdr, err := cbor.Marshal(header{
 		KDF:     "argon2id",
@@ -187,10 +208,22 @@ func Read(r io.Reader, passphrase []byte) (masterKey, db []byte, meta Meta, err 
 		hdr.Time == 0 || hdr.MemKiB == 0 || hdr.Threads == 0 {
 		return nil, nil, Meta{}, ErrFormat
 	}
+	// The header is unauthenticated; bound the KDF cost params BEFORE running
+	// argon2 so a forged/tampered bundle can't force multi-TiB / unbounded work
+	// pre-authentication.
+	if hdr.MemKiB > maxArgonMemKiB || hdr.Time > maxArgonTime || hdr.Threads > maxArgonThreads {
+		return nil, nil, Meta{}, ErrFormat
+	}
 
-	sealed, err := io.ReadAll(io.LimitReader(r, maxSealed))
+	// Read one byte past the cap so an oversized payload is rejected distinctly
+	// rather than silently truncated (which secretbox.Open would then misreport
+	// as a wrong passphrase).
+	sealed, err := io.ReadAll(io.LimitReader(r, maxSealed+1))
 	if err != nil {
 		return nil, nil, Meta{}, ErrFormat
+	}
+	if len(sealed) > maxSealed {
+		return nil, nil, Meta{}, ErrTooLarge
 	}
 
 	var key [32]byte
@@ -198,6 +231,8 @@ func Read(r io.Reader, passphrase []byte) (masterKey, db []byte, meta Meta, err 
 	// parameters still opens.
 	argonKey := argon2.IDKey(passphrase, hdr.Salt, hdr.Time, hdr.MemKiB, hdr.Threads, 32)
 	copy(key[:], argonKey)
+	wipe(argonKey)
+	defer wipe(key[:])
 	var nonce [nonceLen]byte
 	copy(nonce[:], hdr.Nonce)
 
@@ -222,6 +257,16 @@ func Read(r io.Reader, passphrase []byte) (masterKey, db []byte, meta Meta, err 
 func deriveKey(out *[32]byte, passphrase, salt []byte) {
 	k := argon2.IDKey(passphrase, salt, argonTime, argonMemKiB, argonThreads, 32)
 	copy(out[:], k)
+	wipe(k)
+}
+
+// wipe best-effort zeroes a byte slice holding key material. This is
+// defense-in-depth only — Go's GC may have already copied the bytes elsewhere —
+// but it shrinks the window a derived wrap key sits in memory.
+func wipe(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
 }
 
 // bytesEqual is a tiny constant-length compare for the magic (not security

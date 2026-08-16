@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"io"
 	"os"
 	"path/filepath"
@@ -98,7 +99,82 @@ func TestRestoreRefusesOverwrite(t *testing.T) {
 	}
 }
 
-// TestBackupRestoreErrors covers the passphrase + wrong-passphrase paths.
+// TestRestoreEnvSourceSkipsKeyfile asserts that under master_key_source=env the
+// restore writes the DB but NOT a plaintext master.key (respecting the operator's
+// choice to keep the key off disk), and the restored DB decrypts with the env key.
+func TestRestoreEnvSourceSkipsKeyfile(t *testing.T) {
+	ctx := context.Background()
+
+	// A stable 32-byte master key supplied via the environment.
+	rawKey := make([]byte, 32)
+	for i := range rawKey {
+		rawKey[i] = byte(i * 3)
+	}
+	t.Setenv(envMasterKey, base64.StdEncoding.EncodeToString(rawKey))
+
+	envConfig := []byte("master_key_source: env\n")
+
+	// Provision dir A (env source) and import an account.
+	dirA := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dirA, configFile), envConfig, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv(envDataDir, dirA)
+	if err := run(ctx, []string{"init"}, io.Discard, io.Discard); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := run(ctx, []string{"import", writeAuthJSON(t)}, io.Discard, io.Discard); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	// An env-source install must not have written a keyfile.
+	if _, err := os.Stat(filepath.Join(dirA, masterKeyFile)); !os.IsNotExist(err) {
+		t.Fatalf("env-source install unexpectedly has a keyfile: %v", err)
+	}
+
+	// Back up.
+	t.Setenv(envBackupPassphrase, "env-source-pass")
+	bundle := filepath.Join(t.TempDir(), "env.pgbak")
+	if err := run(ctx, []string{"backup", "--out", bundle}, io.Discard, io.Discard); err != nil {
+		t.Fatalf("backup: %v", err)
+	}
+
+	// Restore into a fresh env-source dir B.
+	dirB := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dirB, configFile), envConfig, 0o600); err != nil {
+		t.Fatalf("write config B: %v", err)
+	}
+	t.Setenv(envDataDir, dirB)
+	var out bytes.Buffer
+	if err := run(ctx, []string{"restore", bundle}, &out, io.Discard); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	// The keyfile must NOT be written; the DB must be.
+	if _, err := os.Stat(filepath.Join(dirB, masterKeyFile)); !os.IsNotExist(err) {
+		t.Fatalf("restore wrote a keyfile under env source: %v", err)
+	}
+	if !bytes.Contains(out.Bytes(), []byte("NOT written to disk")) {
+		t.Errorf("expected env-source warning in output, got: %q", out.String())
+	}
+
+	// The DB decrypts with the env key.
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	st, err := openStore(cfg)
+	if err != nil {
+		t.Fatalf("openStore(restored env): %v", err)
+	}
+	defer st.Close()
+	accts, err := st.ListAccounts(ctx)
+	if err != nil {
+		t.Fatalf("ListAccounts: %v", err)
+	}
+	if len(accts) != 1 {
+		t.Fatalf("restored account count = %d, want 1", len(accts))
+	}
+}
+
 func TestBackupRestoreErrors(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()

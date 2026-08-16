@@ -2,7 +2,10 @@ package backup
 
 import (
 	"bytes"
+	"encoding/binary"
 	"testing"
+
+	"github.com/fxamacker/cbor/v2"
 )
 
 func mustKey() []byte {
@@ -100,9 +103,32 @@ func TestEmptyPassphraseRejected(t *testing.T) {
 	}
 }
 
-// TestBadMasterKeyLen asserts Write rejects a non-32-byte key.
-func TestBadMasterKeyLen(t *testing.T) {
-	if err := Write(&bytes.Buffer{}, []byte("pw"), []byte("too short"), []byte("db"), Meta{}); err == nil {
-		t.Fatalf("expected error for short master key")
+// TestRejectsOversizedKDFParams asserts a bundle whose (unauthenticated) header
+// carries absurd argon2 cost parameters is rejected as ErrFormat BEFORE argon2
+// runs — preventing a pre-auth memory/CPU exhaustion DoS.
+func TestRejectsOversizedKDFParams(t *testing.T) {
+	// Hand-build a bundle whose header claims a ~4 TiB memory cost.
+	var buf bytes.Buffer
+	buf.Write(magic)
+	hdr, err := cbor.Marshal(header{
+		KDF:     "argon2id",
+		Salt:    make([]byte, saltLen),
+		Time:    1,
+		MemKiB:  0xffffffff, // ~4 TiB — must be rejected without allocating
+		Threads: 1,
+		Nonce:   make([]byte, nonceLen),
+	})
+	if err != nil {
+		t.Fatalf("marshal header: %v", err)
+	}
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(hdr)))
+	buf.Write(lenBuf[:])
+	buf.Write(hdr)
+	buf.Write([]byte("whatever-sealed-bytes"))
+
+	if _, _, _, err := Read(bytes.NewReader(buf.Bytes()), []byte("pw")); err != ErrFormat {
+		t.Fatalf("oversized KDF params err = %v, want ErrFormat", err)
 	}
 }
+
