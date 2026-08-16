@@ -42,6 +42,14 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    # Let poolgate lock its memory against swap (memory hygiene, DESIGN §22).
+    # mlockall is bounded by RLIMIT_MEMLOCK; the ~64 KiB default is far too small
+    # to lock the process, so raise it here. With an unlimited memlock limit an
+    # unprivileged process can lock without CAP_IPC_LOCK, so this keeps cap_drop
+    # ALL intact. If you omit this, serve still runs — it just logs a warning that
+    # memory could not be locked (core-dump disabling is unaffected either way).
+    ulimits:
+      memlock: -1
     # No container-level healthcheck: the distroless image has no shell/curl and
     # poolgate has no self-probe subcommand. Caddy does active upstream health
     # checks against /readyz instead (see Caddyfile), and /readyz is reachable
