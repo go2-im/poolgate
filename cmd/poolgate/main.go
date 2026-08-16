@@ -80,6 +80,9 @@ const (
 	// no such override — keep it loopback/private (DESIGN §3).
 	envProxyHost = "POOLGATE_PROXY_HOST"
 	envProxyPort = "POOLGATE_PROXY_PORT"
+	// envBackupPassphrase supplies the passphrase for `backup`/`restore` when
+	// --passphrase-file is not given. It is never written to logs.
+	envBackupPassphrase = "POOLGATE_BACKUP_PASSPHRASE"
 )
 
 func main() {
@@ -133,6 +136,16 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 			fmt.Fprintf(stderr, "poolgate %s: %v\n", cmd, err)
 			return err
 		}
+	case "backup":
+		if err := cmdBackup(rest, stdout); err != nil {
+			fmt.Fprintf(stderr, "poolgate %s: %v\n", cmd, err)
+			return err
+		}
+	case "restore":
+		if err := cmdRestore(rest, stdout); err != nil {
+			fmt.Fprintf(stderr, "poolgate %s: %v\n", cmd, err)
+			return err
+		}
 	case "-h", "--help", "help":
 		usage(stderr)
 		return nil
@@ -154,11 +167,17 @@ usage:
   poolgate serve                start the proxy + admin listeners + health scheduler
   poolgate admin reset-auth     wipe all passkeys/recovery codes/sessions and
                                 print a fresh single-use bootstrap token
+  poolgate backup               write a passphrase-wrapped backup bundle
+                                (master key + DB snapshot) [--out <file>]
+                                [--passphrase-file <path>]
+  poolgate restore <bundle>     restore a bundle into the data dir
+                                [--passphrase-file <path>] [--force]
   poolgate version              print version, commit, and build date
 
 environment:
   POOLGATE_DATA_DIR   override the data directory (default: `+config.DefaultDataDir+`)
   POOLGATE_MASTER_KEY base64 master key (when master_key_source=env)
+  POOLGATE_BACKUP_PASSPHRASE  passphrase for backup/restore (or --passphrase-file)
 `)
 }
 
@@ -199,17 +218,22 @@ func loadConfig() (model.Config, error) {
 	return cfg, nil
 }
 
+// loadMasterKey resolves the raw master key bytes per cfg.MasterKeySource: from
+// POOLGATE_MASTER_KEY (env) or a keyfile under the data dir (default; created if
+// absent). Shared by openStore and the backup/restore commands.
+func loadMasterKey(cfg model.Config) ([]byte, error) {
+	switch cfg.MasterKeySource {
+	case "env":
+		return crypto.LoadKeyFromEnv(envMasterKey)
+	default: // keyfile (keychain is a later phase)
+		return crypto.LoadOrCreateKeyfile(filepath.Join(cfg.DataDir, masterKeyFile))
+	}
+}
+
 // openStore loads the master key per cfg.MasterKeySource, builds the cipher, and
 // opens the store (running migrations). Used by import and serve.
 func openStore(cfg model.Config) (*store.Store, error) {
-	var key []byte
-	var err error
-	switch cfg.MasterKeySource {
-	case "env":
-		key, err = crypto.LoadKeyFromEnv(envMasterKey)
-	default: // keyfile (keychain is a later phase)
-		key, err = crypto.LoadOrCreateKeyfile(filepath.Join(cfg.DataDir, masterKeyFile))
-	}
+	key, err := loadMasterKey(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("load master key: %w", err)
 	}
