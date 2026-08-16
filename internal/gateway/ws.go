@@ -169,7 +169,7 @@ func (g *Gateway) handleResponsesWS(w http.ResponseWriter, r *http.Request) {
 			Policy:      group.Name,
 			APIKeyID:    apiKey.ID,
 			APIKeyLabel: apiKey.Label,
-			SessionID:   sessionID(r, apiKey),
+			SessionID:   g.sessionID(r, apiKey),
 		},
 	}
 

@@ -37,6 +37,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go2-im/poolgate/internal/clientip"
 	"github.com/go2-im/poolgate/internal/model"
 	"github.com/go2-im/poolgate/internal/policy"
 	"github.com/go2-im/poolgate/internal/store"
@@ -129,6 +130,11 @@ type Gateway struct {
 	// transport selects which /responses transport(s) are offered (DESIGN.md §0
 	// D2): both | http-only | ws-only. Normalized in New.
 	transport string
+
+	// trustedProxies are reverse-proxy networks whose X-Forwarded-For is trusted
+	// when resolving the client IP for the API-key IP allowlist. Empty => the
+	// direct peer address is used and X-Forwarded-For is ignored.
+	trustedProxies []*net.IPNet
 }
 
 // Option customizes a Gateway.
@@ -160,6 +166,13 @@ func WithEventSink(s EventSink) Option { return func(g *Gateway) { g.events = s 
 // gateway records a secret-free per-request log (routing/failover trace, chosen
 // account, status, latency, best-effort token counts) for each proxied request.
 func WithRecorder(r Recorder) Option { return func(g *Gateway) { g.recorder = r } }
+
+// WithTrustedProxies sets the reverse-proxy networks whose X-Forwarded-For is
+// trusted when resolving the client IP for the API-key IP allowlist. Empty (the
+// default) ignores X-Forwarded-For and uses only the direct peer address.
+func WithTrustedProxies(nets []*net.IPNet) Option {
+	return func(g *Gateway) { g.trustedProxies = nets }
+}
 
 // WithDefaultConcurrencyCap sets a per-account in-flight cap applied to accounts
 // whose own ConcurrencyCap is 0 (DESIGN.md §23.1). 0 (default) means unlimited.
@@ -289,7 +302,7 @@ func (g *Gateway) authorizeInbound(w http.ResponseWriter, r *http.Request) (apiK
 			"key_expired", "API key has expired")
 		return model.ApiKey{}, "", model.PolicyGroup{}, nil, false
 	}
-	if !keyIPAllowed(apiKey, r) {
+	if !g.keyIPAllowed(apiKey, r) {
 		writeError(w, http.StatusForbidden, "poolgate_key_ip_denied",
 			"key_ip_denied", "client IP is not allowed for this API key")
 		return model.ApiKey{}, "", model.PolicyGroup{}, nil, false
@@ -342,7 +355,7 @@ func (g *Gateway) handleResponses(w http.ResponseWriter, r *http.Request) {
 			Policy:      group.Name,
 			APIKeyID:    apiKey.ID,
 			APIKeyLabel: apiKey.Label,
-			SessionID:   sessionID(r, apiKey),
+			SessionID:   g.sessionID(r, apiKey),
 		},
 	}
 
@@ -947,11 +960,11 @@ func keyScopedTo(k model.ApiKey, endpoint string) bool {
 
 // keyIPAllowed reports whether the request's client IP is permitted by the key's
 // IP allowlist. An empty allowlist permits any IP. Each entry is an IP or CIDR.
-func keyIPAllowed(k model.ApiKey, r *http.Request) bool {
+func (g *Gateway) keyIPAllowed(k model.ApiKey, r *http.Request) bool {
 	if len(k.IPAllowlist) == 0 {
 		return true
 	}
-	ip := net.ParseIP(strings.TrimSpace(clientIP(r)))
+	ip := net.ParseIP(strings.TrimSpace(g.clientIP(r)))
 	if ip == nil {
 		return false
 	}
@@ -1107,21 +1120,17 @@ func atoiSafe(b []byte) int {
 // client-supplied X-Session-Id header when present, else a value derived per
 // (api-key + client ip). It is sanitized (control chars stripped, length capped)
 // and is used for logging/monitoring ONLY — never for routing or affinity.
-func sessionID(r *http.Request, k model.ApiKey) string {
+func (g *Gateway) sessionID(r *http.Request, k model.ApiKey) string {
 	if s := r.Header.Get("X-Session-Id"); s != "" {
 		return model.SanitizeField(s)
 	}
-	return model.SanitizeField("k:" + k.ID + ":" + clientIP(r))
+	return model.SanitizeField("k:" + k.ID + ":" + g.clientIP(r))
 }
 
 // clientIP returns the peer IP (host portion of RemoteAddr). Forwarded-header
 // resolution for trusted proxies is a separate concern (§14) and not used here.
-func clientIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
+func (g *Gateway) clientIP(r *http.Request) string {
+	return clientip.FromRequest(r, g.trustedProxies)
 }
 
 // extractModel best-effort reads the "model" field from the inbound JSON body so

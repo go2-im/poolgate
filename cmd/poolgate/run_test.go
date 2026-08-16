@@ -64,14 +64,15 @@ func TestLoadConfigProxyEnvOverride(t *testing.T) {
 		t.Errorf("admin host changed to %q; proxy override must not touch admin", cfg.Server.Admin.Host)
 	}
 
-	// A non-numeric port is ignored (keeps the resolved value), not fatal.
+	// A non-numeric or out-of-range port now fails fast instead of being silently
+	// ignored (which had left the proxy on a surprising default).
 	t.Setenv(envProxyPort, "not-a-port")
-	cfg, err = loadConfig()
-	if err != nil {
-		t.Fatalf("loadConfig (bad port): %v", err)
+	if _, err := loadConfig(); err == nil {
+		t.Errorf("bad POOLGATE_PROXY_PORT should error, not be silently ignored")
 	}
-	if cfg.Server.Proxy.Port == 0 {
-		t.Errorf("bad port zeroed the proxy port; want the resolved default kept")
+	t.Setenv(envProxyPort, "70000")
+	if _, err := loadConfig(); err == nil {
+		t.Errorf("out-of-range POOLGATE_PROXY_PORT should error")
 	}
 }
 

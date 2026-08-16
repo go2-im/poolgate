@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -156,6 +157,11 @@ type Server struct {
 	limiterMaxFailures int
 	limiterWindow      time.Duration
 	limiterLockout     time.Duration
+
+	// trustedProxies are reverse-proxy networks whose X-Forwarded-For is trusted
+	// when resolving the client IP for the brute-force limiter key. Empty => the
+	// direct peer address is used and X-Forwarded-For is ignored.
+	trustedProxies []*net.IPNet
 }
 
 // Option customizes a Server.
@@ -187,10 +193,16 @@ func WithRateLimit(maxFailures int, window, lockout time.Duration) Option {
 	}
 }
 
+// WithTrustedProxies sets the reverse-proxy networks whose X-Forwarded-For is
+// trusted when resolving the client IP for the brute-force limiter. Empty (the
+// default) ignores X-Forwarded-For and keys the limiter on the direct peer.
+func WithTrustedProxies(nets []*net.IPNet) Option {
+	return func(s *Server) { s.trustedProxies = nets }
+}
+
 // WithRecoveryCodeCount overrides how many one-time recovery codes are minted and
 // returned (once) when the first passkey is registered. 0 keeps the default.
-func WithRecoveryCodeCount(n int) Option {
-	return func(s *Server) {
+func WithRecoveryCodeCount(n int) Option {	return func(s *Server) {
 		if n >= 0 {
 			s.recovery = n
 		}

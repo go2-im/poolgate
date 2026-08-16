@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 
+	"github.com/go2-im/poolgate/internal/clientip"
 	"github.com/go2-im/poolgate/internal/model"
 )
 
@@ -178,10 +179,6 @@ func (s *Server) clearSessionCookie(w http.ResponseWriter) {
 // clientIP extracts the peer IP from RemoteAddr for rate-limit keying. The admin
 // listener is loopback / behind the operator's own proxy, so forwarded headers
 // are intentionally NOT trusted here (DESIGN.md §14).
-func clientIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
+func (s *Server) clientIP(r *http.Request) string {
+	return clientip.FromRequest(r, s.trustedProxies)
 }

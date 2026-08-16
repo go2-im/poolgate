@@ -32,6 +32,7 @@ import (
 	"github.com/go2-im/poolgate/internal/admin"
 	"github.com/go2-im/poolgate/internal/adminauth"
 	"github.com/go2-im/poolgate/internal/authimport"
+	"github.com/go2-im/poolgate/internal/clientip"
 	"github.com/go2-im/poolgate/internal/config"
 	"github.com/go2-im/poolgate/internal/crypto"
 	"github.com/go2-im/poolgate/internal/gateway"
@@ -86,6 +87,8 @@ const (
 	envProxyPort = "POOLGATE_PROXY_PORT"
 	// envProxyTransport overrides server.transport (both|http-only|ws-only).
 	envProxyTransport = "POOLGATE_PROXY_TRANSPORT"
+	// envTrustedProxies overrides server.trusted_proxies (comma-separated IPs/CIDRs).
+	envTrustedProxies = "POOLGATE_TRUSTED_PROXIES"
 	// envBackupPassphrase supplies the passphrase for `backup`/`restore` when
 	// --passphrase-file is not given. It is never written to logs.
 	envBackupPassphrase = "POOLGATE_BACKUP_PASSPHRASE"
@@ -235,12 +238,29 @@ func loadConfig() (model.Config, error) {
 		cfg.Server.Proxy.Host = v
 	}
 	if v := strings.TrimSpace(os.Getenv(envProxyPort)); v != "" {
-		if p, err := strconv.Atoi(v); err == nil && p > 0 && p <= 65535 {
-			cfg.Server.Proxy.Port = p
+		p, perr := strconv.Atoi(v)
+		if perr != nil || p <= 0 || p > 65535 {
+			return model.Config{}, fmt.Errorf("%s must be a port in 1..65535, got %q", envProxyPort, v)
 		}
+		cfg.Server.Proxy.Port = p
 	}
 	if v := strings.TrimSpace(os.Getenv(envProxyTransport)); v != "" {
 		cfg.Server.Transport = v
+	}
+	if v := strings.TrimSpace(os.Getenv(envTrustedProxies)); v != "" {
+		parts := strings.Split(v, ",")
+		out := make([]string, 0, len(parts))
+		for _, p := range parts {
+			if p = strings.TrimSpace(p); p != "" {
+				out = append(out, p)
+			}
+		}
+		cfg.Server.TrustedProxies = out
+	}
+	// Validate trusted-proxy specs early so a typo fails fast at startup rather
+	// than silently disabling forwarded-header handling later.
+	if _, err := clientip.ParseCIDRs(cfg.Server.TrustedProxies); err != nil {
+		return model.Config{}, err
 	}
 	return cfg, nil
 }
@@ -605,8 +625,11 @@ func cmdServe(ctx context.Context, _ []string, stdout io.Writer) error {
 	refresher := oauth.NewRefresher(st, cfg.Issuer)
 	engine := newHealthEngine(st, refresher, cfg.HealthProbeMode, logger, notifier)
 
+	// trusted_proxies were validated in loadConfig; parse is infallible here.
+	trusted, _ := clientip.ParseCIDRs(cfg.Server.TrustedProxies)
 	gw := gateway.New(st, cfg, gateway.WithLogger(logger), gateway.WithHealth(engine),
-		gateway.WithEventSink(notifier), gateway.WithRecorder(mon))
+		gateway.WithEventSink(notifier), gateway.WithRecorder(mon),
+		gateway.WithTrustedProxies(trusted))
 
 	// Admin API handler (loopback listener), wired with the same store so the
 	// bootstrap token issued by `init` / `admin reset-auth` registers the first
@@ -701,6 +724,10 @@ func buildAdminHandler(cfg model.Config, st *store.Store, logger *slog.Logger, n
 	opts := []admin.Option{admin.WithNotifier(notifier), admin.WithMonitor(mon), admin.WithLogger(logger)}
 	if skew != nil {
 		opts = append(opts, admin.WithClockSkew(skew))
+	}
+	// trusted_proxies were validated in loadConfig; parse is infallible here.
+	if trusted, _ := clientip.ParseCIDRs(cfg.Server.TrustedProxies); len(trusted) > 0 {
+		opts = append(opts, admin.WithTrustedProxies(trusted))
 	}
 	// Mount the embedded admin SPA when a bundle is present; otherwise run API-only.
 	if spa, serr := webui.Handler(); serr == nil {
