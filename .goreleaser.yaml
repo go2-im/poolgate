@@ -113,9 +113,26 @@ docker_manifests:
       - "ghcr.io/go2-im/poolgate:{{ .Version }}-amd64"
       - "ghcr.io/go2-im/poolgate:{{ .Version }}-arm64"
   - name_template: "ghcr.io/go2-im/poolgate:latest"
+    # Never move the mutable :latest tag for a prerelease (e.g. v1.2.3-rc1), so a
+    # release candidate can't become what `docker pull …:latest` serves. Matches
+    # release.prerelease: auto and brews.skip_upload: auto. The immutable
+    # :{{ .Version }} manifest above is always pushed.
+    skip_push: auto
     image_templates:
       - "ghcr.io/go2-im/poolgate:{{ .Version }}-amd64"
       - "ghcr.io/go2-im/poolgate:{{ .Version }}-arm64"
+
+# cosign keyless-sign the published manifests (same Sigstore OIDC posture as the
+# checksum signing), so consumers can `cosign verify ghcr.io/go2-im/poolgate:<tag>`.
+docker_signs:
+  - id: cosign-images
+    cmd: cosign
+    artifacts: manifests
+    output: true
+    args:
+      - sign
+      - "${artifact}@${digest}"
+      - "--yes"
 
 brews:
   - name: poolgate

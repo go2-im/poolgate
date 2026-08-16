@@ -89,24 +89,46 @@ brew install go2-im/tap/poolgate
 
 ### Docker
 
-The proxy listener defaults to loopback; bind it to `0.0.0.0` (via a mounted
-`config.yaml`) to reach it from outside the container. Keep the **admin** listener
-private (it is not `EXPOSE`d).
+The image binds the proxy to `0.0.0.0` (via `POOLGATE_PROXY_HOST`, baked into
+the image) so a published port works. The **admin** listener stays loopback and
+is intentionally not `EXPOSE`d — reach it via an SSH tunnel or a sidecar.
+
+Like the CLI, the container never auto-imports accounts, so first run is
+**init → import → serve** against a persistent `/data` volume:
 
 ```bash
-docker run --rm -v poolgate-data:/data ghcr.io/go2-im/poolgate:latest version
+# 1. Initialize: creates the master key + DB and prints a single-use bootstrap
+#    token (register your first admin passkey with it).
+docker run --rm -v poolgate-data:/data ghcr.io/go2-im/poolgate:latest init
+
+# 2. Import a Codex auth.json (explicit; prints the sk- proxy key once).
+docker run --rm -v poolgate-data:/data -v "$PWD/auth.json:/auth.json:ro" \
+  ghcr.io/go2-im/poolgate:latest import /auth.json
+
+# 3. Serve (default CMD). Publish the proxy port.
+docker run -d --name poolgate -v poolgate-data:/data -p 8787:8787 \
+  ghcr.io/go2-im/poolgate:latest
 ```
 
-### Verify the checksum signature (cosign)
+`docker run … version` prints the build metadata without touching `/data`.
+
+### Verify a release (cosign)
+
+Binaries are covered by the signed checksum file; the container images are signed
+directly.
 
 ```bash
+# Archives — verify the signed SHA256SUMS, then check a downloaded archive.
 cosign verify-blob \
   --certificate SHA256SUMS.pem \
   --signature SHA256SUMS.sig \
   --certificate-identity-regexp 'https://github.com/go2-im/poolgate/.github/workflows/release.yml@.*' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
   SHA256SUMS
-
-# Then check a downloaded archive against the verified sums:
 sha256sum -c SHA256SUMS --ignore-missing
+
+# Container image — verify the keyless signature on the pulled tag.
+cosign verify ghcr.io/go2-im/poolgate:latest \
+  --certificate-identity-regexp 'https://github.com/go2-im/poolgate/.github/workflows/release.yml@.*' \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
 ```

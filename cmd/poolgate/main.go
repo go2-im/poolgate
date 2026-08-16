@@ -24,6 +24,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -72,6 +73,13 @@ const (
 	envMasterKey = "POOLGATE_MASTER_KEY"
 	// envDataDir overrides the data dir for all subcommands.
 	envDataDir = "POOLGATE_DATA_DIR"
+	// envProxyHost / envProxyPort override the proxy listener bind. The proxy
+	// default is loopback (127.0.0.1), which is unreachable from outside a
+	// container; setting POOLGATE_PROXY_HOST=0.0.0.0 (as the Docker image does)
+	// makes the published port reachable. The admin listener intentionally has
+	// no such override — keep it loopback/private (DESIGN §3).
+	envProxyHost = "POOLGATE_PROXY_HOST"
+	envProxyPort = "POOLGATE_PROXY_PORT"
 )
 
 func main() {
@@ -178,6 +186,15 @@ func loadConfig() (model.Config, error) {
 	}
 	if dataDir != "" {
 		cfg.DataDir = dataDir
+	}
+	// Env overrides for the proxy bind (containers need a non-loopback host).
+	if v := strings.TrimSpace(os.Getenv(envProxyHost)); v != "" {
+		cfg.Server.Proxy.Host = v
+	}
+	if v := strings.TrimSpace(os.Getenv(envProxyPort)); v != "" {
+		if p, err := strconv.Atoi(v); err == nil && p > 0 && p <= 65535 {
+			cfg.Server.Proxy.Port = p
+		}
 	}
 	return cfg, nil
 }

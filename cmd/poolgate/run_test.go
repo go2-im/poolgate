@@ -29,6 +29,52 @@ func writeAuthJSON(t *testing.T) string {
 	return authPath
 }
 
+// TestLoadConfigProxyEnvOverride covers the POOLGATE_PROXY_HOST/PORT overrides
+// loadConfig applies on top of the resolved config — the mechanism the Docker
+// image uses to bind the proxy to a reachable (non-loopback) address. The admin
+// listener is intentionally left untouched (stays loopback).
+func TestLoadConfigProxyEnvOverride(t *testing.T) {
+	// A data dir with no config.yaml → defaults (proxy host 127.0.0.1).
+	t.Setenv(envDataDir, t.TempDir())
+
+	// No override → default loopback proxy host.
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.Server.Proxy.Host != "127.0.0.1" {
+		t.Fatalf("default proxy host = %q, want 127.0.0.1", cfg.Server.Proxy.Host)
+	}
+	adminHost := cfg.Server.Admin.Host
+
+	// Overrides applied.
+	t.Setenv(envProxyHost, "0.0.0.0")
+	t.Setenv(envProxyPort, "9999")
+	cfg, err = loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig (override): %v", err)
+	}
+	if cfg.Server.Proxy.Host != "0.0.0.0" {
+		t.Errorf("proxy host = %q, want 0.0.0.0", cfg.Server.Proxy.Host)
+	}
+	if cfg.Server.Proxy.Port != 9999 {
+		t.Errorf("proxy port = %d, want 9999", cfg.Server.Proxy.Port)
+	}
+	if cfg.Server.Admin.Host != adminHost {
+		t.Errorf("admin host changed to %q; proxy override must not touch admin", cfg.Server.Admin.Host)
+	}
+
+	// A non-numeric port is ignored (keeps the resolved value), not fatal.
+	t.Setenv(envProxyPort, "not-a-port")
+	cfg, err = loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig (bad port): %v", err)
+	}
+	if cfg.Server.Proxy.Port == 0 {
+		t.Errorf("bad port zeroed the proxy port; want the resolved default kept")
+	}
+}
+
 // TestRunVersion covers the version subcommand + its flag aliases: each returns
 // nil and prints a single line carrying the injected version string and the Go
 // runtime version, to stdout (not stderr).

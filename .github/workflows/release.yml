@@ -16,6 +16,13 @@ permissions:
   packages: write
   id-token: write
 
+# Single-flight: a fixed group (not ${{ github.ref }}, which differs per tag)
+# serializes releases so two tags pushed close together can't race on the mutable
+# ghcr :latest manifest. Never cancel — a half-finished release must complete.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   goreleaser:
     runs-on: ubuntu-latest
