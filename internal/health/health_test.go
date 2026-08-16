@@ -91,6 +91,39 @@ func (f *fakeStore) UpdateState(_ context.Context, id string, s model.AccountSta
 	return nil
 }
 
+func (f *fakeStore) GetAccountState(_ context.Context, id string) (model.AccountState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failTiming {
+		return "", errors.New("state read boom")
+	}
+	if s, ok := f.states[id]; ok {
+		return s, nil
+	}
+	for _, a := range f.accounts {
+		if a.ID == id {
+			return a.State, nil
+		}
+	}
+	return "", nil
+}
+
+func (f *fakeStore) UpdateStateAndTiming(_ context.Context, id string, s model.AccountState, t model.AccountTiming) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	// Honor both legacy fail flags so error-injection tests keep exercising the
+	// state-write and timing-write failure paths through the combined method.
+	if f.failState {
+		return errors.New("state boom")
+	}
+	if f.failSetTime {
+		return errors.New("set timing boom")
+	}
+	f.states[id] = s
+	f.timing[id] = t
+	return nil
+}
+
 func (f *fakeStore) SaveUsageSnapshot(_ context.Context, snap model.UsageSnapshot) (model.UsageSnapshot, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -307,7 +340,7 @@ func TestApplyEventTransitions(t *testing.T) {
 		{
 			name:      "healthy recovers to ok and resets backoff",
 			state:     model.StateCooldown,
-			in:        model.AccountTiming{BackoffLevel: 3, ConsecutiveFailures: 2, CooldownUntil: now.Add(time.Hour), ConcurrencyCap: 7},
+			in:        model.AccountTiming{BackoffLevel: 3, ConsecutiveFailures: 2, CooldownUntil: now.Add(-time.Hour), ConcurrencyCap: 7},
 			ev:        evProbeHealthy,
 			p:         eventParams{now: now},
 			wantState: model.StateOK,
@@ -324,6 +357,24 @@ func TestApplyEventTransitions(t *testing.T) {
 				wantNext := now.Add(e.sched.OK)
 				if !tr.Timing.NextProbeAt.Equal(wantNext) {
 					t.Fatalf("next=%v want %v", tr.Timing.NextProbeAt, wantNext)
+				}
+			},
+		},
+		{
+			// Race guard: a healthy probe must NOT clear a cooldown whose gate is
+			// still in the future (a live 429 landed during the probe).
+			name:      "healthy probe keeps unexpired cooldown",
+			state:     model.StateCooldown,
+			in:        model.AccountTiming{BackoffLevel: 2, ConsecutiveFailures: 1, CooldownUntil: now.Add(time.Hour)},
+			ev:        evProbeHealthy,
+			p:         eventParams{now: now},
+			wantState: model.StateCooldown,
+			check: func(t *testing.T, tr Transition) {
+				if !tr.Timing.CooldownUntil.Equal(now.Add(time.Hour)) {
+					t.Fatalf("cooldown gate cleared/changed: %v", tr.Timing.CooldownUntil)
+				}
+				if tr.Timing.NextProbeAt.Before(now.Add(time.Hour)) {
+					t.Fatalf("next probe %v scheduled before gate", tr.Timing.NextProbeAt)
 				}
 			},
 		},

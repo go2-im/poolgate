@@ -160,19 +160,28 @@ func TestLiveRequesterDefaults(t *testing.T) {
 
 func TestParseRetryAfter(t *testing.T) {
 	tests := map[string]time.Duration{
-		"":                              0,
-		"  ":                            0,
-		"30":                            30 * time.Second,
-		" 15 ":                          15 * time.Second,
-		"0":                             0,
-		"-5":                            0,
-		"notasec":                       0,
-		"Wed, 21 Oct 2026 07:28:00 GMT": 0, // HTTP-date form treated as unknown
+		"":        0,
+		"  ":      0,
+		"30":      30 * time.Second,
+		" 15 ":    15 * time.Second,
+		"0":       0,
+		"-5":      0,
+		"notasec": 0,
 	}
 	for in, want := range tests {
 		if got := parseRetryAfter(in); got != want {
 			t.Fatalf("parseRetryAfter(%q)=%v want %v", in, got, want)
 		}
+	}
+	// HTTP-date form is now honored (RFC 7231): a future date yields a positive
+	// delta; a past date clamps to 0.
+	future := time.Now().UTC().Add(45 * time.Second).Format(http.TimeFormat)
+	if got := parseRetryAfter(future); got <= 0 || got > 46*time.Second {
+		t.Fatalf("parseRetryAfter(future HTTP-date)=%v want ~45s", got)
+	}
+	past := time.Now().UTC().Add(-time.Hour).Format(http.TimeFormat)
+	if got := parseRetryAfter(past); got != 0 {
+		t.Fatalf("parseRetryAfter(past HTTP-date)=%v want 0", got)
 	}
 }
 

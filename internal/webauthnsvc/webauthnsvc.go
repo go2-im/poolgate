@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"strings"
 	"time"
@@ -191,6 +192,15 @@ func resolveRP(admin model.ListenConfig) (rpID string, origins []string, err err
 		host := strings.TrimSpace(admin.Host)
 		if host == "" {
 			host = "127.0.0.1"
+		}
+		// WebAuthn RP IDs and origins cannot be bare IP literals — browsers reject
+		// an IP as the effective domain, so the default 127.0.0.1 bind would make
+		// passkey registration impossible out of the box. The loopback IP resolves
+		// from "localhost", which IS a valid RP ID, so synthesize a localhost
+		// origin for any loopback bind. Non-loopback IP binds still require an
+		// explicit external_origin/rp_id pointing at a real domain.
+		if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+			host = "localhost"
 		}
 		port := admin.Port
 		if port == 0 {

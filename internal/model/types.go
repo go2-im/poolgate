@@ -292,6 +292,12 @@ type ServerConfig struct {
 	// "http-only" (refuse the WS upgrade so Codex falls back to HTTP+SSE), or
 	// "ws-only" (require the WS upgrade; refuse plain HTTP POST). Empty = both.
 	Transport string `yaml:"transport" json:"transport"`
+	// TrustedProxies lists reverse-proxy addresses/networks (IPs or CIDRs) whose
+	// X-Forwarded-For header poolgate will trust when resolving the real client IP
+	// for the API-key IP allowlist and the admin brute-force limiter. Empty (the
+	// default) means poolgate is directly exposed: X-Forwarded-For is ignored and
+	// only the direct peer address is used.
+	TrustedProxies []string `yaml:"trusted_proxies,omitempty" json:"trusted_proxies,omitempty"`
 }
 
 // ListenConfig is a host:port bind pair. For the admin listener it also carries

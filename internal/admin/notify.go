@@ -198,7 +198,15 @@ func (s *Server) handleNotifyChannelPatch(w http.ResponseWriter, r *http.Request
 			writeErr(w, http.StatusBadRequest, errBadRequest, err.Error())
 			return
 		}
-		ch.Config = req.Config.toModel()
+		newCfg := req.Config.toModel()
+		// The signing secret is write-only (never returned in views), so a client
+		// editing another config field cannot echo it back. Treat an empty secret
+		// on PATCH as "unchanged" and preserve the stored one, rather than silently
+		// wiping it (which would break DingTalk 加签 on the next alert).
+		if newCfg.Secret == "" {
+			newCfg.Secret = ch.Config.Secret
+		}
+		ch.Config = newCfg
 	}
 	if err := s.store.UpdateNotifyChannel(r.Context(), ch); err != nil {
 		s.writeStoreErr(w, err, "notify channel")

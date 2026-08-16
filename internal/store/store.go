@@ -845,6 +845,51 @@ WHERE id = ?`,
 	return nil
 }
 
+// GetAccountState reads an account's current health state. The health engine uses
+// it to re-read the authoritative state under its per-account lock before
+// applying a transition, so a slow probe cannot compute against a stale snapshot.
+func (s *Store) GetAccountState(ctx context.Context, id string) (model.AccountState, error) {
+	var state string
+	err := s.db.QueryRowContext(ctx, `SELECT state FROM accounts WHERE id = ?`, id).Scan(&state)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", ErrNotFound
+		}
+		return "", fmt.Errorf("store: get account state: %w", err)
+	}
+	return model.AccountState(state), nil
+}
+
+// UpdateStateAndTiming writes an account's health state AND scheduling/backoff
+// timing in ONE UPDATE statement, so the two can never be observed or persisted
+// out of sync (previously they were two separate statements — a crash or error
+// between them left state and cooldown inconsistent). Zero-valued timestamps are
+// written as SQL NULL.
+func (s *Store) UpdateStateAndTiming(ctx context.Context, id string, state model.AccountState, t model.AccountTiming) error {
+	res, err := s.db.ExecContext(ctx, `
+UPDATE accounts SET
+	state = ?,
+	cooldown_until = ?, next_probe_at = ?,
+	consecutive_failures = ?, backoff_level = ?, concurrency_cap = ?,
+	updated_at = ?
+WHERE id = ?`,
+		string(state),
+		nullableTime(t.CooldownUntil), nullableTime(t.NextProbeAt),
+		t.ConsecutiveFailures, t.BackoffLevel, t.ConcurrencyCap,
+		formatTime(time.Now().UTC()), id)
+	if err != nil {
+		return fmt.Errorf("store: update state and timing: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: update state and timing rows: %w", err)
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // ---- api keys -------------------------------------------------------------
 
 // InsertApiKey inserts an inbound key. Endpoints scoping is stored as a JSON
@@ -1158,4 +1203,16 @@ func newID(prefix string) string {
 		return fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano())
 	}
 	return prefix + "_" + hex.EncodeToString(b[:])
+}
+
+// newSessionID mints an admin session id. Unlike newID (64-bit, fine for opaque
+// row ids), the session id is ALSO the admin bearer cookie value and the only
+// secret gating authenticated endpoints, so it uses 256 bits of entropy — far
+// beyond any online guessing budget even without a per-request throttle.
+func newSessionID() string {
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("sess_%d", time.Now().UnixNano())
+	}
+	return "sess_" + hex.EncodeToString(b[:])
 }

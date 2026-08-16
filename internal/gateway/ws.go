@@ -47,6 +47,9 @@ const (
 	wsDialTimeout = 30 * time.Second
 	// wsAffinityTTL is how long an x-codex-turn-state → account pin survives.
 	wsAffinityTTL = 10 * time.Minute
+	// wsAffinityMax caps the number of live turn-state pins so a client rotating
+	// the header can't grow the map without bound; the oldest is evicted when full.
+	wsAffinityMax = 4096
 	// wsPingInterval/wsPingTimeout bound liveness: poolgate pings the client
 	// periodically and, if no pong arrives in time, tears the connection down so a
 	// dead/half-open peer cannot pin a concurrency slot indefinitely.
@@ -83,6 +86,7 @@ type wsAffinity struct {
 	mu  sync.Mutex
 	m   map[string]wsAffEntry
 	ttl time.Duration
+	max int
 	now func() time.Time
 }
 
@@ -92,7 +96,7 @@ type wsAffEntry struct {
 }
 
 func newWSAffinity() *wsAffinity {
-	return &wsAffinity{m: make(map[string]wsAffEntry), ttl: wsAffinityTTL, now: time.Now}
+	return &wsAffinity{m: make(map[string]wsAffEntry), ttl: wsAffinityTTL, max: wsAffinityMax, now: time.Now}
 }
 
 // get returns the pinned account id for a turn-state token if present and unexpired.
@@ -125,6 +129,26 @@ func (a *wsAffinity) set(key, accountID string) {
 	for k, e := range a.m {
 		if now.After(e.expiry) {
 			delete(a.m, k)
+		}
+	}
+	// Hard size cap: a client (or buggy intermediary) that reconnects with a fresh
+	// turn-state token every time would otherwise accumulate entries for the full
+	// TTL. When full after sweeping, evict the oldest entry to admit the new one.
+	if a.max > 0 && len(a.m) >= a.max {
+		if _, exists := a.m[key]; !exists {
+			var (
+				oldestK string
+				oldestE time.Time
+				found   bool
+			)
+			for k, e := range a.m {
+				if !found || e.expiry.Before(oldestE) {
+					oldestK, oldestE, found = k, e.expiry, true
+				}
+			}
+			if found {
+				delete(a.m, oldestK)
+			}
 		}
 	}
 	a.m[key] = wsAffEntry{accountID: accountID, expiry: now.Add(a.ttl)}
@@ -169,7 +193,7 @@ func (g *Gateway) handleResponsesWS(w http.ResponseWriter, r *http.Request) {
 			Policy:      group.Name,
 			APIKeyID:    apiKey.ID,
 			APIKeyLabel: apiKey.Label,
-			SessionID:   sessionID(r, apiKey),
+			SessionID:   g.sessionID(r, apiKey),
 		},
 	}
 
@@ -365,7 +389,7 @@ func (g *Gateway) pumpWS(ctx context.Context, client, upstream *websocket.Conn) 
 	}
 	go relay(upstream, client) // client → upstream
 	go relay(client, upstream) // upstream → client
-	go g.wsHeartbeat(ctx, cancel, client)
+	go g.wsHeartbeat(ctx, cancel, client, upstream)
 
 	<-done
 	// One side finished; close both so the other Read returns promptly.
@@ -374,21 +398,30 @@ func (g *Gateway) pumpWS(ctx context.Context, client, upstream *websocket.Conn) 
 	<-done
 }
 
-// wsHeartbeat pings client every wsPingInterval and cancels the relay if a pong
-// does not arrive within wsPingTimeout (a dead or half-open peer). It exits when
-// ctx is cancelled (the connection closed), so it never outlives the connection.
-func (g *Gateway) wsHeartbeat(ctx context.Context, cancel context.CancelFunc, client *websocket.Conn) {
+// wsHeartbeat pings BOTH peers every wsPingInterval and cancels the relay if a
+// pong does not arrive within wsPingTimeout from either side. Pinging the
+// upstream as well as the client is what reaps a silently-dead/half-open UPSTREAM
+// (whose relay would otherwise block on Read with no deadline, pinning the
+// account's concurrency slot until OS TCP keepalive). It exits when ctx is
+// cancelled (the connection closed), so it never outlives the connection.
+func (g *Gateway) wsHeartbeat(ctx context.Context, cancel context.CancelFunc, client, upstream *websocket.Conn) {
 	t := time.NewTicker(wsPingInterval)
 	defer t.Stop()
+	ping := func(c *websocket.Conn) error {
+		pctx, pcancel := context.WithTimeout(ctx, wsPingTimeout)
+		defer pcancel()
+		return c.Ping(pctx)
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			pctx, pcancel := context.WithTimeout(ctx, wsPingTimeout)
-			err := client.Ping(pctx)
-			pcancel()
-			if err != nil {
+			if err := ping(client); err != nil {
+				cancel()
+				return
+			}
+			if err := ping(upstream); err != nil {
 				cancel()
 				return
 			}

@@ -75,9 +75,26 @@ func (s *Server) handleRegisterFinish(w http.ResponseWriter, r *http.Request, at
 	}
 	gate := webauthnsvc.RegisterGate{BootstrapToken: req.BootstrapToken, Label: req.Label, SessionID: sid}
 
-	if _, err := s.webauthn.FinishRegistration(r.Context(), gate, req.ChallengeID, req.Credential); err != nil {
+	_, wasFirst, err := s.webauthn.FinishRegistration(r.Context(), gate, req.ChallengeID, req.Credential)
+	if err != nil {
 		s.writeRegisterErr(w, err, at)
 		return
+	}
+
+	resp := map[string]any{"authenticated": true}
+	// Recovery codes are minted for the actual bootstrap (first-passkey) ceremony
+	// as determined by FinishRegistration — not from the client-supplied
+	// BootstrapToken flag, which could disagree. Mint them BEFORE establishing the
+	// session so a code-generation failure surfaces as a clean 500 (the operator
+	// simply retries the bootstrap) rather than leaving a live session with no
+	// recovery codes.
+	if wasFirst {
+		codes, cerr := s.sessions.GenerateRecoveryCodes(r.Context(), s.recovery)
+		if cerr != nil {
+			writeErr(w, http.StatusInternalServerError, errInternal, "could not generate recovery codes")
+			return
+		}
+		resp["recovery_codes"] = codes
 	}
 
 	sess, err := s.sessions.RotateSession(r.Context(), sid)
@@ -87,22 +104,15 @@ func (s *Server) handleRegisterFinish(w http.ResponseWriter, r *http.Request, at
 	}
 	s.setSessionCookie(w, sess)
 
-	resp := map[string]any{"authenticated": true}
-	// The first passkey is the bootstrap-gated one: mint recovery codes once.
-	if req.BootstrapToken != "" {
-		codes, err := s.sessions.GenerateRecoveryCodes(r.Context(), s.recovery)
-		if err != nil {
-			writeErr(w, http.StatusInternalServerError, errInternal, "could not generate recovery codes")
-			return
-		}
-		resp["recovery_codes"] = codes
-	}
 	s.audit(r.Context(), "auth.passkey_register", req.Label, "")
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// handleLoginBegin starts a passkey assertion ceremony.
-func (s *Server) handleLoginBegin(w http.ResponseWriter, r *http.Request) {
+// handleLoginBegin starts a passkey assertion ceremony. It is wrapped by the
+// brute limiter (route "login") so a source IP already locked out from failed
+// logins cannot keep starting new ceremonies; it reports neither success nor
+// failure, so a begin never itself counts against the limiter.
+func (s *Server) handleLoginBegin(w http.ResponseWriter, r *http.Request, _ *attempt) {
 	assertion, challengeID, err := s.webauthn.BeginLogin(r.Context())
 	if err != nil {
 		if errors.Is(err, webauthnsvc.ErrNoCredentials) {

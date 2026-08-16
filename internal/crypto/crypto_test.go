@@ -64,6 +64,36 @@ func TestOpenWrongKeyFails(t *testing.T) {
 	}
 }
 
+func TestLoadKeyfileNoCreate(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "master.key")
+
+	// Missing keyfile must be a hard error, never a silent mint.
+	if _, err := LoadKeyfile(path); err == nil {
+		t.Fatal("LoadKeyfile on a missing file should error, not create")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("LoadKeyfile must not create the keyfile")
+	}
+
+	// After a real create it reads back the same key (and the atomic write left no
+	// leftover temp file).
+	created, err := LoadOrCreateKeyfile(path)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	got, err := LoadKeyfile(path)
+	if err != nil {
+		t.Fatalf("LoadKeyfile: %v", err)
+	}
+	if string(got) != string(created) {
+		t.Fatal("LoadKeyfile returned a different key")
+	}
+	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
+		t.Fatal("atomic keyfile write left a .tmp file behind")
+	}
+}
+
 func TestLoadOrCreateKeyfile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sub", "master.key")

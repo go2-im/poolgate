@@ -22,14 +22,21 @@ func TestMaskKey(t *testing.T) {
 }
 
 func TestClientIP(t *testing.T) {
+	s := &Server{} // no trusted proxies -> peer address only, X-Forwarded-For ignored
 	r := httptest.NewRequest(http.MethodGet, "/admin/me", nil)
 	r.RemoteAddr = "10.0.0.5:1234"
-	if got := clientIP(r); got != "10.0.0.5" {
+	if got := s.clientIP(r); got != "10.0.0.5" {
 		t.Errorf("clientIP with port = %q, want 10.0.0.5", got)
 	}
 	r.RemoteAddr = "no-port"
-	if got := clientIP(r); got != "no-port" {
+	if got := s.clientIP(r); got != "no-port" {
 		t.Errorf("clientIP no port = %q, want no-port", got)
+	}
+	// A spoofed X-Forwarded-For from an untrusted peer must be ignored.
+	r.RemoteAddr = "10.0.0.5:1234"
+	r.Header.Set("X-Forwarded-For", "1.2.3.4")
+	if got := s.clientIP(r); got != "10.0.0.5" {
+		t.Errorf("clientIP with untrusted XFF = %q, want 10.0.0.5 (peer)", got)
 	}
 }
 

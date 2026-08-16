@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -125,7 +126,7 @@ type SessionManager interface {
 // Ceremonies is the WebAuthn ceremony surface. *webauthnsvc.Service satisfies it.
 type Ceremonies interface {
 	BeginRegistration(ctx context.Context, gate webauthnsvc.RegisterGate) (*protocol.CredentialCreation, string, error)
-	FinishRegistration(ctx context.Context, gate webauthnsvc.RegisterGate, challengeID string, body []byte) (model.WebAuthnCredential, error)
+	FinishRegistration(ctx context.Context, gate webauthnsvc.RegisterGate, challengeID string, body []byte) (model.WebAuthnCredential, bool, error)
 	BeginLogin(ctx context.Context) (*protocol.CredentialAssertion, string, error)
 	FinishLogin(ctx context.Context, challengeID string, body []byte) (webauthn.User, error)
 	// RPID returns the resolved WebAuthn Relying Party ID, surfaced read-only by
@@ -156,6 +157,11 @@ type Server struct {
 	limiterMaxFailures int
 	limiterWindow      time.Duration
 	limiterLockout     time.Duration
+
+	// trustedProxies are reverse-proxy networks whose X-Forwarded-For is trusted
+	// when resolving the client IP for the brute-force limiter key. Empty => the
+	// direct peer address is used and X-Forwarded-For is ignored.
+	trustedProxies []*net.IPNet
 }
 
 // Option customizes a Server.
@@ -187,10 +193,16 @@ func WithRateLimit(maxFailures int, window, lockout time.Duration) Option {
 	}
 }
 
+// WithTrustedProxies sets the reverse-proxy networks whose X-Forwarded-For is
+// trusted when resolving the client IP for the brute-force limiter. Empty (the
+// default) ignores X-Forwarded-For and keys the limiter on the direct peer.
+func WithTrustedProxies(nets []*net.IPNet) Option {
+	return func(s *Server) { s.trustedProxies = nets }
+}
+
 // WithRecoveryCodeCount overrides how many one-time recovery codes are minted and
 // returned (once) when the first passkey is registered. 0 keeps the default.
-func WithRecoveryCodeCount(n int) Option {
-	return func(s *Server) {
+func WithRecoveryCodeCount(n int) Option {	return func(s *Server) {
 		if n >= 0 {
 			s.recovery = n
 		}
@@ -288,7 +300,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 	// ---- auth / bootstrap (public: no session guard) ----
 	mux.HandleFunc("POST /admin/register/begin", s.brute("register", s.handleRegisterBegin))
 	mux.HandleFunc("POST /admin/register/finish", s.brute("register", s.handleRegisterFinish))
-	mux.HandleFunc("POST /admin/login/begin", s.handleLoginBegin)
+	mux.HandleFunc("POST /admin/login/begin", s.brute("login", s.handleLoginBegin))
 	mux.HandleFunc("POST /admin/login/finish", s.brute("login", s.handleLoginFinish))
 	mux.HandleFunc("POST /admin/login/recovery", s.brute("recovery", s.handleLoginRecovery))
 

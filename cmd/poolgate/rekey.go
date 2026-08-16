@@ -107,8 +107,11 @@ func cmdRotateKey(_ []string, stdout io.Writer) error {
 	// DB is now committed on the NEW key. Persist the new key.
 	if cfg.MasterKeySource == "env" {
 		fmt.Fprintf(stdout, "\nRe-encrypted %d account(s) and %d notify channel(s).\n"+
-			"master_key_source is \"env\": update POOLGATE_MASTER_KEY to the NEW key below — the old key no longer decrypts the DB:\n\n  %s\n\n",
+			"master_key_source is \"env\": the DB is now decryptable ONLY with the NEW key below.\n"+
+			"poolgate will FAIL to start until you update POOLGATE_MASTER_KEY (systemd unit, Docker env,\n"+
+			"secret store, etc.) to this value — the old key no longer works:\n\n  %s\n\n",
 			nAcc, nCh, crypto.EncodeKey(newKey))
+		pruneOldSnapshots(cfg.DataDir, stdout)
 		return nil
 	}
 

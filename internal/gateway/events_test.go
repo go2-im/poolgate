@@ -94,6 +94,41 @@ func TestNoSinkNoHealthyMember(t *testing.T) {
 	}
 }
 
+func TestFailWindowSlidingCatchesBoundaryStraddle(t *testing.T) {
+	// Threshold 3 within 60s. Two failures late in one notional window and one
+	// just after a fixed-window boundary are within 60s of each other, so a true
+	// sliding window must fire (a tumbling window would have reset and missed it).
+	fw := newFailWindow(3, time.Minute)
+	base := time.Date(2026, 8, 16, 10, 0, 0, 0, time.UTC)
+	now := base
+	fw.now = func() time.Time { return now }
+
+	now = base.Add(58 * time.Second)
+	if fw.record() {
+		t.Fatal("1st failure should not fire")
+	}
+	now = base.Add(59 * time.Second)
+	if fw.record() {
+		t.Fatal("2nd failure should not fire")
+	}
+	now = base.Add(61 * time.Second) // past a 60s tumbling boundary, still within 60s of the 1st two
+	if !fw.record() {
+		t.Fatal("3rd failure within the trailing 60s window should fire (sliding window)")
+	}
+
+	// Genuinely spread-out failures do NOT fire: advance well past the window.
+	fw2 := newFailWindow(3, time.Minute)
+	n2 := base
+	fw2.now = func() time.Time { return n2 }
+	fw2.record()
+	n2 = base.Add(30 * time.Second)
+	fw2.record()
+	n2 = base.Add(200 * time.Second) // first two aged out
+	if fw2.record() {
+		t.Fatal("failures spread beyond the window should not fire")
+	}
+}
+
 func TestFailWindowFiresOnceAtThreshold(t *testing.T) {
 	fw := newFailWindow(3, time.Minute)
 	base := time.Date(2026, 8, 16, 10, 0, 0, 0, time.UTC)

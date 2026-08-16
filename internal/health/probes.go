@@ -194,16 +194,24 @@ func setCodexHeaders(req *http.Request, acct model.Account, originator, userAgen
 	req.Header.Set("User-Agent", userAgent)
 }
 
-// parseRetryAfter parses a Retry-After header value (delta-seconds only; an
-// HTTP-date form is treated as unknown → 0). Negative/zero → 0.
+// parseRetryAfter parses a Retry-After header value. Both RFC 7231 forms are
+// honored: delta-seconds ("120") and HTTP-date ("Wed, 21 Oct 2026 07:28:00 GMT",
+// converted to a delta from now). Negative/zero/malformed → 0.
 func parseRetryAfter(v string) time.Duration {
 	v = strings.TrimSpace(v)
 	if v == "" {
 		return 0
 	}
-	secs, err := strconv.Atoi(v)
-	if err != nil || secs <= 0 {
-		return 0
+	if secs, err := strconv.Atoi(v); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		return time.Duration(secs) * time.Second
 	}
-	return time.Duration(secs) * time.Second
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
 }

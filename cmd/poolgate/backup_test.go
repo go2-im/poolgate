@@ -74,6 +74,29 @@ func TestBackupRestoreRoundTrip(t *testing.T) {
 	}
 }
 
+// TestBackupRefusesToMintKeyWhenMissing asserts that backup errors (rather than
+// minting a fresh key and producing an unrestorable bundle) when the keyfile is
+// absent for a data dir that was never initialized.
+func TestBackupRefusesToMintKeyWhenMissing(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	t.Setenv(envDataDir, dir)
+	t.Setenv(envBackupPassphrase, "pw-123456")
+	bundle := filepath.Join(t.TempDir(), "b.pgbak")
+
+	err := run(ctx, []string{"backup", "--out", bundle}, io.Discard, io.Discard)
+	if err == nil {
+		t.Fatal("backup on an uninitialized data dir should error, not mint a key")
+	}
+	// No stray master.key should have been created as a side effect.
+	if _, statErr := os.Stat(filepath.Join(dir, "master.key")); statErr == nil {
+		t.Fatal("backup created a stray master.key on a data dir with no database")
+	}
+	if _, statErr := os.Stat(bundle); statErr == nil {
+		t.Fatal("backup wrote a bundle despite failing")
+	}
+}
+
 // TestRestoreRefusesOverwrite asserts restore won't clobber an existing install
 // without --force, and succeeds with it.
 func TestRestoreRefusesOverwrite(t *testing.T) {
@@ -99,11 +122,56 @@ func TestRestoreRefusesOverwrite(t *testing.T) {
 	}
 }
 
+// TestRestoreEnvSourceRefusesKeyMismatch asserts that restoring an env-source
+// bundle into an environment whose POOLGATE_MASTER_KEY differs from the bundle's
+// key is refused up front (rather than "succeeding" and failing at next serve).
+func TestRestoreEnvSourceRefusesKeyMismatch(t *testing.T) {
+	ctx := context.Background()
+	envConfig := []byte("master_key_source: env\n")
+
+	k1 := make([]byte, 32)
+	for i := range k1 {
+		k1[i] = byte(i + 1)
+	}
+	t.Setenv(envMasterKey, base64.StdEncoding.EncodeToString(k1))
+
+	dirA := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dirA, configFile), envConfig, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv(envDataDir, dirA)
+	if err := run(ctx, []string{"init"}, io.Discard, io.Discard); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := run(ctx, []string{"import", writeAuthJSON(t)}, io.Discard, io.Discard); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	t.Setenv(envBackupPassphrase, "mismatch-pass")
+	bundle := filepath.Join(t.TempDir(), "m.pgbak")
+	if err := run(ctx, []string{"backup", "--out", bundle}, io.Discard, io.Discard); err != nil {
+		t.Fatalf("backup: %v", err)
+	}
+
+	// Restore into a fresh env-source dir but with a DIFFERENT env key.
+	k2 := make([]byte, 32)
+	for i := range k2 {
+		k2[i] = byte(200 - i)
+	}
+	t.Setenv(envMasterKey, base64.StdEncoding.EncodeToString(k2))
+	dirB := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dirB, configFile), envConfig, 0o600); err != nil {
+		t.Fatalf("write config B: %v", err)
+	}
+	t.Setenv(envDataDir, dirB)
+	if err := run(ctx, []string{"restore", bundle}, io.Discard, io.Discard); err == nil {
+		t.Fatal("restore should refuse when the env key does not match the bundle key")
+	}
+}
+
 // TestRestoreEnvSourceSkipsKeyfile asserts that under master_key_source=env the
 // restore writes the DB but NOT a plaintext master.key (respecting the operator's
 // choice to keep the key off disk), and the restored DB decrypts with the env key.
-func TestRestoreEnvSourceSkipsKeyfile(t *testing.T) {
-	ctx := context.Background()
+func TestRestoreEnvSourceSkipsKeyfile(t *testing.T) {	ctx := context.Background()
 
 	// A stable 32-byte master key supplied via the environment.
 	rawKey := make([]byte, 32)

@@ -438,7 +438,7 @@ func TestBuildViewHeadroomDefaults(t *testing.T) {
 	ctx := context.Background()
 	a := seedAccount(t, st, "a", "tok-a", "id-a")
 	b := seedAccount(t, st, "b", "tok-b", "id-b")
-	// Snapshot only for a; b has none -> defaults to 100.
+	// Snapshot only for a; b has none -> unknown headroom (ranked below any known).
 	if _, err := st.SaveUsageSnapshot(ctx, model.UsageSnapshot{
 		AccountID: a.ID, Windows: []model.UsageWindow{{Name: "primary", UsedPercent: 75}},
 	}); err != nil {
@@ -450,8 +450,13 @@ func TestBuildViewHeadroomDefaults(t *testing.T) {
 	if got := v.Headroom(a.ID); got != 25 {
 		t.Errorf("Headroom(a) = %v, want 25", got)
 	}
-	if got := v.Headroom(b.ID); got != 100 {
-		t.Errorf("Headroom(b) = %v, want 100 (no snapshot)", got)
+	if got := v.Headroom(b.ID); got != unknownHeadroom {
+		t.Errorf("Headroom(b) = %v, want %v (no snapshot => unknown)", got, unknownHeadroom)
+	}
+	// Unknown headroom must rank below any known value so an unprobed account
+	// never outranks trusted data.
+	if !(v.Headroom(b.ID) < v.Headroom(a.ID)) {
+		t.Errorf("unknown headroom %v should rank below known %v", v.Headroom(b.ID), v.Headroom(a.ID))
 	}
 	if !v.IsHealthy(a.ID) {
 		t.Errorf("a should be healthy")

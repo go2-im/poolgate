@@ -31,6 +31,7 @@ const DefaultClientID = "app_EMoamEEZ73f0CkXaXp7hrann"
 // TokenStore is the persistence surface oauth needs: atomic rotation write.
 // *store.Store satisfies it.
 type TokenStore interface {
+	GetAccount(ctx context.Context, id string) (model.Account, error)
 	UpdateTokens(ctx context.Context, id, accessToken, refreshToken string) error
 }
 
@@ -95,6 +96,20 @@ func (r *Refresher) RefreshAccount(ctx context.Context, acct model.Account) (mod
 }
 
 func (r *Refresher) refresh(ctx context.Context, acct model.Account) (model.Account, error) {
+	// Re-read the authoritative tokens before refreshing. A staggered caller may
+	// hold a stale account snapshot whose refresh_token was ALREADY rotated (and
+	// possibly single-use-invalidated) by an earlier refresh. Reusing that
+	// consumed refresh_token can trip the issuer's refresh-token reuse detection
+	// and revoke the entire token family — bricking the account. If the stored
+	// tokens have moved on since the caller's snapshot, adopt them instead of
+	// refreshing again; otherwise refresh using the authoritative refresh_token.
+	if cur, err := r.store.GetAccount(ctx, acct.ID); err == nil {
+		if cur.AccessToken != acct.AccessToken || cur.RefreshToken != acct.RefreshToken {
+			return cur, nil
+		}
+		acct = cur
+	}
+
 	if acct.RefreshToken == "" {
 		return acct, fmt.Errorf("oauth: account %q has no refresh token", acct.ID)
 	}
@@ -172,7 +187,7 @@ type sfCall struct {
 	err  error
 }
 
-func (g *singleflight) Do(key string, fn func() (model.Account, error)) (model.Account, error) {
+func (g *singleflight) Do(key string, fn func() (model.Account, error)) (acct model.Account, err error) {
 	g.mu.Lock()
 	if g.m == nil {
 		g.m = make(map[string]*sfCall)
@@ -187,11 +202,22 @@ func (g *singleflight) Do(key string, fn func() (model.Account, error)) (model.A
 	g.m[key] = c
 	g.mu.Unlock()
 
+	// Clean up and release waiters even if fn panics. Without this, a panic in fn
+	// would skip both the delete and wg.Done(), leaving the sfCall wedged in the
+	// map with its WaitGroup permanently at 1 — every current and future caller
+	// for this key would then block forever on c.wg.Wait(). A panic is converted
+	// to an error (surfaced to the leader via the named returns and to waiters via
+	// c.err) so the refresh path never crashes the whole process.
+	defer func() {
+		if rec := recover(); rec != nil && c.err == nil {
+			c.err = fmt.Errorf("oauth: refresh panicked: %v", rec)
+		}
+		g.mu.Lock()
+		delete(g.m, key)
+		g.mu.Unlock()
+		acct, err = c.acct, c.err
+		c.wg.Done()
+	}()
 	c.acct, c.err = fn()
-	c.wg.Done()
-
-	g.mu.Lock()
-	delete(g.m, key)
-	g.mu.Unlock()
 	return c.acct, c.err
 }

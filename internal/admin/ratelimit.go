@@ -110,7 +110,7 @@ func (l *limiter) Reset(key string) {
 // locked-out key is refused up front with 429 + Retry-After.
 func (s *Server) brute(route string, h func(w http.ResponseWriter, r *http.Request, at *attempt)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		key := route + "|" + clientIP(r)
+		key := route + "|" + s.clientIP(r)
 		if !s.limiter.Allow(key) {
 			w.Header().Set("Retry-After", "900")
 			writeErr(w, http.StatusTooManyRequests, errRateLimited, "too many attempts; try again later")

@@ -253,6 +253,31 @@ func TestNotifyChannelPatchPreservesSecretWhenConfigOmitted(t *testing.T) {
 	}
 }
 
+func TestNotifyChannelPatchPreservesSecretWhenConfigHasEmptySecret(t *testing.T) {
+	h := newHarness(t)
+	id := seedChannel(t, h) // seeded URL + Secret "S"
+
+	// PATCH a config object that changes the URL but omits the (write-only) secret.
+	// The stored secret must be preserved, not wiped.
+	cookie, csrf := h.authed()
+	rec := h.do(http.MethodPatch, "/admin/api/notify/channels/"+id, map[string]any{
+		"config": map[string]any{"url": "https://oapi.dingtalk.com/robot/send?access_token=NEW"},
+	}, func(r *http.Request) {
+		r.AddCookie(cookie)
+		r.Header.Set(CSRFHeaderName, csrf)
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("patch = %d, want 200 (%s)", rec.Code, rec.Body.String())
+	}
+	got := h.store.channels[id]
+	if got.Config.URL != "https://oapi.dingtalk.com/robot/send?access_token=NEW" {
+		t.Errorf("URL not updated: %q", got.Config.URL)
+	}
+	if got.Config.Secret != "S" {
+		t.Errorf("secret wiped by config PATCH: got %q, want preserved \"S\"", got.Config.Secret)
+	}
+}
+
 // seedChannel stores a channel directly and returns its id.
 func seedChannel(t *testing.T, h *harness) string {
 	t.Helper()

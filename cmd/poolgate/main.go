@@ -32,6 +32,7 @@ import (
 	"github.com/go2-im/poolgate/internal/admin"
 	"github.com/go2-im/poolgate/internal/adminauth"
 	"github.com/go2-im/poolgate/internal/authimport"
+	"github.com/go2-im/poolgate/internal/clientip"
 	"github.com/go2-im/poolgate/internal/config"
 	"github.com/go2-im/poolgate/internal/crypto"
 	"github.com/go2-im/poolgate/internal/gateway"
@@ -86,6 +87,8 @@ const (
 	envProxyPort = "POOLGATE_PROXY_PORT"
 	// envProxyTransport overrides server.transport (both|http-only|ws-only).
 	envProxyTransport = "POOLGATE_PROXY_TRANSPORT"
+	// envTrustedProxies overrides server.trusted_proxies (comma-separated IPs/CIDRs).
+	envTrustedProxies = "POOLGATE_TRUSTED_PROXIES"
 	// envBackupPassphrase supplies the passphrase for `backup`/`restore` when
 	// --passphrase-file is not given. It is never written to logs.
 	envBackupPassphrase = "POOLGATE_BACKUP_PASSPHRASE"
@@ -179,9 +182,9 @@ func usage(w io.Writer) {
 usage:
   poolgate init                 initialize data dir, master key, and DB
   poolgate import <auth.json>   import a Codex account (explicit, never automatic)
-                                [--strategy fallback|best-quota|load-balance]
+                                [--strategy fallback|best-quota|load-balance|weighted]
   poolgate login                sign in via browser (OAuth + PKCE) to add an account
-                                [--strategy fallback|best-quota|load-balance]
+                                [--strategy fallback|best-quota|load-balance|weighted]
   poolgate serve                start the proxy + admin listeners + health scheduler
   poolgate admin reset-auth     wipe all passkeys/recovery codes/sessions and
                                 print a fresh single-use bootstrap token
@@ -197,6 +200,10 @@ usage:
 environment:
   POOLGATE_DATA_DIR   override the data directory (default: `+config.DefaultDataDir+`)
   POOLGATE_MASTER_KEY base64 master key (when master_key_source=env)
+  POOLGATE_PROXY_HOST / POOLGATE_PROXY_PORT   override the proxy listener bind
+  POOLGATE_PROXY_TRANSPORT   both|http-only|ws-only (default both)
+  POOLGATE_TRUSTED_PROXIES   comma-separated reverse-proxy IPs/CIDRs whose
+                             X-Forwarded-For is trusted (default: none)
   POOLGATE_BACKUP_PASSPHRASE  passphrase for backup/restore (or --passphrase-file)
 
   Any secret env var also accepts a "<NAME>_FILE" variant (Docker/K8s secrets):
@@ -235,12 +242,29 @@ func loadConfig() (model.Config, error) {
 		cfg.Server.Proxy.Host = v
 	}
 	if v := strings.TrimSpace(os.Getenv(envProxyPort)); v != "" {
-		if p, err := strconv.Atoi(v); err == nil && p > 0 && p <= 65535 {
-			cfg.Server.Proxy.Port = p
+		p, perr := strconv.Atoi(v)
+		if perr != nil || p <= 0 || p > 65535 {
+			return model.Config{}, fmt.Errorf("%s must be a port in 1..65535, got %q", envProxyPort, v)
 		}
+		cfg.Server.Proxy.Port = p
 	}
 	if v := strings.TrimSpace(os.Getenv(envProxyTransport)); v != "" {
 		cfg.Server.Transport = v
+	}
+	if v := strings.TrimSpace(os.Getenv(envTrustedProxies)); v != "" {
+		parts := strings.Split(v, ",")
+		out := make([]string, 0, len(parts))
+		for _, p := range parts {
+			if p = strings.TrimSpace(p); p != "" {
+				out = append(out, p)
+			}
+		}
+		cfg.Server.TrustedProxies = out
+	}
+	// Validate trusted-proxy specs early so a typo fails fast at startup rather
+	// than silently disabling forwarded-header handling later.
+	if _, err := clientip.ParseCIDRs(cfg.Server.TrustedProxies); err != nil {
+		return model.Config{}, err
 	}
 	return cfg, nil
 }
@@ -278,6 +302,26 @@ func loadMasterKey(cfg model.Config) ([]byte, error) {
 		return crypto.ParseKey(v)
 	default: // keyfile (keychain is a later phase)
 		return crypto.LoadOrCreateKeyfile(filepath.Join(cfg.DataDir, masterKeyFile))
+	}
+}
+
+// loadMasterKeyExisting loads the master key but NEVER creates one. Read-only /
+// DR commands (backup) use it: minting a fresh key when the keyfile is missing
+// would embed a random key in the bundle that cannot decrypt the snapshotted
+// database, producing an unrestorable bundle that still reports success.
+func loadMasterKeyExisting(cfg model.Config) ([]byte, error) {
+	switch cfg.MasterKeySource {
+	case "env":
+		v, err := envValue(envMasterKey)
+		if err != nil {
+			return nil, err
+		}
+		if v == "" {
+			return nil, fmt.Errorf("crypto: %s (or %s_FILE) is empty", envMasterKey, envMasterKey)
+		}
+		return crypto.ParseKey(v)
+	default:
+		return crypto.LoadKeyfile(filepath.Join(cfg.DataDir, masterKeyFile))
 	}
 }
 
@@ -484,7 +528,7 @@ func parseImportArgs(args []string) (path string, strategy model.Strategy, err e
 		switch {
 		case a == "--strategy" || a == "-strategy":
 			if i+1 >= len(args) {
-				return "", "", errors.New("usage: poolgate import <auth.json> [--strategy fallback|best-quota|load-balance]")
+				return "", "", errors.New("usage: poolgate import <auth.json> [--strategy fallback|best-quota|load-balance|weighted]")
 			}
 			strategy = model.Strategy(args[i+1])
 			i++
@@ -499,10 +543,10 @@ func parseImportArgs(args []string) (path string, strategy model.Strategy, err e
 		}
 	}
 	if path == "" {
-		return "", "", errors.New("usage: poolgate import <auth.json> [--strategy fallback|best-quota|load-balance]")
+		return "", "", errors.New("usage: poolgate import <auth.json> [--strategy fallback|best-quota|load-balance|weighted]")
 	}
 	if !validStrategy(strategy) {
-		return "", "", fmt.Errorf("invalid --strategy %q (want fallback, best-quota, or load-balance)", strategy)
+		return "", "", fmt.Errorf("invalid --strategy %q (want fallback, best-quota, load-balance, or weighted)", strategy)
 	}
 	return path, strategy, nil
 }
@@ -585,8 +629,11 @@ func cmdServe(ctx context.Context, _ []string, stdout io.Writer) error {
 	refresher := oauth.NewRefresher(st, cfg.Issuer)
 	engine := newHealthEngine(st, refresher, cfg.HealthProbeMode, logger, notifier)
 
+	// trusted_proxies were validated in loadConfig; parse is infallible here.
+	trusted, _ := clientip.ParseCIDRs(cfg.Server.TrustedProxies)
 	gw := gateway.New(st, cfg, gateway.WithLogger(logger), gateway.WithHealth(engine),
-		gateway.WithEventSink(notifier), gateway.WithRecorder(mon))
+		gateway.WithEventSink(notifier), gateway.WithRecorder(mon),
+		gateway.WithTrustedProxies(trusted))
 
 	// Admin API handler (loopback listener), wired with the same store so the
 	// bootstrap token issued by `init` / `admin reset-auth` registers the first
@@ -681,6 +728,10 @@ func buildAdminHandler(cfg model.Config, st *store.Store, logger *slog.Logger, n
 	opts := []admin.Option{admin.WithNotifier(notifier), admin.WithMonitor(mon), admin.WithLogger(logger)}
 	if skew != nil {
 		opts = append(opts, admin.WithClockSkew(skew))
+	}
+	// trusted_proxies were validated in loadConfig; parse is infallible here.
+	if trusted, _ := clientip.ParseCIDRs(cfg.Server.TrustedProxies); len(trusted) > 0 {
+		opts = append(opts, admin.WithTrustedProxies(trusted))
 	}
 	// Mount the embedded admin SPA when a bundle is present; otherwise run API-only.
 	if spa, serr := webui.Handler(); serr == nil {

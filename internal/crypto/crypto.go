@@ -106,6 +106,28 @@ func ParseKey(s string) ([]byte, error) {
 	return key, nil
 }
 
+// LoadKeyfile reads a base64 std-encoded master key from path WITHOUT creating
+// one when it is absent. Read-only / DR commands (e.g. backup) use this so a
+// missing keyfile is a hard error rather than silently minting a fresh key that
+// cannot decrypt the existing database.
+func LoadKeyfile(path string) ([]byte, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("crypto: keyfile %q does not exist", path)
+		}
+		return nil, fmt.Errorf("crypto: read keyfile %q: %w", path, err)
+	}
+	key, derr := base64.StdEncoding.DecodeString(string(trimSpace(data)))
+	if derr != nil {
+		return nil, fmt.Errorf("crypto: decode keyfile %q: %w", path, derr)
+	}
+	if len(key) != KeySize {
+		return nil, ErrKeySize
+	}
+	return key, nil
+}
+
 // LoadOrCreateKeyfile reads a base64 std-encoded master key from path. If the
 // file does not exist, a fresh random key is generated and written 0600
 // (creating parent dirs as needed), then returned.
@@ -133,14 +155,45 @@ func generateKeyfile(path string) ([]byte, error) {
 	if _, err := io.ReadFull(rand.Reader, key); err != nil {
 		return nil, fmt.Errorf("crypto: generate key: %w", err)
 	}
-	if dir := filepath.Dir(path); dir != "" {
+	dir := filepath.Dir(path)
+	if dir != "" {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, fmt.Errorf("crypto: mkdir for keyfile: %w", err)
 		}
 	}
-	enc := base64.StdEncoding.EncodeToString(key)
-	if err := os.WriteFile(path, []byte(enc+"\n"), 0o600); err != nil {
-		return nil, fmt.Errorf("crypto: write keyfile %q: %w", path, err)
+	// Write atomically and durably: a fresh master key that is lost to a crash
+	// before the page reaches disk would render every field-encrypted secret
+	// permanently unrecoverable. Stage to a temp file, fsync it, rename into
+	// place, then fsync the directory (mirrors rekey/backup key writes).
+	enc := base64.StdEncoding.EncodeToString(key) + "\n"
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("crypto: create keyfile temp: %w", err)
+	}
+	if _, err := f.Write([]byte(enc)); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return nil, fmt.Errorf("crypto: write keyfile temp: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return nil, fmt.Errorf("crypto: fsync keyfile temp: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return nil, fmt.Errorf("crypto: close keyfile temp: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return nil, fmt.Errorf("crypto: commit keyfile %q: %w", path, err)
+	}
+	if dir != "" {
+		if d, derr := os.Open(dir); derr == nil {
+			_ = d.Sync()
+			_ = d.Close()
+		}
 	}
 	return key, nil
 }
