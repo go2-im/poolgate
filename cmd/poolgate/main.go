@@ -157,6 +157,11 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 			fmt.Fprintf(stderr, "poolgate %s: %v\n", cmd, err)
 			return err
 		}
+	case "rotate-key":
+		if err := cmdRotateKey(rest, stdout); err != nil {
+			fmt.Fprintf(stderr, "poolgate %s: %v\n", cmd, err)
+			return err
+		}
 	case "-h", "--help", "help":
 		usage(stderr)
 		return nil
@@ -185,6 +190,8 @@ usage:
                                 [--passphrase-file <path>]
   poolgate restore <bundle>     restore a bundle into the data dir
                                 [--passphrase-file <path>] [--force]
+  poolgate rotate-key           generate a new master key and re-encrypt all
+                                secrets (writes a pre-rotation snapshot first)
   poolgate version              print version, commit, and build date
 
 environment:

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -267,4 +268,58 @@ func TestEmitBindWarnings(t *testing.T) {
 
 	// Nil sink is a no-op (no panic).
 	emitBindWarnings(cfg, nil)
+}
+
+func TestCmdRotateKeyKeyfile(t *testing.T) {
+	t.Setenv(envDataDir, t.TempDir())
+	t.Setenv(envMasterKey, "")
+	if err := cmdInit(nil, io.Discard); err != nil {
+		t.Fatalf("cmdInit: %v", err)
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	ctx := context.Background()
+
+	// Insert an account under the original key.
+	st, err := openStore(cfg)
+	if err != nil {
+		t.Fatalf("openStore: %v", err)
+	}
+	acct, err := st.InsertAccount(ctx, model.Account{
+		AccessToken: "tok-access", RefreshToken: "tok-refresh", AccountID: "acc-1", State: model.StateOK,
+	})
+	if err != nil {
+		t.Fatalf("InsertAccount: %v", err)
+	}
+	_ = st.Close()
+
+	var out bytes.Buffer
+	if err := cmdRotateKey(nil, &out); err != nil {
+		t.Fatalf("cmdRotateKey: %v", err)
+	}
+	if !strings.Contains(out.String(), "rotated") {
+		t.Errorf("output missing success line: %s", out.String())
+	}
+
+	// A pre-rotation snapshot must exist.
+	snaps, _ := filepath.Glob(filepath.Join(cfg.DataDir, "poolgate-pre-rotate-*.db"))
+	if len(snaps) != 1 {
+		t.Errorf("pre-rotation snapshots = %d, want 1", len(snaps))
+	}
+
+	// Reopen: the new keyfile must decrypt the account tokens.
+	st2, err := openStore(cfg)
+	if err != nil {
+		t.Fatalf("openStore after rotate: %v", err)
+	}
+	defer st2.Close()
+	got, err := st2.GetAccount(ctx, acct.ID)
+	if err != nil {
+		t.Fatalf("GetAccount after rotate: %v", err)
+	}
+	if got.AccessToken != "tok-access" || got.RefreshToken != "tok-refresh" {
+		t.Errorf("tokens after rotate = %q/%q, want originals", got.AccessToken, got.RefreshToken)
+	}
 }
