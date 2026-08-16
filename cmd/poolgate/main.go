@@ -36,6 +36,7 @@ import (
 	"github.com/go2-im/poolgate/internal/crypto"
 	"github.com/go2-im/poolgate/internal/gateway"
 	"github.com/go2-im/poolgate/internal/health"
+	"github.com/go2-im/poolgate/internal/lock"
 	"github.com/go2-im/poolgate/internal/model"
 	"github.com/go2-im/poolgate/internal/monitor"
 	"github.com/go2-im/poolgate/internal/notify"
@@ -67,6 +68,8 @@ const (
 
 	// masterKeyFile is the keyfile name under the data dir (keyfile source).
 	masterKeyFile = "master.key"
+	// lockFile is the single-instance advisory lockfile under the data dir.
+	lockFile = "poolgate.lock"
 	// configFile is the YAML config name under the data dir.
 	configFile = "config.yaml"
 	// envMasterKey is the env var read when master_key_source=env.
@@ -467,6 +470,25 @@ func cmdServe(ctx context.Context, _ []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
+
+	// Single-instance guard (DESIGN.md §21): acquire BEFORE opening the store, so
+	// the lock also gates store open + migrations — two servers starting against
+	// the same data dir would otherwise race the migration runner on the shared
+	// SQLite WAL. Acquire only needs the data dir to exist. The lock is held for
+	// the process lifetime and released on exit (or by the kernel on a crash, so
+	// it is never left stale).
+	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
+		return fmt.Errorf("create data dir: %w", err)
+	}
+	lk, err := lock.Acquire(filepath.Join(cfg.DataDir, lockFile))
+	if err != nil {
+		if errors.Is(err, lock.ErrLocked) {
+			return fmt.Errorf("another poolgate serve is already running for data dir %s", cfg.DataDir)
+		}
+		return fmt.Errorf("acquire single-instance lock: %w", err)
+	}
+	defer lk.Release()
+
 	st, err := openStore(cfg)
 	if err != nil {
 		return err
@@ -589,7 +611,11 @@ func serveBoth(ctx context.Context, cfg model.Config, gw *gateway.Gateway, admin
 // once the listener is open (used by tests to discover the ephemeral port).
 func serveGateway(ctx context.Context, cfg model.Config, gw *gateway.Gateway, logger *slog.Logger, onReady func(addr string)) error {
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Proxy.Host, cfg.Server.Proxy.Port)
-	return serveListener(ctx, addr, gw.Routes(), func(bound string) {
+	// drainStreams=false: proxy relays are FINITE responses whose upstream request
+	// is bound to r.Context(); cancelling them at shutdown would truncate a
+	// response (losing the terminal usage event) that would otherwise complete
+	// within the Shutdown grace. So the proxy relies on Shutdown's timed drain.
+	return serveListener(ctx, addr, gw.Routes(), false, func(bound string) {
 		logger.Info("proxy listening", slog.String("addr", bound))
 		if cfg.Server.Proxy.Host != "127.0.0.1" && cfg.Server.Proxy.Host != "localhost" {
 			logger.Info("proxy bound to a non-loopback address; front it with a reverse proxy",
@@ -606,7 +632,11 @@ func serveGateway(ctx context.Context, cfg model.Config, gw *gateway.Gateway, lo
 // non-loopback bind is a warning, not a refusal.
 func serveAdmin(ctx context.Context, cfg model.Config, handler http.Handler, logger *slog.Logger, onReady func(addr string)) error {
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Admin.Host, cfg.Server.Admin.Port)
-	return serveListener(ctx, addr, handler, func(bound string) {
+	// drainStreams=true: the monitor SSE feed is an INFINITE stream that never ends
+	// on its own, so cancelling its request context is the only way to drain it
+	// without waiting out the Shutdown deadline. Normal admin handlers finish their
+	// Write regardless of the context, so this only affects the SSE feed.
+	return serveListener(ctx, addr, handler, true, func(bound string) {
 		logger.Info("admin listening (loopback)", slog.String("addr", bound))
 		if cfg.Server.Admin.Host != "127.0.0.1" && cfg.Server.Admin.Host != "localhost" {
 			logger.Warn("admin bound to a non-loopback address; keep the admin surface private",
@@ -621,23 +651,42 @@ func serveAdmin(ctx context.Context, cfg model.Config, handler http.Handler, log
 // serveListener binds addr and serves handler with a bounded read-header timeout
 // (no write timeout — SSE streams are long-lived), invoking onReady with the
 // bound address once the socket is open, and shutting the server down gracefully
-// (5s drain deadline) when ctx is cancelled.
-func serveListener(ctx context.Context, addr string, handler http.Handler, onReady func(bound string)) error {
+// (5s drain deadline) when ctx is cancelled. When drainStreams is true, every
+// request context is cancelled at the start of shutdown so infinite streaming
+// handlers (the monitor SSE feed) drain promptly instead of waiting out the
+// deadline; when false, in-flight requests keep running until they finish or the
+// deadline elapses (used by the proxy so finite relays complete intact).
+func serveListener(ctx context.Context, addr string, handler http.Handler, drainStreams bool, onReady func(bound string)) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
+	// When draining streams, every request gets a context derived from baseCtx;
+	// cancelling baseCtx at shutdown unblocks handlers that select on r.Context()
+	// (the monitor SSE feed). Short handlers mid-Write are unaffected (Write does
+	// not consult the context). When not draining, leave BaseContext at its
+	// default so Shutdown's timed grace applies to in-flight requests.
+	baseCtx, baseCancel := context.WithCancel(context.Background())
+	defer baseCancel()
 	srv := &http.Server{
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
+	}
+	if drainStreams {
+		srv.BaseContext = func(net.Listener) context.Context { return baseCtx }
 	}
 	if onReady != nil {
 		onReady(ln.Addr().String())
 	}
 
-	// Graceful shutdown on context cancellation.
+	// Graceful shutdown on context cancellation. For a draining listener, signal
+	// streaming handlers to finish (cancel their request contexts) first; then
+	// Shutdown with a bounded deadline as the backstop.
 	go func() {
 		<-ctx.Done()
+		if drainStreams {
+			baseCancel()
+		}
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
