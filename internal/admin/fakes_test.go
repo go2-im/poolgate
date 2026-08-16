@@ -3,6 +3,7 @@ package admin
 import (
 	"context"
 	"errors"
+	"strconv"
 	"sync"
 
 	"github.com/go-webauthn/webauthn/protocol"
@@ -191,6 +192,7 @@ type fakeStore struct {
 	checks   map[string][]model.HealthCheck
 	channels map[string]model.NotifyChannel
 	reqLogs  []model.RequestLog
+	audit    []model.AuditEntry
 	seq      int
 	failList bool // force list operations to error
 }
@@ -308,6 +310,44 @@ func (f *fakeStore) RotateApiKey(_ context.Context, id, newKey string) (model.Ap
 	k.Key = newKey
 	f.keys[id] = k
 	return k, nil
+}
+
+func (f *fakeStore) InsertAuditEntry(_ context.Context, e model.AuditEntry) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if e.ID == "" {
+		f.seq++
+		e.ID = "audit_" + strconv.Itoa(f.seq)
+	}
+	f.audit = append(f.audit, e)
+	return nil
+}
+
+func (f *fakeStore) ListAuditEntries(_ context.Context, limit, offset int) ([]model.AuditEntry, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failList {
+		return nil, errors.New("list failed")
+	}
+	// newest-first
+	rev := make([]model.AuditEntry, 0, len(f.audit))
+	for i := len(f.audit) - 1; i >= 0; i-- {
+		rev = append(rev, f.audit[i])
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= len(rev) {
+		return []model.AuditEntry{}, nil
+	}
+	end := offset + limit
+	if end > len(rev) {
+		end = len(rev)
+	}
+	return rev[offset:end], nil
 }
 
 func (f *fakeStore) InsertEndpoint(_ context.Context, e model.Endpoint) (model.Endpoint, error) {

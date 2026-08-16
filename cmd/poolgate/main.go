@@ -595,7 +595,7 @@ func buildAdminHandler(cfg model.Config, st *store.Store, logger *slog.Logger, n
 	if err != nil {
 		return nil, fmt.Errorf("webauthn: %w", err)
 	}
-	opts := []admin.Option{admin.WithNotifier(notifier), admin.WithMonitor(mon)}
+	opts := []admin.Option{admin.WithNotifier(notifier), admin.WithMonitor(mon), admin.WithLogger(logger)}
 	// Mount the embedded admin SPA when a bundle is present; otherwise run API-only.
 	if spa, serr := webui.Handler(); serr == nil {
 		opts = append(opts, admin.WithSPA(spa))

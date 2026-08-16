@@ -159,6 +159,7 @@ func (s *Server) handleNotifyChannelCreate(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	writeJSON(w, http.StatusCreated, toNotifyChannelView(created))
+	s.audit(r.Context(), "notify.channel_create", created.ID, "type="+string(created.Type))
 }
 
 // handleNotifyChannelPatch updates a channel's mutable attributes and/or config.
@@ -203,15 +204,18 @@ func (s *Server) handleNotifyChannelPatch(w http.ResponseWriter, r *http.Request
 		s.writeStoreErr(w, err, "notify channel")
 		return
 	}
+	s.audit(r.Context(), "notify.channel_update", ch.ID, "")
 	writeJSON(w, http.StatusOK, toNotifyChannelView(ch))
 }
 
 // handleNotifyChannelDelete removes one channel by id.
 func (s *Server) handleNotifyChannelDelete(w http.ResponseWriter, r *http.Request) {
-	if err := s.store.DeleteNotifyChannel(r.Context(), r.PathValue("id")); err != nil {
+	id := r.PathValue("id")
+	if err := s.store.DeleteNotifyChannel(r.Context(), id); err != nil {
 		s.writeStoreErr(w, err, "notify channel")
 		return
 	}
+	s.audit(r.Context(), "notify.channel_delete", id, "")
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
 }
 
