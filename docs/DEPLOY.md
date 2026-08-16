@@ -123,6 +123,12 @@ time out).
 - **Runtime**: the compose service already runs `read_only` rootfs (only the
   `/data` volume and a small `/tmp` tmpfs are writable), `no-new-privileges`, and
   `cap_drop: ALL`. The image is distroless/nonroot (uid 65532) to begin with.
+- **Memory hygiene**: on `serve`, poolgate disables core dumps (so a crash cannot
+  write the decrypted master key to a core file) and attempts to lock its memory
+  against swap. Core-dump disabling always applies; memory locking is bounded by
+  `RLIMIT_MEMLOCK`, so the compose recipe raises the `memlock` ulimit to `-1`
+  (unlimited) to let it succeed without any added capability. Omit that and serve
+  still runs — it just logs `memory hygiene not fully applied` and continues.
 - **Master key via secret (instead of the keyfile in the volume)**: set
   `master_key_source: env` in `config.yaml`, generate a 32-byte key, and feed it
   as a file so it never sits in the process environment — poolgate reads the

@@ -37,6 +37,7 @@ import (
 	"github.com/go2-im/poolgate/internal/gateway"
 	"github.com/go2-im/poolgate/internal/health"
 	"github.com/go2-im/poolgate/internal/lock"
+	"github.com/go2-im/poolgate/internal/memguard"
 	"github.com/go2-im/poolgate/internal/model"
 	"github.com/go2-im/poolgate/internal/monitor"
 	"github.com/go2-im/poolgate/internal/notify"
@@ -517,13 +518,26 @@ func cmdServe(ctx context.Context, _ []string, stdout io.Writer) error {
 	}
 	defer lk.Release()
 
+	logger := slog.New(slog.NewJSONHandler(stdout, nil))
+
+	// Memory hygiene (DESIGN.md §22): disable core dumps and lock memory against
+	// swap BEFORE the master key is loaded into memory, so the key never has a
+	// window where a crash core file or a swapped page could persist it. Both are
+	// best-effort — a warning is logged and serve continues if a mitigation can't
+	// be applied (e.g. memory locking under a tight RLIMIT_MEMLOCK).
+	mg := memguard.Harden()
+	for _, w := range mg.Warnings {
+		logger.Warn("memory hygiene not fully applied", slog.String("detail", w))
+	}
+	logger.Info("memory hygiene applied",
+		slog.Bool("core_dumps_disabled", mg.CoreDumpsDisabled),
+		slog.Bool("memory_locked", mg.MemoryLocked))
+
 	st, err := openStore(cfg)
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-
-	logger := slog.New(slog.NewJSONHandler(stdout, nil))
 
 	// Notification engine (DESIGN.md §11): SSRF-guarded egress, holds channel
 	// secrets server-side, dispatches secret-free events asynchronously so the
