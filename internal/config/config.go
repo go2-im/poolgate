@@ -31,6 +31,10 @@ const (
 	// DefaultIssuer is the OAuth token endpoint, pinned regardless of any `iss`
 	// claim in imported tokens (DESIGN.md §0 D6 / §6).
 	DefaultIssuer = "https://auth.openai.com/oauth/token"
+
+	// DefaultTransport offers both proxy transports (accept the WS upgrade and
+	// serve HTTP+SSE). See model.ServerConfig.Transport (DESIGN.md §0 D2).
+	DefaultTransport = "both"
 )
 
 // DefaultUpstreamAllowlist is the set of hosts poolgate may send
@@ -43,8 +47,9 @@ func DefaultUpstreamAllowlist() []string {
 func Default() model.Config {
 	return model.Config{
 		Server: model.ServerConfig{
-			Admin: model.ListenConfig{Host: DefaultAdminHost, Port: DefaultAdminPort},
-			Proxy: model.ListenConfig{Host: DefaultProxyHost, Port: DefaultProxyPort},
+			Admin:     model.ListenConfig{Host: DefaultAdminHost, Port: DefaultAdminPort},
+			Proxy:     model.ListenConfig{Host: DefaultProxyHost, Port: DefaultProxyPort},
+			Transport: DefaultTransport,
 		},
 		DataDir:           DefaultDataDir,
 		MasterKeySource:   DefaultMasterKeySource,
@@ -104,5 +109,8 @@ func applyDefaults(cfg *model.Config) {
 	}
 	if cfg.HealthProbeMode == "" {
 		cfg.HealthProbeMode = DefaultHealthProbeMode
+	}
+	if cfg.Server.Transport == "" {
+		cfg.Server.Transport = DefaultTransport
 	}
 }

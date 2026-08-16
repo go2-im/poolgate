@@ -55,7 +55,27 @@ const (
 	// DefaultWSOpenAIBeta is synthesized when the client omits OpenAI-Beta on a WS
 	// upgrade (verified against openai/codex: responses_websockets=<date>).
 	DefaultWSOpenAIBeta = "responses_websockets=2026-02-06"
+
+	// Transport modes (model.ServerConfig.Transport, DESIGN.md §0 D2). TransportBoth
+	// accepts the WS upgrade and serves HTTP+SSE; TransportHTTPOnly refuses the WS
+	// upgrade (Codex falls back to HTTP); TransportWSOnly refuses plain HTTP POST.
+	TransportBoth     = "both"
+	TransportHTTPOnly = "http-only"
+	TransportWSOnly   = "ws-only"
 )
+
+// normalizeTransport maps a config value to a known mode, defaulting unknown/empty
+// to TransportBoth (lenient — an unrecognized value never disables the proxy).
+func normalizeTransport(v string) string {
+	switch v {
+	case TransportHTTPOnly:
+		return TransportHTTPOnly
+	case TransportWSOnly:
+		return TransportWSOnly
+	default:
+		return TransportBoth
+	}
+}
 
 // wsAffinity is a small TTL map pinning an x-codex-turn-state token to an account
 // id across reconnects. It is safe for concurrent use.
@@ -127,6 +147,12 @@ func (g *Gateway) handleResponsesWS(w http.ResponseWriter, r *http.Request) {
 	if !isWebSocketUpgrade(r) {
 		writeError(w, http.StatusBadRequest, "poolgate_bad_request",
 			"bad_request", "GET /responses requires a websocket upgrade; use POST for HTTP+SSE")
+		return
+	}
+	if g.transport == TransportHTTPOnly {
+		// WS disabled by config: refuse the upgrade so Codex falls back to HTTP+SSE.
+		writeError(w, http.StatusNotImplemented, "poolgate_websocket_unsupported",
+			"websocket_unsupported", "websocket transport is disabled; use HTTP POST + SSE")
 		return
 	}
 

@@ -122,6 +122,10 @@ type Gateway struct {
 	// authFail counts invalid inbound-key attempts and drives EventAuthAnomaly
 	// (DESIGN.md §11) when they cross a threshold within a rolling window.
 	authFail *failWindow
+
+	// transport selects which /responses transport(s) are offered (DESIGN.md §0
+	// D2): both | http-only | ws-only. Normalized in New.
+	transport string
 }
 
 // Option customizes a Gateway.
@@ -191,6 +195,7 @@ func New(st *store.Store, cfg model.Config, opts ...Option) *Gateway {
 		inflight:     newInflight(),
 		wsAff:        newWSAffinity(),
 		authFail:     newFailWindow(authAnomalyThreshold, authAnomalyWindow),
+		transport:    normalizeTransport(cfg.Server.Transport),
 		retryAfterSecs: 1,
 		// No client Timeout: SSE streams are long-lived; cancellation rides the
 		// request context instead.
@@ -292,6 +297,11 @@ func (g *Gateway) authorizeInbound(w http.ResponseWriter, r *http.Request) (apiK
 func (g *Gateway) handleResponses(w http.ResponseWriter, r *http.Request) {
 	// WebSocket upgrades are a GET and are served by handleResponsesWS via the
 	// GET route (DESIGN.md §0 D2/D3); this POST path is HTTP+SSE only.
+	if g.transport == TransportWSOnly {
+		writeError(w, http.StatusUpgradeRequired, "poolgate_use_websocket",
+			"use_websocket", "this endpoint is configured ws-only; use the WebSocket transport")
+		return
+	}
 	apiKey, endpoint, group, accounts, ok := g.authorizeInbound(w, r)
 	if !ok {
 		return

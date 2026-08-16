@@ -250,3 +250,83 @@ func TestWS_TurnStateAffinityPinsBackend(t *testing.T) {
 		t.Errorf("round-robin broken: conn3=%s should differ from the pinned account %s", seen[2].accountID, seen[0].accountID)
 	}
 }
+
+func TestNormalizeTransport(t *testing.T) {
+	cases := map[string]string{
+		"both": TransportBoth, "http-only": TransportHTTPOnly, "ws-only": TransportWSOnly,
+		"": TransportBoth, "bogus": TransportBoth,
+	}
+	for in, want := range cases {
+		if got := normalizeTransport(in); got != want {
+			t.Errorf("normalizeTransport(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestTransportHTTPOnlyRefusesWSUpgrade(t *testing.T) {
+	f := newFixture(t)
+	up := newWSUpstream(t, nil)
+	f.cfg.UpstreamAllowlist = []string{mustHost(t, up.srv.URL)}
+	f.cfg.Server.Transport = "http-only"
+	gw := New(f.st, f.cfg, WithUpstreamBase(up.srv.URL), WithHTTPClient(up.srv.Client()))
+	srv := httptest.NewServer(gw.Routes())
+	defer srv.Close()
+
+	// WS upgrade must be refused (501) so Codex falls back to HTTP+SSE.
+	_, resp, err := wsDial(t, srv.URL, "default", f.apiKey, "")
+	if err == nil {
+		t.Fatal("ws dial succeeded under http-only, want refusal")
+	}
+	if resp == nil || resp.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("status = %v, want 501", resp)
+	}
+	if len(up.seen()) != 0 {
+		t.Errorf("upstream contacted despite http-only WS refusal")
+	}
+
+	// POST HTTP path still works (upstream WS server also answers /responses over
+	// plain POST? No — assert the request is at least authorized + routed, i.e. not
+	// a transport refusal). A 200/5xx from the fake WS upstream's non-WS path is
+	// fine; the point is it's NOT a 426.
+	postReq, _ := http.NewRequest(http.MethodPost, srv.URL+"/e/default/v1/responses",
+		strings.NewReader(`{"model":"gpt-5"}`))
+	postReq.Header.Set("Authorization", "Bearer "+f.apiKey)
+	postResp, err := http.DefaultClient.Do(postReq)
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer postResp.Body.Close()
+	if postResp.StatusCode == http.StatusUpgradeRequired {
+		t.Errorf("http-only POST returned 426, want the HTTP path to be served")
+	}
+}
+
+func TestTransportWSOnlyRefusesHTTPPost(t *testing.T) {
+	f := newFixture(t)
+	up := newWSUpstream(t, nil)
+	f.cfg.UpstreamAllowlist = []string{mustHost(t, up.srv.URL)}
+	f.cfg.Server.Transport = "ws-only"
+	gw := New(f.st, f.cfg, WithUpstreamBase(up.srv.URL), WithHTTPClient(up.srv.Client()))
+	srv := httptest.NewServer(gw.Routes())
+	defer srv.Close()
+
+	// Plain HTTP POST must be refused with 426 Upgrade Required.
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/e/default/v1/responses",
+		strings.NewReader(`{"model":"gpt-5"}`))
+	req.Header.Set("Authorization", "Bearer "+f.apiKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUpgradeRequired {
+		t.Fatalf("ws-only POST status = %d, want 426", resp.StatusCode)
+	}
+
+	// WS still works.
+	c, _, err := wsDial(t, srv.URL, "default", f.apiKey, "")
+	if err != nil {
+		t.Fatalf("ws dial under ws-only: %v", err)
+	}
+	c.CloseNow()
+}

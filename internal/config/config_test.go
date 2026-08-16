@@ -15,8 +15,9 @@ func TestDefault(t *testing.T) {
 	cfg := Default()
 	want := model.Config{
 		Server: model.ServerConfig{
-			Admin: model.ListenConfig{Host: DefaultAdminHost, Port: DefaultAdminPort},
-			Proxy: model.ListenConfig{Host: DefaultProxyHost, Port: DefaultProxyPort},
+			Admin:     model.ListenConfig{Host: DefaultAdminHost, Port: DefaultAdminPort},
+			Proxy:     model.ListenConfig{Host: DefaultProxyHost, Port: DefaultProxyPort},
+			Transport: DefaultTransport,
 		},
 		DataDir:           DefaultDataDir,
 		MasterKeySource:   DefaultMasterKeySource,
@@ -115,6 +116,7 @@ func TestLoadFullYAMLOverridesEveryField(t *testing.T) {
 		"  proxy:\n" +
 		"    host: 10.0.0.2\n" +
 		"    port: 2222\n" +
+		"  transport: ws-only\n" +
 		"data_dir: /var/pg\n" +
 		"master_key_source: env\n" +
 		"upstream_allowlist:\n" +
@@ -131,8 +133,9 @@ func TestLoadFullYAMLOverridesEveryField(t *testing.T) {
 	}
 	want := model.Config{
 		Server: model.ServerConfig{
-			Admin: model.ListenConfig{Host: "10.0.0.1", Port: 1111},
-			Proxy: model.ListenConfig{Host: "10.0.0.2", Port: 2222},
+			Admin:     model.ListenConfig{Host: "10.0.0.1", Port: 1111},
+			Proxy:     model.ListenConfig{Host: "10.0.0.2", Port: 2222},
+			Transport: "ws-only",
 		},
 		DataDir:           "/var/pg",
 		MasterKeySource:   "env",

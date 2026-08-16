@@ -272,6 +272,11 @@ type Config struct {
 type ServerConfig struct {
 	Admin ListenConfig `yaml:"admin" json:"admin"`
 	Proxy ListenConfig `yaml:"proxy" json:"proxy"`
+	// Transport selects which proxy transport(s) the /responses surface offers
+	// (DESIGN.md §0 D2): "both" (default — accept the WS upgrade AND serve HTTP+SSE),
+	// "http-only" (refuse the WS upgrade so Codex falls back to HTTP+SSE), or
+	// "ws-only" (require the WS upgrade; refuse plain HTTP POST). Empty = both.
+	Transport string `yaml:"transport" json:"transport"`
 }
 
 // ListenConfig is a host:port bind pair. For the admin listener it also carries
