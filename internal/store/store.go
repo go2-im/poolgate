@@ -294,6 +294,23 @@ ALTER TABLE api_keys ADD COLUMN expires_at   TEXT NOT NULL DEFAULT '';
 ALTER TABLE api_keys ADD COLUMN ip_allowlist TEXT NOT NULL DEFAULT '[]';
 `,
 	},
+	{
+		// v7 — append-only audit log (DESIGN.md §22): one secret-free row per
+		// security-relevant admin/system action. Fixed-width `at` for chronological
+		// TEXT ordering. Append-only: v1–v6 above are never edited.
+		version: 7,
+		sql: `
+CREATE TABLE audit_log (
+	id     TEXT PRIMARY KEY,
+	at     TEXT NOT NULL,
+	actor  TEXT NOT NULL DEFAULT '',
+	action TEXT NOT NULL DEFAULT '',
+	target TEXT NOT NULL DEFAULT '',
+	detail TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX idx_audit_log_at ON audit_log(at);
+`,
+	},
 }
 
 // Migrate applies any migrations whose version is not yet recorded. It is

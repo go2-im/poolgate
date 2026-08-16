@@ -127,6 +127,7 @@ func (s *Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, errInternal, "could not store account")
 		return
 	}
+	s.audit(r.Context(), "account.import", created.ID, "label="+created.Label)
 	writeJSON(w, http.StatusCreated, toAccountView(created))
 }
 
@@ -156,10 +157,12 @@ func (s *Server) handleAccountGet(w http.ResponseWriter, r *http.Request) {
 
 // handleAccountDelete removes one account by id.
 func (s *Server) handleAccountDelete(w http.ResponseWriter, r *http.Request) {
-	if err := s.store.DeleteAccount(r.Context(), r.PathValue("id")); err != nil {
+	id := r.PathValue("id")
+	if err := s.store.DeleteAccount(r.Context(), id); err != nil {
 		s.writeStoreErr(w, err, "account")
 		return
 	}
+	s.audit(r.Context(), "account.delete", id, "")
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
 }
 
@@ -228,6 +231,7 @@ func (s *Server) handleApiKeyCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	view := toApiKeyView(created)
 	view.Key = created.Key // shown once
+	s.audit(r.Context(), "apikey.create", created.ID, "label="+created.Label)
 	writeJSON(w, http.StatusCreated, view)
 }
 
@@ -246,6 +250,7 @@ func (s *Server) handleApiKeyRotate(w http.ResponseWriter, r *http.Request) {
 	}
 	view := toApiKeyView(rotated)
 	view.Key = rotated.Key // shown once
+	s.audit(r.Context(), "apikey.rotate", rotated.ID, "")
 	writeJSON(w, http.StatusOK, view)
 }
 
@@ -283,10 +288,12 @@ func validateIPAllowlist(entries []string) error {
 
 // handleApiKeyDelete removes one inbound key by id.
 func (s *Server) handleApiKeyDelete(w http.ResponseWriter, r *http.Request) {
-	if err := s.store.DeleteApiKey(r.Context(), r.PathValue("id")); err != nil {
+	id := r.PathValue("id")
+	if err := s.store.DeleteApiKey(r.Context(), id); err != nil {
 		s.writeStoreErr(w, err, "api key")
 		return
 	}
+	s.audit(r.Context(), "apikey.delete", id, "")
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
 }
 
@@ -337,15 +344,18 @@ func (s *Server) handleEndpointCreate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, errConflict, "could not create endpoint (name in use or unknown group)")
 		return
 	}
+	s.audit(r.Context(), "endpoint.create", ep.Name, "group="+ep.GroupID)
 	writeJSON(w, http.StatusCreated, ep)
 }
 
 // handleEndpointDelete removes one endpoint by name.
 func (s *Server) handleEndpointDelete(w http.ResponseWriter, r *http.Request) {
-	if err := s.store.DeleteEndpoint(r.Context(), r.PathValue("name")); err != nil {
+	name := r.PathValue("name")
+	if err := s.store.DeleteEndpoint(r.Context(), name); err != nil {
 		s.writeStoreErr(w, err, "endpoint")
 		return
 	}
+	s.audit(r.Context(), "endpoint.delete", name, "")
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
 }
 
@@ -403,6 +413,7 @@ func (s *Server) handlePolicyGroupCreate(w http.ResponseWriter, r *http.Request)
 		writeErr(w, http.StatusConflict, errConflict, "could not create policy group (name in use)")
 		return
 	}
+	s.audit(r.Context(), "policygroup.create", g.ID, "name="+g.Name)
 	writeJSON(w, http.StatusCreated, g)
 }
 
@@ -432,12 +443,14 @@ func (s *Server) handlePolicyGroupPatch(w http.ResponseWriter, r *http.Request) 
 		s.writeStoreErr(w, err, "policy group")
 		return
 	}
+	s.audit(r.Context(), "policygroup.update", g.ID, "")
 	writeJSON(w, http.StatusOK, g)
 }
 
 // handlePolicyGroupDelete removes one policy group by id.
 func (s *Server) handlePolicyGroupDelete(w http.ResponseWriter, r *http.Request) {
-	err := s.store.DeletePolicyGroup(r.Context(), r.PathValue("id"))
+	id := r.PathValue("id")
+	err := s.store.DeletePolicyGroup(r.Context(), id)
 	if errors.Is(err, store.ErrNotFound) {
 		writeErr(w, http.StatusNotFound, errNotFound, "policy group not found")
 		return
@@ -447,6 +460,7 @@ func (s *Server) handlePolicyGroupDelete(w http.ResponseWriter, r *http.Request)
 		writeErr(w, http.StatusConflict, errConflict, "policy group is still bound to an endpoint")
 		return
 	}
+	s.audit(r.Context(), "policygroup.delete", id, "")
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
 }
 

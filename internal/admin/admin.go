@@ -78,6 +78,9 @@ type Store interface {
 	// request logs (real-time monitor, DESIGN.md §15)
 	ListRequestLogs(ctx context.Context, f model.RequestLogFilter, limit, offset int) ([]model.RequestLog, error)
 	CountRequestLogs(ctx context.Context, f model.RequestLogFilter) (store.RequestCounters, error)
+	// audit log (append-only, DESIGN.md §22)
+	InsertAuditEntry(ctx context.Context, e model.AuditEntry) error
+	ListAuditEntries(ctx context.Context, limit, offset int) ([]model.AuditEntry, error)
 }
 
 // Notifier is the optional notification surface used by the channel "send test"
@@ -297,6 +300,8 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /admin/api/monitor/logs", s.guard(s.handleMonitorLogs))
 	mux.HandleFunc("GET /admin/api/monitor/counters", s.guard(s.handleMonitorCounters))
 	mux.HandleFunc("GET /admin/api/monitor/stream", s.guard(s.handleMonitorStream))
+
+	mux.HandleFunc("GET /admin/api/audit", s.guard(s.handleAuditList))
 
 	// Embedded SPA (unauthenticated catch-all): serves the admin UI + assets and
 	// falls back to index.html for client-side routes. Registered last / most

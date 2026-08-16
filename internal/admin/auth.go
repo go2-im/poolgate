@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 
 	"github.com/go2-im/poolgate/internal/adminauth"
 	"github.com/go2-im/poolgate/internal/webauthnsvc"
@@ -96,6 +97,7 @@ func (s *Server) handleRegisterFinish(w http.ResponseWriter, r *http.Request, at
 		}
 		resp["recovery_codes"] = codes
 	}
+	s.audit(r.Context(), "auth.passkey_register", req.Label, "")
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -139,6 +141,7 @@ func (s *Server) handleLoginFinish(w http.ResponseWriter, r *http.Request, at *a
 	}
 	at.succeeded = true
 	s.setSessionCookie(w, sess)
+	s.audit(r.Context(), "auth.login", "", "method=passkey")
 	writeJSON(w, http.StatusOK, map[string]any{"authenticated": true})
 }
 
@@ -171,6 +174,7 @@ func (s *Server) handleLoginRecovery(w http.ResponseWriter, r *http.Request, at 
 	}
 	at.succeeded = true
 	s.setSessionCookie(w, sess)
+	s.audit(r.Context(), "auth.login", "", "method=recovery_code")
 	writeJSON(w, http.StatusOK, map[string]any{"authenticated": true})
 }
 
@@ -194,6 +198,7 @@ func (s *Server) handleRevokeAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.clearSessionCookie(w)
+	s.audit(r.Context(), "auth.revoke_all_sessions", "", "count="+strconv.FormatInt(n, 10))
 	writeJSON(w, http.StatusOK, map[string]any{"revoked": n})
 }
 
