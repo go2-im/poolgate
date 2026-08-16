@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -136,6 +137,7 @@ type Server struct {
 	extOrigin string // configured external_origin (may be empty when synthesized)
 	secure   bool   // set the Secure cookie flag (origin is https)
 	now      func() time.Time
+	logger   *slog.Logger
 	limiter  *limiter
 	recovery int // number of recovery codes minted with the first passkey
 
@@ -197,6 +199,17 @@ func WithMonitor(m MonitorStream) Option {
 	return func(s *Server) { s.monitor = m }
 }
 
+// WithLogger injects the structured logger (default slog.Default()). It is used
+// only for best-effort diagnostics such as a failed audit-log write; it never
+// carries request bodies or secrets.
+func WithLogger(l *slog.Logger) Option {
+	return func(s *Server) {
+		if l != nil {
+			s.logger = l
+		}
+	}
+}
+
 // WithSPA mounts the embedded admin single-page app (DESIGN.md §9 phase 4) as an
 // UNAUTHENTICATED catch-all so the login UI loads before a session exists. When
 // unset, non-API routes 404 (headless / API-only deployments). The handler must
@@ -224,6 +237,7 @@ func New(cfg model.Config, st Store, sessions SessionManager, wa Ceremonies, opt
 		extOrigin: strings.TrimSpace(cfg.Server.Admin.ExternalOrigin),
 		secure:    secure,
 		now:       func() time.Time { return time.Now().UTC() },
+		logger:    slog.Default(),
 		recovery:  defaultRecoveryCodes,
 	}
 	s.limiterMaxFailures = defaultMaxFailures

@@ -30,11 +30,18 @@ func (s *Store) InsertAuditEntry(ctx context.Context, e model.AuditEntry) error 
 	return nil
 }
 
+// maxAuditListLimit caps a single ListAuditEntries page so an authenticated
+// caller cannot pull the entire log in one unpaginated request.
+const maxAuditListLimit = 1000
+
 // ListAuditEntries returns audit records newest-first, paginated. A non-positive
-// limit falls back to 100.
+// limit falls back to 100; a limit above maxAuditListLimit is clamped down.
 func (s *Store) ListAuditEntries(ctx context.Context, limit, offset int) ([]model.AuditEntry, error) {
 	if limit <= 0 {
 		limit = 100
+	}
+	if limit > maxAuditListLimit {
+		limit = maxAuditListLimit
 	}
 	if offset < 0 {
 		offset = 0

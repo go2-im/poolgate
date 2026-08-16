@@ -7,6 +7,7 @@ package admin
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"strconv"
 
@@ -14,17 +15,21 @@ import (
 )
 
 // audit records one operator action. It is best-effort: an insert error is
-// swallowed so auditing can never break the action being audited. Actor is
-// always the operator (these are called from session-guarded handlers). target
-// and detail must be secret-free (ids/labels/counts only).
+// logged but never propagated, so auditing can never break the action being
+// audited — while a silent gap in the security trail still becomes observable.
+// Actor is always the operator (these are called from session-guarded
+// handlers). target and detail must be secret-free (ids/labels/counts only).
 func (s *Server) audit(ctx context.Context, action, target, detail string) {
-	_ = s.store.InsertAuditEntry(ctx, model.AuditEntry{
+	if err := s.store.InsertAuditEntry(ctx, model.AuditEntry{
 		At:     s.now(),
 		Actor:  model.AuditActorOperator,
 		Action: action,
 		Target: target,
 		Detail: detail,
-	})
+	}); err != nil {
+		s.logger.Warn("admin: audit insert failed",
+			slog.String("action", action), slog.String("target", target), slog.Any("err", err))
+	}
 }
 
 // auditEntryView is the JSON projection of an audit entry.

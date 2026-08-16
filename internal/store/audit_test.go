@@ -55,3 +55,31 @@ func TestAuditLogAppendAndList(t *testing.T) {
 		t.Error("entry id was not generated")
 	}
 }
+
+// TestAuditListLimitClamped confirms an over-large client-supplied limit is
+// clamped to maxAuditListLimit rather than forwarded verbatim into SQL.
+func TestAuditListLimitClamped(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	base := time.Date(2026, 8, 16, 10, 0, 0, 0, time.UTC)
+	for i := 0; i < 3; i++ {
+		if err := s.InsertAuditEntry(ctx, model.AuditEntry{
+			At:     base.Add(time.Duration(i) * time.Minute),
+			Actor:  model.AuditActorSystem,
+			Action: "test.clamp",
+		}); err != nil {
+			t.Fatalf("InsertAuditEntry %d: %v", i, err)
+		}
+	}
+
+	// A huge limit must not error and must return only the rows that exist —
+	// the clamp bounds the SQL LIMIT, not the result count.
+	got, err := s.ListAuditEntries(ctx, 1_000_000_000, 0)
+	if err != nil {
+		t.Fatalf("ListAuditEntries huge limit: %v", err)
+	}
+	if len(got) != 3 {
+		t.Errorf("count = %d, want 3", len(got))
+	}
+}
