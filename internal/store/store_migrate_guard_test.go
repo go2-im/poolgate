@@ -90,14 +90,20 @@ func TestPreMigrationSnapshotDirect(t *testing.T) {
 		t.Errorf("snapshot account count = %d, want 1", n)
 	}
 
-	// Idempotent: a second call keeps the original snapshot (does not overwrite).
-	before := fi.ModTime()
+	// Publishing is atomic and always-fresh: a second call re-publishes a valid
+	// 0600 snapshot (no leftover .tmp, no partial file under the real name).
 	if err := s.preMigrationSnapshot(ctx, 3); err != nil {
 		t.Fatalf("second preMigrationSnapshot: %v", err)
 	}
-	fi2, _ := os.Stat(snap)
-	if !fi2.ModTime().Equal(before) {
-		t.Errorf("snapshot was overwritten on the second call")
+	fi2, err := os.Stat(snap)
+	if err != nil {
+		t.Fatalf("snapshot missing after second call: %v", err)
+	}
+	if fi2.Mode().Perm() != 0o600 {
+		t.Errorf("refreshed snapshot perm = %v, want 0600", fi2.Mode().Perm())
+	}
+	if _, err := os.Stat(snap + ".tmp"); !os.IsNotExist(err) {
+		t.Errorf("leftover temp file after publish: %v", err)
 	}
 }
 
