@@ -145,6 +145,14 @@ func (l *Login) Run(ctx context.Context, prompt func(authorizeURL string)) (mode
 	go func() { _ = srv.Serve(ln) }()
 	defer srv.Close()
 
+	// The redirect_uri advertises "localhost", which may resolve to ::1 first on
+	// some hosts. Also accept the callback on the IPv6 loopback (same port, still
+	// loopback-only) so the browser reaches us regardless of resolution order.
+	if ln6, err6 := net.Listen("tcp", fmt.Sprintf("[::1]:%d", port)); err6 == nil {
+		defer ln6.Close()
+		go func() { _ = srv.Serve(ln6) }()
+	}
+
 	if prompt != nil {
 		prompt(authorizeURL)
 	}
@@ -244,22 +252,29 @@ type result struct {
 }
 
 // deliver writes the browser response and, exactly once, sends the outcome to
-// Run. A full results channel (a second callback) is ignored.
+// Run. The response is written AND flushed before signaling Run, so the deferred
+// srv.Close() in Run cannot truncate the browser page. A full results channel (a
+// second callback) is ignored.
 func deliver(w http.ResponseWriter, results chan<- result, code string, err error, ok bool) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if ok {
+		_, _ = io.WriteString(w, "<!doctype html><title>poolgate</title><body style=\"font-family:sans-serif\">"+
+			"<h2>Signed in.</h2><p>You can close this tab and return to the terminal.</p></body>")
+	} else {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, "<!doctype html><title>poolgate</title><body style=\"font-family:sans-serif\">"+
+			"<h2>Sign-in failed.</h2><p>Return to the terminal for details.</p></body>")
+	}
+	// Flush the page onto the wire before signaling Run, so a fast return + the
+	// deferred srv.Close() cannot reset the connection mid-write.
+	if f, okFlush := w.(http.Flusher); okFlush {
+		f.Flush()
+	}
 	select {
 	case results <- result{code: code, err: err}:
 	default:
 		// Already delivered; ignore the duplicate.
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if ok {
-		_, _ = io.WriteString(w, "<!doctype html><title>poolgate</title><body style=\"font-family:sans-serif\">"+
-			"<h2>Signed in.</h2><p>You can close this tab and return to the terminal.</p></body>")
-		return
-	}
-	w.WriteHeader(http.StatusBadRequest)
-	_, _ = io.WriteString(w, "<!doctype html><title>poolgate</title><body style=\"font-family:sans-serif\">"+
-		"<h2>Sign-in failed.</h2><p>Return to the terminal for details.</p></body>")
 }
 
 // tokenResponse is the authorization_code exchange result.
