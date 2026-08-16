@@ -18,6 +18,7 @@ export function PolicyGroups() {
   const [name, setName] = useState('')
   const [strategy, setStrategy] = useState<string>(STRATEGIES[0])
   const [members, setMembers] = useState<string[]>([])
+  const [weights, setWeights] = useState<Record<string, string>>({})
 
   async function load() {
     setErr('')
@@ -38,13 +39,26 @@ export function PolicyGroups() {
     setMembers((m) => (m.includes(id) ? m.filter((x) => x !== id) : [...m, id]))
   }
 
+  // collectWeights builds the member_weights map (accountID → int >=1) from the
+  // per-member inputs, only for selected members with a non-default value.
+  function collectWeights(): Record<string, number> | undefined {
+    if (strategy !== 'weighted') return undefined
+    const out: Record<string, number> = {}
+    for (const id of members) {
+      const n = parseInt(weights[id] ?? '', 10)
+      if (!isNaN(n) && n > 1) out[id] = n
+    }
+    return Object.keys(out).length > 0 ? out : undefined
+  }
+
   async function doCreate() {
     setErr('')
     setBusy(true)
     try {
-      await createPolicyGroup(name.trim(), strategy, members)
+      await createPolicyGroup(name.trim(), strategy, members, collectWeights())
       setName('')
       setMembers([])
+      setWeights({})
       await load()
     } catch (e) {
       setErr(errMessage(e))
@@ -103,9 +117,23 @@ export function PolicyGroups() {
                   onChange={() => toggleMember(a.id)}
                 />
                 {a.label || a.id}
+                {strategy === 'weighted' && members.includes(a.id) && (
+                  <input
+                    type="number"
+                    min={1}
+                    className="weight-input"
+                    value={weights[a.id] ?? ''}
+                    placeholder="wt 1"
+                    aria-label={`weight for ${a.label || a.id}`}
+                    onChange={(e) => setWeights((w) => ({ ...w, [a.id]: e.target.value }))}
+                  />
+                )}
               </label>
             ))}
           </div>
+        )}
+        {strategy === 'weighted' && (
+          <p className="muted">Weights (≥1, default 1) set each member's share of traffic.</p>
         )}
         <button disabled={busy || name.trim() === ''} onClick={doCreate}>
           {busy ? 'Creating…' : 'Create policy group'}
@@ -137,7 +165,12 @@ export function PolicyGroups() {
                   <td className="muted">
                     {g.member_account_ids.length === 0
                       ? '—'
-                      : g.member_account_ids.map(labelFor).join(', ')}
+                      : g.member_account_ids
+                          .map((id) => {
+                            const w = g.member_weights?.[id]
+                            return w && w > 1 ? `${labelFor(id)} ×${w}` : labelFor(id)
+                          })
+                          .join(', ')}
                   </td>
                   <td className="right">
                     <button className="danger small" onClick={() => doDelete(g)}>

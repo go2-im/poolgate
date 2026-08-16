@@ -142,8 +142,8 @@ func (s *Store) UpdatePolicyGroup(ctx context.Context, g model.PolicyGroup) erro
 	}
 	for i, accID := range g.MemberAccountIDs {
 		if _, err := tx.ExecContext(ctx, `
-INSERT INTO group_members (group_id, member_type, member_id, position) VALUES (?, ?, ?, ?)`,
-			g.ID, memberTypeAccount, accID, i); err != nil {
+INSERT INTO group_members (group_id, member_type, member_id, position, weight) VALUES (?, ?, ?, ?, ?)`,
+			g.ID, memberTypeAccount, accID, i, g.Weight(accID)); err != nil {
 			_ = tx.Rollback()
 			return fmt.Errorf("store: insert group member: %w", err)
 		}

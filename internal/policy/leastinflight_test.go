@@ -80,6 +80,7 @@ type mutatingView struct {
 
 func (v *mutatingView) IsHealthy(id string) bool { return v.healthy[id] }
 func (v *mutatingView) Headroom(string) float64  { return 100 }
+func (v *mutatingView) Weight(string) int        { return 1 }
 func (v *mutatingView) Cursor() *Cursor          { return &v.cursor }
 func (v *mutatingView) InFlight(id string) int {
 	v.calls[id]++

@@ -662,6 +662,7 @@ type routeView struct {
 	tried     map[string]bool    // accounts already attempted this request
 	refreshed map[string]bool    // accounts whose token was refreshed once after a 401
 	caps      map[string]int     // effective per-account concurrency cap (0 = unlimited)
+	weights   map[string]int     // weighted-LB weights (only populated for that strategy)
 	inflight  *inflight          // live per-account in-flight counts (shared with the gateway)
 	cursor    *policy.Cursor
 }
@@ -701,6 +702,14 @@ func (v *routeView) Headroom(id string) float64 {
 // Cursor returns the group's round-robin cursor (load-balance).
 func (v *routeView) Cursor() *policy.Cursor { return v.cursor }
 
+// Weight returns the account's weighted-LB weight (>=1; default 1).
+func (v *routeView) Weight(id string) int {
+	if w, ok := v.weights[id]; ok && w >= 1 {
+		return w
+	}
+	return 1
+}
+
 // buildView builds the routeView for one request. Base routability comes from the
 // eligible members; best-quota additionally loads each member's latest usage
 // snapshot to compute min headroom (missing snapshot => 100, unconstrained).
@@ -725,6 +734,12 @@ func (g *Gateway) buildView(ctx context.Context, group model.PolicyGroup, eligib
 				h = policy.MinHeadroom(model.Usage{PlanType: snap.PlanType, Windows: snap.Windows})
 			}
 			v.headroom[a.ID] = h
+		}
+	}
+	if group.Strategy == model.StrategyWeighted {
+		v.weights = make(map[string]int, len(eligible))
+		for _, a := range eligible {
+			v.weights[a.ID] = group.Weight(a.ID)
 		}
 	}
 	return v

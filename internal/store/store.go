@@ -311,6 +311,12 @@ CREATE TABLE audit_log (
 CREATE INDEX idx_audit_log_at ON audit_log(at);
 `,
 	},
+	{
+		version: 8,
+		sql: `
+ALTER TABLE group_members ADD COLUMN weight INTEGER NOT NULL DEFAULT 1;
+`,
+	},
 }
 
 // Migrate applies any migrations whose version is not yet recorded. It is
@@ -967,8 +973,8 @@ func (s *Store) InsertPolicyGroup(ctx context.Context, g model.PolicyGroup) (mod
 	}
 	for i, accID := range g.MemberAccountIDs {
 		if _, err := tx.ExecContext(ctx, `
-INSERT INTO group_members (group_id, member_type, member_id, position) VALUES (?, ?, ?, ?)`,
-			g.ID, memberTypeAccount, accID, i); err != nil {
+INSERT INTO group_members (group_id, member_type, member_id, position, weight) VALUES (?, ?, ?, ?, ?)`,
+			g.ID, memberTypeAccount, accID, i, g.Weight(accID)); err != nil {
 			_ = tx.Rollback()
 			return model.PolicyGroup{}, fmt.Errorf("store: insert group member: %w", err)
 		}
@@ -997,7 +1003,7 @@ func (s *Store) GetPolicyGroup(ctx context.Context, id string) (model.PolicyGrou
 	g.Strategy = model.Strategy(strategy)
 
 	rows, err := s.db.QueryContext(ctx, `
-SELECT member_id FROM group_members
+SELECT member_id, weight FROM group_members
 WHERE group_id = ? AND member_type = ?
 ORDER BY position`, id, memberTypeAccount)
 	if err != nil {
@@ -1005,11 +1011,20 @@ ORDER BY position`, id, memberTypeAccount)
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var mid string
-		if err := rows.Scan(&mid); err != nil {
+		var (
+			mid    string
+			weight int
+		)
+		if err := rows.Scan(&mid, &weight); err != nil {
 			return model.PolicyGroup{}, fmt.Errorf("store: scan group member: %w", err)
 		}
 		g.MemberAccountIDs = append(g.MemberAccountIDs, mid)
+		if weight != 1 {
+			if g.MemberWeights == nil {
+				g.MemberWeights = make(map[string]int)
+			}
+			g.MemberWeights[mid] = weight
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return model.PolicyGroup{}, err

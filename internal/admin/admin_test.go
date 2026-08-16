@@ -558,6 +558,41 @@ func TestApiKeyCreateShowsSecretOnceThenMasks(t *testing.T) {
 	}
 }
 
+func TestWeightedPolicyGroup(t *testing.T) {
+	h := newHarness(t)
+	cookie, csrf := h.authed()
+	mut := func(r *http.Request) { r.AddCookie(cookie); r.Header.Set(CSRFHeaderName, csrf) }
+	acc, _ := h.store.InsertAccount(context.Background(), model.Account{Label: "a1", AccessToken: "x", RefreshToken: "y"})
+
+	// weighted strategy with member weights round-trips.
+	rec := h.do(http.MethodPost, "/admin/api/policy_groups", map[string]any{
+		"name": "wg", "strategy": "weighted",
+		"member_account_ids": []string{acc.ID},
+		"member_weights":     map[string]any{acc.ID: 3},
+	}, mut)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("weighted group create = %d body=%s", rec.Code, rec.Body.String())
+	}
+	m := decodeBody(t, rec)
+	if m["strategy"] != "weighted" {
+		t.Errorf("strategy = %v, want weighted", m["strategy"])
+	}
+	mw, _ := m["member_weights"].(map[string]any)
+	if mw == nil || mw[acc.ID].(float64) != 3 {
+		t.Errorf("member_weights = %v, want {%s:3}", m["member_weights"], acc.ID)
+	}
+
+	// weight < 1 → 400.
+	rec = h.do(http.MethodPost, "/admin/api/policy_groups", map[string]any{
+		"name": "bad", "strategy": "weighted",
+		"member_account_ids": []string{acc.ID},
+		"member_weights":     map[string]any{acc.ID: 0},
+	}, mut)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("weight 0 create = %d, want 400", rec.Code)
+	}
+}
+
 func TestEndpointAndPolicyGroupCRUD(t *testing.T) {
 	h := newHarness(t)
 	cookie, csrf := h.authed()

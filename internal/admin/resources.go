@@ -407,6 +407,8 @@ type policyGroupCreateReq struct {
 	Name             string         `json:"name"`
 	Strategy         model.Strategy `json:"strategy"`
 	MemberAccountIDs []string       `json:"member_account_ids"`
+	// MemberWeights maps account id → weight (>=1) for the "weighted" strategy.
+	MemberWeights map[string]int `json:"member_weights"`
 }
 
 // policyGroupPatchReq is the body of PATCH /admin/api/policy_groups/{id}. Both
@@ -414,6 +416,21 @@ type policyGroupCreateReq struct {
 type policyGroupPatchReq struct {
 	Strategy         *model.Strategy `json:"strategy"`
 	MemberAccountIDs *[]string       `json:"member_account_ids"`
+	MemberWeights    *map[string]int `json:"member_weights"`
+}
+
+// maxMemberWeight caps a member weight so the SWRR accumulator can't overflow and
+// peer starvation ratios stay sane. Well above any realistic weighting.
+const maxMemberWeight = 1_000_000
+
+// validMemberWeights rejects any weight outside [1, maxMemberWeight].
+func validMemberWeights(weights map[string]int) bool {
+	for _, w := range weights {
+		if w < 1 || w > maxMemberWeight {
+			return false
+		}
+	}
+	return true
 }
 
 // handlePolicyGroupsList returns every policy group.
@@ -444,15 +461,25 @@ func (s *Server) handlePolicyGroupCreate(w http.ResponseWriter, r *http.Request)
 		writeErr(w, http.StatusBadRequest, errBadRequest, "invalid strategy")
 		return
 	}
+	if !validMemberWeights(req.MemberWeights) {
+		writeErr(w, http.StatusBadRequest, errBadRequest, "member weights must be in [1, 1000000]")
+		return
+	}
 	if req.MemberAccountIDs == nil {
 		req.MemberAccountIDs = []string{}
 	}
 	g, err := s.store.InsertPolicyGroup(r.Context(), model.PolicyGroup{
 		Name: req.Name, Strategy: req.Strategy, MemberAccountIDs: req.MemberAccountIDs,
+		MemberWeights: req.MemberWeights,
 	})
 	if err != nil {
 		writeErr(w, http.StatusConflict, errConflict, "could not create policy group (name in use)")
 		return
+	}
+	// Return the canonical stored representation (normalized member_weights) so
+	// POST and GET/List agree.
+	if fresh, ferr := s.store.GetPolicyGroup(r.Context(), g.ID); ferr == nil {
+		g = fresh
 	}
 	s.audit(r.Context(), "policygroup.create", g.ID, "name="+g.Name)
 	writeJSON(w, http.StatusCreated, g)
@@ -479,6 +506,13 @@ func (s *Server) handlePolicyGroupPatch(w http.ResponseWriter, r *http.Request) 
 	}
 	if req.MemberAccountIDs != nil {
 		g.MemberAccountIDs = *req.MemberAccountIDs
+	}
+	if req.MemberWeights != nil {
+		if !validMemberWeights(*req.MemberWeights) {
+			writeErr(w, http.StatusBadRequest, errBadRequest, "member weights must be in [1, 1000000]")
+			return
+		}
+		g.MemberWeights = *req.MemberWeights
 	}
 	if err := s.store.UpdatePolicyGroup(r.Context(), g); err != nil {
 		s.writeStoreErr(w, err, "policy group")
@@ -508,7 +542,7 @@ func (s *Server) handlePolicyGroupDelete(w http.ResponseWriter, r *http.Request)
 // validStrategy reports whether st is one of the three v1 strategies.
 func validStrategy(st model.Strategy) bool {
 	switch st {
-	case model.StrategyFallback, model.StrategyBestQuota, model.StrategyLoadBalance:
+	case model.StrategyFallback, model.StrategyBestQuota, model.StrategyLoadBalance, model.StrategyWeighted:
 		return true
 	default:
 		return false
