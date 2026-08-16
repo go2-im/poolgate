@@ -188,8 +188,9 @@ type Cursor struct {
 	mu sync.Mutex
 	n  uint64
 	// cw holds the smooth-weighted-round-robin current-weight accumulator per
-	// account id (lazily created). Entries for members no longer selected linger
-	// harmlessly (bounded by the group's account count).
+	// account id (lazily created). weightedNext prunes entries for members not in
+	// the current round, so the map is bounded by the current member set (not
+	// lifetime account churn).
 	cw map[string]int
 }
 
@@ -221,7 +222,9 @@ func (c *Cursor) weightedNext(members []model.Account, weight func(string) int) 
 	best := members[0]
 	bestVal := 0
 	first := true
+	present := make(map[string]struct{}, len(members))
 	for _, a := range members {
+		present[a.ID] = struct{}{}
 		w := weight(a.ID)
 		if w < 1 {
 			w = 1
@@ -234,6 +237,15 @@ func (c *Cursor) weightedNext(members []model.Account, weight func(string) int) 
 		}
 	}
 	c.cw[best.ID] -= total
+	// Prune accumulator entries for members not in this round so the map is
+	// bounded by the current member set (not lifetime account churn).
+	if len(c.cw) > len(present) {
+		for id := range c.cw {
+			if _, ok := present[id]; !ok {
+				delete(c.cw, id)
+			}
+		}
+	}
 	return best
 }
 

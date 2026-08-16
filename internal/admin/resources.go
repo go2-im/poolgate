@@ -419,10 +419,14 @@ type policyGroupPatchReq struct {
 	MemberWeights    *map[string]int `json:"member_weights"`
 }
 
-// validMemberWeights rejects any weight < 1 (0/negative are meaningless for SWRR).
+// maxMemberWeight caps a member weight so the SWRR accumulator can't overflow and
+// peer starvation ratios stay sane. Well above any realistic weighting.
+const maxMemberWeight = 1_000_000
+
+// validMemberWeights rejects any weight outside [1, maxMemberWeight].
 func validMemberWeights(weights map[string]int) bool {
 	for _, w := range weights {
-		if w < 1 {
+		if w < 1 || w > maxMemberWeight {
 			return false
 		}
 	}
@@ -458,7 +462,7 @@ func (s *Server) handlePolicyGroupCreate(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if !validMemberWeights(req.MemberWeights) {
-		writeErr(w, http.StatusBadRequest, errBadRequest, "member weights must be >= 1")
+		writeErr(w, http.StatusBadRequest, errBadRequest, "member weights must be in [1, 1000000]")
 		return
 	}
 	if req.MemberAccountIDs == nil {
@@ -471,6 +475,11 @@ func (s *Server) handlePolicyGroupCreate(w http.ResponseWriter, r *http.Request)
 	if err != nil {
 		writeErr(w, http.StatusConflict, errConflict, "could not create policy group (name in use)")
 		return
+	}
+	// Return the canonical stored representation (normalized member_weights) so
+	// POST and GET/List agree.
+	if fresh, ferr := s.store.GetPolicyGroup(r.Context(), g.ID); ferr == nil {
+		g = fresh
 	}
 	s.audit(r.Context(), "policygroup.create", g.ID, "name="+g.Name)
 	writeJSON(w, http.StatusCreated, g)
@@ -500,7 +509,7 @@ func (s *Server) handlePolicyGroupPatch(w http.ResponseWriter, r *http.Request) 
 	}
 	if req.MemberWeights != nil {
 		if !validMemberWeights(*req.MemberWeights) {
-			writeErr(w, http.StatusBadRequest, errBadRequest, "member weights must be >= 1")
+			writeErr(w, http.StatusBadRequest, errBadRequest, "member weights must be in [1, 1000000]")
 			return
 		}
 		g.MemberWeights = *req.MemberWeights
