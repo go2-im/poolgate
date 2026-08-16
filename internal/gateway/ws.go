@@ -47,6 +47,11 @@ const (
 	wsDialTimeout = 30 * time.Second
 	// wsAffinityTTL is how long an x-codex-turn-state → account pin survives.
 	wsAffinityTTL = 10 * time.Minute
+	// wsPingInterval/wsPingTimeout bound liveness: poolgate pings the client
+	// periodically and, if no pong arrives in time, tears the connection down so a
+	// dead/half-open peer cannot pin a concurrency slot indefinitely.
+	wsPingInterval = 30 * time.Second
+	wsPingTimeout  = 10 * time.Second
 	// DefaultWSOpenAIBeta is synthesized when the client omits OpenAI-Beta on a WS
 	// upgrade (verified against openai/codex: responses_websockets=<date>).
 	DefaultWSOpenAIBeta = "responses_websockets=2026-02-06"
@@ -166,6 +171,9 @@ func (g *Gateway) handleResponsesWS(w http.ResponseWriter, r *http.Request) {
 		byID[a.ID] = i
 	}
 	turnState := r.Header.Get("x-codex-turn-state")
+	// The account this turn-state token is currently pinned to (if any), captured
+	// once so we only unpin it when that specific account fails to dial.
+	pinnedID, _ := g.wsAff.get(turnState)
 
 	var lastStatus int
 	triedAny := false
@@ -200,16 +208,26 @@ func (g *Gateway) handleResponsesWS(w http.ResponseWriter, r *http.Request) {
 			g.logger.Warn("account ws dial failed pre-accept",
 				"endpoint", endpoint, "account", acct.ID, "status", status)
 			g.recordFailure(ctx, eligible, byID, view, acct, status, retryAfter)
-			g.wsAff.delete(turnState) // the pinned backend (if this was it) failed
+			if turnState != "" && acct.ID == pinnedID {
+				g.wsAff.delete(turnState) // only unpin when the PINNED backend failed
+			}
 			continue
 		}
 
-		// Commit: a working upstream exists. Pin affinity and relay.
+		// Commit: a working upstream exists. Pin affinity and relay. The slot is
+		// released via defer so a panic in the relay path cannot leak it.
 		g.wsAff.set(turnState, acct.ID)
 		rec.trace = append(rec.trace, acct.ID+":ws")
-		g.serveWSPair(ctx, w, r, uc)
-		g.inflight.done(acct.ID)
-		rec.finish(http.StatusSwitchingProtocols, acct, "", 0, 0)
+		committed := false
+		func() {
+			defer g.inflight.done(acct.ID)
+			committed = g.serveWSPair(ctx, w, r, uc)
+		}()
+		if committed {
+			rec.finish(http.StatusSwitchingProtocols, acct, "", 0, 0)
+		} else {
+			rec.finish(http.StatusBadGateway, acct, "ws_accept_failed", 0, 0)
+		}
 		return
 	}
 
@@ -276,8 +294,9 @@ func (g *Gateway) dialUpstreamWS(ctx context.Context, r *http.Request, acct mode
 }
 
 // serveWSPair accepts the client upgrade (negotiating the same subprotocol the
-// upstream chose) and relays frames until either side closes.
-func (g *Gateway) serveWSPair(ctx context.Context, w http.ResponseWriter, r *http.Request, upstream *websocket.Conn) {
+// upstream chose) and relays frames until either side closes. It returns true
+// once the client upgrade was accepted (committed), false if the accept failed.
+func (g *Gateway) serveWSPair(ctx context.Context, w http.ResponseWriter, r *http.Request, upstream *websocket.Conn) bool {
 	opts := &websocket.AcceptOptions{
 		// Auth is the bearer sk- key, not a cookie, so the browser same-origin
 		// (CSRF) check is irrelevant for this machine-to-machine proxy.
@@ -289,16 +308,19 @@ func (g *Gateway) serveWSPair(ctx context.Context, w http.ResponseWriter, r *htt
 	client, err := websocket.Accept(w, r, opts)
 	if err != nil {
 		upstream.Close(websocket.StatusInternalError, "client upgrade failed")
-		return
+		return false
 	}
 	client.SetReadLimit(wsReadLimit)
 	upstream.SetReadLimit(wsReadLimit)
 	g.pumpWS(ctx, client, upstream)
+	return true
 }
 
 // pumpWS relays whole messages in both directions until either side errors/closes,
 // then closes both so the second direction's blocked Read unblocks. It waits for
-// both goroutines to exit, so no goroutine leaks past the connection.
+// both relay goroutines to exit, so no goroutine leaks past the connection. A
+// heartbeat pings the client so a silent/half-open peer is reaped (releasing its
+// concurrency slot) rather than pinning it until OS TCP keepalive.
 func (g *Gateway) pumpWS(ctx context.Context, client, upstream *websocket.Conn) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -317,12 +339,35 @@ func (g *Gateway) pumpWS(ctx context.Context, client, upstream *websocket.Conn) 
 	}
 	go relay(upstream, client) // client → upstream
 	go relay(client, upstream) // upstream → client
+	go g.wsHeartbeat(ctx, cancel, client)
 
 	<-done
 	// One side finished; close both so the other Read returns promptly.
 	client.Close(websocket.StatusNormalClosure, "")
 	upstream.Close(websocket.StatusNormalClosure, "")
 	<-done
+}
+
+// wsHeartbeat pings client every wsPingInterval and cancels the relay if a pong
+// does not arrive within wsPingTimeout (a dead or half-open peer). It exits when
+// ctx is cancelled (the connection closed), so it never outlives the connection.
+func (g *Gateway) wsHeartbeat(ctx context.Context, cancel context.CancelFunc, client *websocket.Conn) {
+	t := time.NewTicker(wsPingInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			pctx, pcancel := context.WithTimeout(ctx, wsPingTimeout)
+			err := client.Ping(pctx)
+			pcancel()
+			if err != nil {
+				cancel()
+				return
+			}
+		}
+	}
 }
 
 // ---- ws helpers -----------------------------------------------------------
