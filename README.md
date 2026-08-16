@@ -59,6 +59,7 @@ poolgate serve                      # start the proxy (127.0.0.1:8787) + admin (
 - [`docs/DESIGN.md`](docs/DESIGN.md) — architecture, policy engine, storage, auth, config.
 - [`docs/SECURITY.md`](docs/SECURITY.md) — threat model and hardening.
 - [`docs/RUN.md`](docs/RUN.md) — local run guide.
+- [`docs/DEPLOY.md`](docs/DEPLOY.md) — Docker Compose + reverse-proxy (Caddy/nginx) deployment.
 
 ## License
 

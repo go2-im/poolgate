@@ -1,0 +1,30 @@
+# config.yaml — example for the reverse-proxied docker-compose deployment.
+# Mounted read-only at /data/config.yaml. Replace the two example.com hostnames.
+#
+# Only the keys that differ from the loopback defaults are set here. See
+# ../docs/RUN.md "Configuration" for the full key reference.
+
+server:
+  admin:
+    # Bind the admin listener to all interfaces INSIDE the container so the caddy
+    # container can reach it across the docker network. It is NOT published to the
+    # host or LAN (no `ports:` on the poolgate service) — only caddy fronts it,
+    # over TLS. poolgate logs a "keep the admin surface private" warning for a
+    # non-loopback bind; that is expected here and safe given the topology.
+    host: 0.0.0.0
+    port: 7070
+    # WebAuthn RP inputs, resolved ONCE at startup (never from request headers).
+    # external_origin MUST be the https browser-facing origin of the admin UI, and
+    # rp_id the registrable domain passkeys are scoped to. Passkeys registered
+    # under one rp_id do not work under another — pick this before onboarding.
+    external_origin: "https://admin.example.com"
+    rp_id: "example.com"
+  proxy:
+    host: 0.0.0.0     # reached only via caddy on the internal network
+    port: 8787
+
+data_dir: /data
+master_key_source: keyfile   # keyfile (default): master.key lives in the volume.
+                             # For env+secret hardening see docs/DEPLOY.md.
+upstream_allowlist: ["chatgpt.com", "api.openai.com"]
+health_probe_mode: usage-poll-only

@@ -1,0 +1,41 @@
+# Caddyfile — TLS termination + reverse proxy for poolgate.
+#
+# Caddy obtains and renews Let's Encrypt certificates automatically for both
+# hostnames (ensure the DNS A/AAAA records point at this host and 80/443 are
+# reachable). Replace the two example.com names and the admin email.
+#
+# Streaming: poolgate relays Server-Sent Events on BOTH surfaces — the proxy
+# relays the upstream SSE completion stream, and the admin UI's live monitor is
+# an SSE feed. `flush_interval -1` disables response buffering so tokens/events
+# reach the client immediately instead of being batched.
+
+{
+	# ACME registration contact for expiry notices.
+	email admin@example.com
+}
+
+# --- OpenAI-compatible proxy API -------------------------------------------
+# Point OpenAI-compatible clients at https://api.example.com/e/<endpoint>/v1/...
+api.example.com {
+	reverse_proxy poolgate:8787 {
+		flush_interval -1          # stream SSE unbuffered
+		health_uri /readyz         # active upstream health check
+		health_interval 15s
+		health_timeout 5s
+	}
+}
+
+# --- Admin UI + REST API ----------------------------------------------------
+# Passkey login requires this to be HTTPS with a stable hostname matching the
+# rp_id / external_origin in config.yaml.
+admin.example.com {
+	reverse_proxy poolgate:7070 {
+		flush_interval -1          # the live monitor is an SSE stream
+	}
+
+	# Optional defense-in-depth: restrict the admin surface to your own IPs.
+	# Uncomment and set your CIDR(s). This is in addition to poolgate's own
+	# passkey session auth + CSRF + strict CSP.
+	# @notallowed not remote_ip 203.0.113.0/24 198.51.100.7
+	# respond @notallowed 403
+}
