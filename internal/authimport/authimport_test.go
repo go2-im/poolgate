@@ -1,6 +1,7 @@
 package authimport
 
 import (
+	"encoding/base64"
 	"errors"
 	"os"
 	"path/filepath"
@@ -109,5 +110,35 @@ func TestParseFileMalformed(t *testing.T) {
 	}
 	if _, err := ParseFile(path); err == nil {
 		t.Fatal("expected parse error for malformed file")
+	}
+}
+
+func TestParseFallsBackToIDTokenAccountID(t *testing.T) {
+	// id_token payload carrying the chatgpt_account_id claim, no top-level account_id.
+	payload := base64.RawURLEncoding.EncodeToString(
+		[]byte(`{"https://api.openai.com/auth":{"chatgpt_account_id":"acc_from_idtoken"}}`))
+	idToken := "aGVhZGVy." + payload + ".sig"
+	data := `{"tokens":{"access_token":"at","refresh_token":"rt","id_token":"` + idToken + `"}}`
+
+	acct, err := Parse([]byte(data))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if acct.AccountID != "acc_from_idtoken" {
+		t.Errorf("AccountID = %q, want acc_from_idtoken (from id_token claim)", acct.AccountID)
+	}
+}
+
+func TestParsePrefersExplicitAccountID(t *testing.T) {
+	payload := base64.RawURLEncoding.EncodeToString(
+		[]byte(`{"https://api.openai.com/auth":{"chatgpt_account_id":"from_idtoken"}}`))
+	idToken := "h." + payload + ".s"
+	data := `{"tokens":{"access_token":"at","refresh_token":"rt","account_id":"explicit","id_token":"` + idToken + `"}}`
+	acct, err := Parse([]byte(data))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if acct.AccountID != "explicit" {
+		t.Errorf("AccountID = %q, want explicit (top-level wins)", acct.AccountID)
 	}
 }

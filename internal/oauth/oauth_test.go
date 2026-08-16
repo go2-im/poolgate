@@ -28,6 +28,23 @@ type fakeStore struct {
 	gotID      string
 	gotAccess  string
 	gotRefresh string
+
+	// getAcct, when set, is returned by GetAccount (used to simulate a token that
+	// was already rotated by a concurrent/earlier refresh). When nil, GetAccount
+	// returns getErr (default: a not-found error) so refresh() falls back to the
+	// caller's snapshot — preserving the pre-existing test behavior.
+	getAcct *model.Account
+	getErr  error
+}
+
+func (f *fakeStore) GetAccount(_ context.Context, id string) (model.Account, error) {
+	if f.getAcct != nil {
+		return *f.getAcct, nil
+	}
+	if f.getErr != nil {
+		return model.Account{}, f.getErr
+	}
+	return model.Account{}, errors.New("not found")
 }
 
 func (f *fakeStore) UpdateTokens(_ context.Context, id, accessToken, refreshToken string) error {
@@ -202,6 +219,66 @@ func TestWithClientID(t *testing.T) {
 	}
 	if gotClientID != "custom-client" {
 		t.Errorf("client_id = %q, want custom-client", gotClientID)
+	}
+}
+
+// TestRefreshAdoptsAlreadyRotatedTokensWithoutReusingOldRefresh verifies that a
+// staggered caller holding a stale snapshot adopts the already-rotated stored
+// tokens instead of hitting the issuer again with a consumed refresh_token.
+func TestRefreshAdoptsAlreadyRotatedTokensWithoutReusingOldRefresh(t *testing.T) {
+	ctx := context.Background()
+
+	var issuerHits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		issuerHits++
+		_ = json.NewEncoder(w).Encode(refreshResponse{AccessToken: "at-should-not-happen"})
+	}))
+	defer srv.Close()
+
+	// Stored tokens have already moved on from the caller's stale snapshot.
+	rotated := model.Account{ID: "acct-1", AccessToken: "at-new", RefreshToken: "rt-new", State: model.StateOK}
+	fs := &fakeStore{getAcct: &rotated}
+	r := NewRefresher(fs, srv.URL, WithHTTPClient(srv.Client()))
+
+	stale := model.Account{ID: "acct-1", AccessToken: "at-old", RefreshToken: "rt-old", State: model.StateOK}
+	got, err := r.RefreshAccount(ctx, stale)
+	if err != nil {
+		t.Fatalf("RefreshAccount: %v", err)
+	}
+	if got.AccessToken != "at-new" || got.RefreshToken != "rt-new" {
+		t.Errorf("adopted tokens = %q/%q, want at-new/rt-new", got.AccessToken, got.RefreshToken)
+	}
+	if issuerHits != 0 {
+		t.Errorf("issuer hit %d times; a stale caller must NOT reuse the old refresh_token", issuerHits)
+	}
+	if fs.calls != 0 {
+		t.Errorf("UpdateTokens called %d times; adoption should not persist", fs.calls)
+	}
+}
+
+// TestSingleflightPanicDoesNotWedgeWaiters verifies a panic in the refresh
+// function is converted to an error and never leaves the singleflight entry
+// wedged (which would block all future callers forever).
+func TestSingleflightPanicDoesNotWedgeWaiters(t *testing.T) {
+	var g singleflight
+	_, err := g.Do("k", func() (model.Account, error) {
+		panic("boom")
+	})
+	if err == nil {
+		t.Fatal("panic should surface as an error")
+	}
+	// A subsequent call for the same key must proceed (entry not wedged).
+	done := make(chan struct{})
+	go func() {
+		_, _ = g.Do("k", func() (model.Account, error) {
+			return model.Account{ID: "ok"}, nil
+		})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second Do wedged after a prior panic")
 	}
 }
 
