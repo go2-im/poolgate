@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/go2-im/poolgate/internal/config"
 	"github.com/go2-im/poolgate/internal/crypto"
@@ -106,6 +107,69 @@ func TestUpdateStateExecError(t *testing.T) {
 	s := newClosedStore(t)
 	if err := s.UpdateState(context.Background(), "any", model.StateOK); err == nil {
 		t.Fatal("UpdateState on closed db: want error, got nil")
+	}
+}
+
+func TestGetAccountStateAndUpdateStateAndTiming(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	stored, err := s.InsertAccount(ctx, model.Account{AccessToken: "at", RefreshToken: "rt"})
+	if err != nil {
+		t.Fatalf("InsertAccount: %v", err)
+	}
+
+	// Fresh account state is readable.
+	st, err := s.GetAccountState(ctx, stored.ID)
+	if err != nil {
+		t.Fatalf("GetAccountState: %v", err)
+	}
+	if st != model.StateUnknown {
+		t.Fatalf("initial state = %q, want %q", st, model.StateUnknown)
+	}
+
+	// Atomic state+timing write lands both.
+	cooldown := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
+	next := cooldown.Add(time.Minute)
+	timing := model.AccountTiming{
+		CooldownUntil: cooldown, NextProbeAt: next,
+		ConsecutiveFailures: 3, BackoffLevel: 2, ConcurrencyCap: 5,
+	}
+	if err := s.UpdateStateAndTiming(ctx, stored.ID, model.StateCooldown, timing); err != nil {
+		t.Fatalf("UpdateStateAndTiming: %v", err)
+	}
+	st, err = s.GetAccountState(ctx, stored.ID)
+	if err != nil {
+		t.Fatalf("GetAccountState: %v", err)
+	}
+	if st != model.StateCooldown {
+		t.Fatalf("state = %q, want cooldown", st)
+	}
+	gotT, err := s.GetAccountTiming(ctx, stored.ID)
+	if err != nil {
+		t.Fatalf("GetAccountTiming: %v", err)
+	}
+	if !gotT.CooldownUntil.Equal(cooldown) || gotT.ConsecutiveFailures != 3 ||
+		gotT.BackoffLevel != 2 || gotT.ConcurrencyCap != 5 {
+		t.Fatalf("timing round-trip mismatch: %+v", gotT)
+	}
+
+	// Unknown id => ErrNotFound on both.
+	if _, err := s.GetAccountState(ctx, "nope"); err != ErrNotFound {
+		t.Fatalf("GetAccountState(unknown) = %v, want ErrNotFound", err)
+	}
+	if err := s.UpdateStateAndTiming(ctx, "nope", model.StateOK, model.AccountTiming{}); err != ErrNotFound {
+		t.Fatalf("UpdateStateAndTiming(unknown) = %v, want ErrNotFound", err)
+	}
+}
+
+func TestGetAccountStateAndUpdateStateAndTimingExecError(t *testing.T) {
+	s := newClosedStore(t)
+	if _, err := s.GetAccountState(context.Background(), "any"); err == nil {
+		t.Fatal("GetAccountState on closed db: want error")
+	}
+	if err := s.UpdateStateAndTiming(context.Background(), "any", model.StateOK, model.AccountTiming{}); err == nil {
+		t.Fatal("UpdateStateAndTiming on closed db: want error")
 	}
 }
 

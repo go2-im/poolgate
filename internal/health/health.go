@@ -56,9 +56,11 @@ import (
 // Store is the persistence surface the engine needs. *store.Store satisfies it.
 type Store interface {
 	ListAccounts(ctx context.Context) ([]model.Account, error)
+	GetAccountState(ctx context.Context, id string) (model.AccountState, error)
 	GetAccountTiming(ctx context.Context, id string) (model.AccountTiming, error)
 	SetAccountTiming(ctx context.Context, id string, t model.AccountTiming) error
 	UpdateState(ctx context.Context, id string, state model.AccountState) error
+	UpdateStateAndTiming(ctx context.Context, id string, state model.AccountState, t model.AccountTiming) error
 	SaveUsageSnapshot(ctx context.Context, snap model.UsageSnapshot) (model.UsageSnapshot, error)
 	RecordHealthCheck(ctx context.Context, hc model.HealthCheck) (model.HealthCheck, error)
 	ListHealthChecks(ctx context.Context, accountID string, limit int) ([]model.HealthCheck, error)
@@ -174,6 +176,30 @@ type Engine struct {
 	skewAt   time.Time
 	haveSkew bool
 	skewWarn time.Duration
+
+	// acctLocks serializes the read-modify-write of state+timing per account so a
+	// slow active probe cannot overwrite a fresher passive transition (a lost
+	// update that could clear a live Retry-After gate). Each transition re-reads
+	// the authoritative state+timing under this lock before applying its event.
+	acctLocksMu sync.Mutex
+	acctLocks   map[string]*sync.Mutex
+}
+
+// lockAccount returns the per-account mutex, locked. The caller must call the
+// returned unlock function.
+func (e *Engine) lockAccount(id string) func() {
+	e.acctLocksMu.Lock()
+	if e.acctLocks == nil {
+		e.acctLocks = make(map[string]*sync.Mutex)
+	}
+	m, ok := e.acctLocks[id]
+	if !ok {
+		m = &sync.Mutex{}
+		e.acctLocks[id] = m
+	}
+	e.acctLocksMu.Unlock()
+	m.Lock()
+	return m.Unlock
 }
 
 // Option customizes an Engine.
@@ -282,6 +308,15 @@ func (e *Engine) applyEvent(state model.AccountState, t model.AccountTiming, ev 
 	}
 	switch ev {
 	case evProbeHealthy, evRefreshed:
+		// A probe reporting healthy must not clear a cooldown/quota gate that a
+		// more-authoritative live 429/5xx set and that has not yet elapsed (e.g. a
+		// usage poll that began before the 429 landed, then re-read the fresh
+		// cooldown under the lock). Keep the gated state; only reschedule. Refresh
+		// (401 recovery) is exempt: an expired account carries no cooldown gate.
+		if ev == evProbeHealthy && degraded(state) && t.CooldownUntil.After(p.now) {
+			t.NextProbeAt = e.gatedNext(state, t, p.now, t.CooldownUntil)
+			return Transition{State: state, Timing: t}
+		}
 		t.ConsecutiveFailures = 0
 		t.BackoffLevel = 0
 		t.CooldownUntil = time.Time{}
@@ -337,13 +372,23 @@ func (e *Engine) scheduleFor(state model.AccountState, t model.AccountTiming, no
 
 // gatedNext is scheduleFor clamped so the result is never before the gate
 // (Retry-After / window reset). This is the auto-recovery gate: a cooled-down or
-// quota-exhausted account is never probed before its cooldown elapses.
+// quota-exhausted account is never probed before its cooldown elapses. When the
+// gate dominates, a jittered spread is added on TOP of the gate so a fleet of
+// accounts sharing one Retry-After do not all re-probe (and potentially re-storm
+// the upstream) at the exact same instant.
 func (e *Engine) gatedNext(state model.AccountState, t model.AccountTiming, now, gate time.Time) time.Time {
 	n := e.scheduleFor(state, t, now)
 	if gate.After(n) {
-		return gate
+		return gate.Add(e.jitterSpread(e.baseInterval(state, t.BackoffLevel)))
 	}
 	return n
+}
+
+// jitterSpread returns just the jitter component (0..JitterFrac*d) of jittered,
+// used to spread accounts that would otherwise release from a shared gate in
+// lockstep.
+func (e *Engine) jitterSpread(d time.Duration) time.Duration {
+	return e.jittered(d) - d
 }
 
 // baseInterval is the (pre-jitter) interval for a state and backoff level.
@@ -425,19 +470,21 @@ func Due(now time.Time, state model.AccountState, t model.AccountTiming) bool {
 // single-flight Refresher, moving the account to ok on success (returning the
 // refreshed account so the caller can retry) or to expired on failure.
 func (e *Engine) OnUnauthorized(ctx context.Context, acct model.Account) (model.Account, error) {
-	t, err := e.store.GetAccountTiming(ctx, acct.ID)
+	unlock := e.lockAccount(acct.ID)
+	defer unlock()
+	curState, t, err := e.readCurrent(ctx, acct)
 	if err != nil {
 		return acct, err
 	}
 	refreshed, rerr := e.refresher.RefreshAccount(ctx, acct)
 	now := e.now()
 	if rerr != nil {
-		tr := e.applyEvent(acct.State, t, evExpired, eventParams{now: now})
-		_ = e.persist(ctx, acct, tr)
+		tr := e.applyEvent(curState, t, evExpired, eventParams{now: now})
+		_ = e.persist(ctx, acct, curState, tr)
 		return acct, rerr
 	}
-	tr := e.applyEvent(acct.State, t, evRefreshed, eventParams{now: now})
-	if err := e.persist(ctx, acct, tr); err != nil {
+	tr := e.applyEvent(curState, t, evRefreshed, eventParams{now: now})
+	if err := e.persist(ctx, acct, curState, tr); err != nil {
 		return refreshed, err
 	}
 	return refreshed, nil
@@ -446,33 +493,45 @@ func (e *Engine) OnUnauthorized(ctx context.Context, acct model.Account) (model.
 // OnRateLimited handles a real-traffic 429: cooldown gated on retryAfter (a
 // conservative default is used when retryAfter <= 0).
 func (e *Engine) OnRateLimited(ctx context.Context, acct model.Account, retryAfter time.Duration) error {
-	t, err := e.store.GetAccountTiming(ctx, acct.ID)
+	unlock := e.lockAccount(acct.ID)
+	defer unlock()
+	curState, t, err := e.readCurrent(ctx, acct)
 	if err != nil {
 		return err
 	}
-	tr := e.applyEvent(acct.State, t, evRateLimited, eventParams{now: e.now(), retryAfter: retryAfter})
-	return e.persist(ctx, acct, tr)
+	tr := e.applyEvent(curState, t, evRateLimited, eventParams{now: e.now(), retryAfter: retryAfter})
+	return e.persist(ctx, acct, curState, tr)
 }
 
 // OnQuotaExhausted handles a real-traffic quota=0 signal: quota_exhausted gated
 // on resetAt (a conservative default is used when resetAt is unknown/past).
 func (e *Engine) OnQuotaExhausted(ctx context.Context, acct model.Account, resetAt time.Time) error {
-	t, err := e.store.GetAccountTiming(ctx, acct.ID)
+	unlock := e.lockAccount(acct.ID)
+	defer unlock()
+	curState, t, err := e.readCurrent(ctx, acct)
 	if err != nil {
 		return err
 	}
-	tr := e.applyEvent(acct.State, t, evQuotaZero, eventParams{now: e.now(), resetAt: resetAt})
-	return e.persist(ctx, acct, tr)
+	tr := e.applyEvent(curState, t, evQuotaZero, eventParams{now: e.now(), resetAt: resetAt})
+	return e.persist(ctx, acct, curState, tr)
 }
 
-func (e *Engine) persist(ctx context.Context, acct model.Account, tr Transition) error {
-	oldState := acct.State
-	if tr.State != oldState {
-		if err := e.store.UpdateState(ctx, acct.ID, tr.State); err != nil {
-			return err
-		}
+// readCurrent re-reads the authoritative state+timing for acct. Callers hold the
+// per-account lock so the values cannot change before they persist a transition.
+func (e *Engine) readCurrent(ctx context.Context, acct model.Account) (model.AccountState, model.AccountTiming, error) {
+	state, err := e.store.GetAccountState(ctx, acct.ID)
+	if err != nil {
+		return "", model.AccountTiming{}, err
 	}
-	if err := e.store.SetAccountTiming(ctx, acct.ID, tr.Timing); err != nil {
+	t, err := e.store.GetAccountTiming(ctx, acct.ID)
+	if err != nil {
+		return "", model.AccountTiming{}, err
+	}
+	return state, t, nil
+}
+
+func (e *Engine) persist(ctx context.Context, acct model.Account, oldState model.AccountState, tr Transition) error {
+	if err := e.store.UpdateStateAndTiming(ctx, acct.ID, tr.State, tr.Timing); err != nil {
 		return err
 	}
 	e.emitTransition(acct, oldState, tr.State)
@@ -546,10 +605,6 @@ func (e *Engine) ProbeAccount(ctx context.Context, acct model.Account) (model.He
 	if acct.State.Terminal() {
 		return model.HealthCheck{}, nil
 	}
-	t, err := e.store.GetAccountTiming(ctx, acct.ID)
-	if err != nil {
-		return model.HealthCheck{}, err
-	}
 
 	kind := e.selectProbeKind(ctx, acct)
 	start := e.now()
@@ -572,9 +627,22 @@ func (e *Engine) ProbeAccount(ctx context.Context, acct model.Account) (model.He
 	}
 
 	now := e.now()
-	tr := e.applyEvent(acct.State, t, ev, eventParams{now: now, retryAfter: retryAfter, resetAt: resetAt})
-	if err := e.persist(ctx, acct, tr); err != nil {
-		return model.HealthCheck{}, err
+	// Serialize the state write against passive hooks and re-read the
+	// authoritative state+timing: the probe above may have raced a live 429/quota
+	// transition. Applying against the fresh state (and honoring an unexpired
+	// cooldown gate in applyEvent) prevents a stale "healthy" probe from clearing
+	// a live Retry-After.
+	unlock := e.lockAccount(acct.ID)
+	curState, t, rerr := e.readCurrent(ctx, acct)
+	if rerr != nil {
+		unlock()
+		return model.HealthCheck{}, rerr
+	}
+	tr := e.applyEvent(curState, t, ev, eventParams{now: now, retryAfter: retryAfter, resetAt: resetAt})
+	perr := e.persist(ctx, acct, curState, tr)
+	unlock()
+	if perr != nil {
+		return model.HealthCheck{}, perr
 	}
 
 	return e.store.RecordHealthCheck(ctx, model.HealthCheck{
