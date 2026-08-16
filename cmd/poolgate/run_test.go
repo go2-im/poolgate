@@ -76,6 +76,23 @@ func TestLoadConfigProxyEnvOverride(t *testing.T) {
 	}
 }
 
+func TestLoadConfigTrustedProxies(t *testing.T) {
+	t.Setenv(envDataDir, t.TempDir())
+	t.Setenv(envTrustedProxies, "10.0.0.0/8, 127.0.0.1 ,")
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if len(cfg.Server.TrustedProxies) != 2 {
+		t.Fatalf("trusted proxies = %v, want 2 (blank trimmed)", cfg.Server.TrustedProxies)
+	}
+	// An invalid spec fails fast.
+	t.Setenv(envTrustedProxies, "not-an-ip")
+	if _, err := loadConfig(); err == nil {
+		t.Error("invalid POOLGATE_TRUSTED_PROXIES should error")
+	}
+}
+
 // TestRunVersion covers the version subcommand + its flag aliases: each returns
 // nil and prints a single line carrying the injected version string and the Go
 // runtime version, to stdout (not stderr).

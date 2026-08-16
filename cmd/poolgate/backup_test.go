@@ -122,11 +122,56 @@ func TestRestoreRefusesOverwrite(t *testing.T) {
 	}
 }
 
+// TestRestoreEnvSourceRefusesKeyMismatch asserts that restoring an env-source
+// bundle into an environment whose POOLGATE_MASTER_KEY differs from the bundle's
+// key is refused up front (rather than "succeeding" and failing at next serve).
+func TestRestoreEnvSourceRefusesKeyMismatch(t *testing.T) {
+	ctx := context.Background()
+	envConfig := []byte("master_key_source: env\n")
+
+	k1 := make([]byte, 32)
+	for i := range k1 {
+		k1[i] = byte(i + 1)
+	}
+	t.Setenv(envMasterKey, base64.StdEncoding.EncodeToString(k1))
+
+	dirA := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dirA, configFile), envConfig, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv(envDataDir, dirA)
+	if err := run(ctx, []string{"init"}, io.Discard, io.Discard); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := run(ctx, []string{"import", writeAuthJSON(t)}, io.Discard, io.Discard); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	t.Setenv(envBackupPassphrase, "mismatch-pass")
+	bundle := filepath.Join(t.TempDir(), "m.pgbak")
+	if err := run(ctx, []string{"backup", "--out", bundle}, io.Discard, io.Discard); err != nil {
+		t.Fatalf("backup: %v", err)
+	}
+
+	// Restore into a fresh env-source dir but with a DIFFERENT env key.
+	k2 := make([]byte, 32)
+	for i := range k2 {
+		k2[i] = byte(200 - i)
+	}
+	t.Setenv(envMasterKey, base64.StdEncoding.EncodeToString(k2))
+	dirB := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dirB, configFile), envConfig, 0o600); err != nil {
+		t.Fatalf("write config B: %v", err)
+	}
+	t.Setenv(envDataDir, dirB)
+	if err := run(ctx, []string{"restore", bundle}, io.Discard, io.Discard); err == nil {
+		t.Fatal("restore should refuse when the env key does not match the bundle key")
+	}
+}
+
 // TestRestoreEnvSourceSkipsKeyfile asserts that under master_key_source=env the
 // restore writes the DB but NOT a plaintext master.key (respecting the operator's
 // choice to keep the key off disk), and the restored DB decrypts with the env key.
-func TestRestoreEnvSourceSkipsKeyfile(t *testing.T) {
-	ctx := context.Background()
+func TestRestoreEnvSourceSkipsKeyfile(t *testing.T) {	ctx := context.Background()
 
 	// A stable 32-byte master key supplied via the environment.
 	rawKey := make([]byte, 32)
