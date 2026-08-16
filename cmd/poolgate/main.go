@@ -649,17 +649,29 @@ func serveListener(ctx context.Context, addr string, handler http.Handler, onRea
 	if err != nil {
 		return err
 	}
+	// Every request gets a context derived from baseCtx. Cancelling baseCtx at
+	// shutdown promptly unblocks long-lived streaming handlers — the monitor SSE
+	// feed and gateway relays select on r.Context() — so they drain and return
+	// instead of making Shutdown wait out the full deadline (DESIGN.md §21.2).
+	// Short handlers that are mid-Write are unaffected (Write does not consult the
+	// context), so normal responses still complete.
+	baseCtx, baseCancel := context.WithCancel(context.Background())
+	defer baseCancel()
 	srv := &http.Server{
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
+		BaseContext:       func(net.Listener) context.Context { return baseCtx },
 	}
 	if onReady != nil {
 		onReady(ln.Addr().String())
 	}
 
-	// Graceful shutdown on context cancellation.
+	// Graceful shutdown on context cancellation: signal in-flight streaming
+	// handlers to drain (cancel their request contexts), THEN Shutdown with a
+	// bounded deadline as a backstop for anything still finishing.
 	go func() {
 		<-ctx.Done()
+		baseCancel()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
