@@ -1,6 +1,8 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { deleteAccount, importAccount, listAccounts, type Account } from '../api'
 import { errMessage, stateClass } from './ui'
+
+type SortKey = 'label' | 'state' | 'account_id' | 'created_at'
 
 export function Accounts() {
   const [accounts, setAccounts] = useState<Account[]>([])
@@ -8,6 +10,9 @@ export function Accounts() {
   const [busy, setBusy] = useState(false)
   const [content, setContent] = useState('')
   const [label, setLabel] = useState('')
+  const [query, setQuery] = useState('')
+  const [sortKey, setSortKey] = useState<SortKey>('label')
+  const [sortDesc, setSortDesc] = useState(false)
 
   async function load() {
     setErr('')
@@ -22,6 +27,38 @@ export function Accounts() {
   useEffect(() => {
     void load()
   }, [])
+
+  // visible applies the case-insensitive search filter then the chosen sort. It
+  // is memoized so typing/sorting doesn't re-run on unrelated renders.
+  const visible = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    const filtered = q
+      ? accounts.filter((a) =>
+          [a.label, a.account_id, a.id, a.state].some((f) => f.toLowerCase().includes(q)),
+        )
+      : accounts
+    const sorted = [...filtered].sort((a, b) => {
+      const av = (a[sortKey] || '').toLowerCase()
+      const bv = (b[sortKey] || '').toLowerCase()
+      return av < bv ? -1 : av > bv ? 1 : 0
+    })
+    if (sortDesc) sorted.reverse()
+    return sorted
+  }, [accounts, query, sortKey, sortDesc])
+
+  function toggleSort(key: SortKey) {
+    if (key === sortKey) {
+      setSortDesc((d) => !d)
+    } else {
+      setSortKey(key)
+      setSortDesc(false)
+    }
+  }
+
+  function sortArrow(key: SortKey): string {
+    if (key !== sortKey) return ''
+    return sortDesc ? ' ▼' : ' ▲'
+  }
 
   async function doImport() {
     setErr('')
@@ -86,34 +123,54 @@ export function Accounts() {
         {accounts.length === 0 ? (
           <p className="muted">No accounts yet.</p>
         ) : (
-          <table>
-            <thead>
-              <tr>
-                <th>ID</th>
-                <th>Label</th>
-                <th>ChatGPT account</th>
-                <th>State</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody>
-              {accounts.map((a) => (
-                <tr key={a.id}>
-                  <td className="mono">{a.id}</td>
-                  <td>{a.label || '—'}</td>
-                  <td className="mono">{a.account_id || '—'}</td>
-                  <td>
-                    <span className={stateClass(a.state)}>{a.state}</span>
-                  </td>
-                  <td className="right">
-                    <button className="danger small" onClick={() => doDelete(a.id)}>
-                      Delete
-                    </button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          <>
+            <input
+              type="search"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Search label, ChatGPT account, id, or state…"
+              autoComplete="off"
+              aria-label="Search accounts"
+            />
+            {visible.length === 0 ? (
+              <p className="muted">No accounts match “{query}”.</p>
+            ) : (
+              <table>
+                <thead>
+                  <tr>
+                    <th>ID</th>
+                    <th className="sortable" onClick={() => toggleSort('label')}>
+                      Label{sortArrow('label')}
+                    </th>
+                    <th className="sortable" onClick={() => toggleSort('account_id')}>
+                      ChatGPT account{sortArrow('account_id')}
+                    </th>
+                    <th className="sortable" onClick={() => toggleSort('state')}>
+                      State{sortArrow('state')}
+                    </th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {visible.map((a) => (
+                    <tr key={a.id}>
+                      <td className="mono">{a.id}</td>
+                      <td>{a.label || '—'}</td>
+                      <td className="mono">{a.account_id || '—'}</td>
+                      <td>
+                        <span className={stateClass(a.state)}>{a.state}</span>
+                      </td>
+                      <td className="right">
+                        <button className="danger small" onClick={() => doDelete(a.id)}>
+                          Delete
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </>
         )}
       </div>
     </>
