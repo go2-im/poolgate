@@ -438,6 +438,14 @@ export const getSettings = () => get<Settings>('/admin/api/settings')
 export const revokeAllSessions = () =>
   mutate<{ revoked: number }>('POST', '/admin/sessions/revoke-all', {})
 
+// verifyAuditLog recomputes the audit log's tamper-evident hash chain.
+export interface AuditVerify {
+  ok: boolean
+  count: number
+  broken_at?: string
+}
+export const verifyAuditLog = () => get<AuditVerify>('/admin/api/audit/verify')
+
 // registerAdditionalPasskey runs the session-gated registration ceremony (no
 // bootstrap token): both begin and finish carry the CSRF header, which the server
 // requires once a session cookie is present. No recovery codes are minted.

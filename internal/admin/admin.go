@@ -83,6 +83,7 @@ type Store interface {
 	// audit log (append-only, DESIGN.md §22)
 	InsertAuditEntry(ctx context.Context, e model.AuditEntry) error
 	ListAuditEntries(ctx context.Context, limit, offset int) ([]model.AuditEntry, error)
+	VerifyAuditChain(ctx context.Context) (valid bool, count int, brokenID string, err error)
 }
 
 // Notifier is the optional notification surface used by the channel "send test"
@@ -335,6 +336,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /admin/api/monitor/stream", s.guard(s.handleMonitorStream))
 
 	mux.HandleFunc("GET /admin/api/audit", s.guard(s.handleAuditList))
+	mux.HandleFunc("GET /admin/api/audit/verify", s.guard(s.handleAuditVerify))
 
 	// Embedded SPA (unauthenticated catch-all): serves the admin UI + assets and
 	// falls back to index.html for client-side routes. Registered last / most

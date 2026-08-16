@@ -83,3 +83,61 @@ func TestAuditListLimitClamped(t *testing.T) {
 		t.Errorf("count = %d, want 3", len(got))
 	}
 }
+
+func TestAuditChainDetectsTampering(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	for i := 0; i < 4; i++ {
+		if err := s.InsertAuditEntry(ctx, model.AuditEntry{
+			Actor: model.AuditActorOperator, Action: "test.act", Target: "t" + string(rune('0'+i)),
+		}); err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+	}
+
+	// Intact chain verifies.
+	ok, count, broken, err := s.VerifyAuditChain(ctx)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if !ok || count != 4 || broken != "" {
+		t.Fatalf("intact chain: ok=%v count=%d broken=%q, want true/4/''", ok, count, broken)
+	}
+
+	// Tamper with a row's detail directly (bypassing the store API).
+	var victim string
+	if err := s.db.QueryRowContext(ctx, `SELECT id FROM audit_log ORDER BY rowid ASC LIMIT 1 OFFSET 2`).Scan(&victim); err != nil {
+		t.Fatalf("pick victim: %v", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE audit_log SET detail = 'FORGED' WHERE id = ?`, victim); err != nil {
+		t.Fatalf("tamper: %v", err)
+	}
+	ok, _, broken, err = s.VerifyAuditChain(ctx)
+	if err != nil {
+		t.Fatalf("verify after tamper: %v", err)
+	}
+	if ok || broken != victim {
+		t.Errorf("tampered chain: ok=%v broken=%q, want false and broken=%s", ok, broken, victim)
+	}
+}
+
+func TestAuditChainDetectsDeletion(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	for i := 0; i < 3; i++ {
+		_ = s.InsertAuditEntry(ctx, model.AuditEntry{Actor: model.AuditActorSystem, Action: "a"})
+	}
+	// Delete the middle row: the row after it no longer chains to the right prev.
+	var mid string
+	_ = s.db.QueryRowContext(ctx, `SELECT id FROM audit_log ORDER BY rowid ASC LIMIT 1 OFFSET 1`).Scan(&mid)
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM audit_log WHERE id = ?`, mid); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	ok, _, _, err := s.VerifyAuditChain(ctx)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if ok {
+		t.Error("chain verified as intact after a mid-row deletion, want broken")
+	}
+}

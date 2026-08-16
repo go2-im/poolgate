@@ -3,6 +3,7 @@ import {
   getSettings,
   registerAdditionalPasskey,
   revokeAllSessions,
+  verifyAuditLog,
   webauthnSupported,
   type Me,
   type Settings as SettingsData,
@@ -23,12 +24,28 @@ export function Settings({
   const [note, setNote] = useState('')
   const [busy, setBusy] = useState(false)
   const [label, setLabel] = useState('')
+  const [auditNote, setAuditNote] = useState('')
 
   useEffect(() => {
     getSettings()
       .then(setSettings)
       .catch((e) => setErr(errMessage(e)))
   }, [])
+
+  async function checkAuditLog() {
+    setErr('')
+    setAuditNote('')
+    try {
+      const r = await verifyAuditLog()
+      setAuditNote(
+        r.ok
+          ? `Audit log intact — ${r.count} entries, hash chain verified.`
+          : `⚠ Audit log FAILED verification (${r.count} entries; first broken entry: ${r.broken_at}).`,
+      )
+    } catch (e) {
+      setErr(errMessage(e))
+    }
+  }
 
   async function addPasskey() {
     setErr('')
@@ -118,6 +135,16 @@ export function Settings({
           </>
         )}
         {note && <p className="hint">{note}</p>}
+      </div>
+
+      <div className="section">
+        <h2>Audit log integrity</h2>
+        <p className="muted">
+          The audit log is append-only and hash-chained. Verify recomputes the chain and reports
+          whether the persisted log has been tampered with, truncated, or reordered.
+        </p>
+        <button onClick={checkAuditLog}>Verify audit log</button>
+        {auditNote && <p className="hint">{auditNote}</p>}
       </div>
 
       <div className="section">

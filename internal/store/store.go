@@ -317,6 +317,12 @@ CREATE INDEX idx_audit_log_at ON audit_log(at);
 ALTER TABLE group_members ADD COLUMN weight INTEGER NOT NULL DEFAULT 1;
 `,
 	},
+	{
+		version: 9,
+		sql: `
+ALTER TABLE audit_log ADD COLUMN hash TEXT NOT NULL DEFAULT '';
+`,
+	},
 }
 
 // Migrate applies any migrations whose version is not yet recorded. It is
