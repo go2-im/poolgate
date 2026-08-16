@@ -2,6 +2,8 @@
 
 **Single-user, self-hostable manager and OpenAI-compatible reverse proxy for a pool of Codex/ChatGPT accounts — with a composable routing-policy engine and a passkey-protected web admin UI.**
 
+> 中文说明见 [`README.zh-CN.md`](README.zh-CN.md)（含功能总览与运行时资源需求评估）。
+
 ## What it does
 
 - **Pool multiple Codex/ChatGPT accounts** — import via OAuth or `~/.codex/auth.json`, auto-refresh tokens, and view per-account usage.
