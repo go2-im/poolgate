@@ -53,6 +53,9 @@ const (
 	DefaultUserAgent = "codex_cli_rs"
 	// DefaultOpenAIBeta is synthesized when the inbound request omits OpenAI-Beta.
 	DefaultOpenAIBeta = "responses=experimental"
+	// maxRequestBody caps the inbound request body (DESIGN.md §23). Oversized
+	// bodies are rejected with 413.
+	maxRequestBody = 32 << 20
 )
 
 // HealthHooks is the passive-transition surface the gateway calls on real
@@ -183,9 +186,26 @@ func WithBackpressure(queueWait time.Duration, retryAfterSecs int) Option {
 	}
 }
 
+// upstreamResponseHeaderTimeout bounds how long an upstream attempt may take to
+// send response headers before the gateway gives up on it and fails over. It
+// covers only the pre-first-byte phase (the upstream sends 200 + headers up front
+// before streaming SSE tokens), so it does not truncate long completions.
+const upstreamResponseHeaderTimeout = 60 * time.Second
+
+// defaultUpstreamTransport clones http.DefaultTransport and adds a
+// ResponseHeaderTimeout so a post-TLS/pre-headers stall is bounded.
+func defaultUpstreamTransport() *http.Transport {
+	tr, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return &http.Transport{ResponseHeaderTimeout: upstreamResponseHeaderTimeout}
+	}
+	t := tr.Clone()
+	t.ResponseHeaderTimeout = upstreamResponseHeaderTimeout
+	return t
+}
+
 // New builds a Gateway over st using cfg (for the upstream allowlist).
-func New(st *store.Store, cfg model.Config, opts ...Option) *Gateway {
-	g := &Gateway{
+func New(st *store.Store, cfg model.Config, opts ...Option) *Gateway {	g := &Gateway{
 		store:        st,
 		cfg:          cfg,
 		upstreamBase: DefaultUpstreamBase,
@@ -198,8 +218,13 @@ func New(st *store.Store, cfg model.Config, opts ...Option) *Gateway {
 		transport:    normalizeTransport(cfg.Server.Transport),
 		retryAfterSecs: 1,
 		// No client Timeout: SSE streams are long-lived; cancellation rides the
-		// request context instead.
-		httpc: &http.Client{},
+		// request context instead. We DO bound the pre-first-byte phase with a
+		// ResponseHeaderTimeout so a backend that completes TLS but then stalls
+		// before sending response headers triggers pre-first-byte failover rather
+		// than pinning the request (and its reserved inflight slot) indefinitely.
+		// This does not truncate the streamed body: it only limits time-to-headers,
+		// which the upstream sends up front before the SSE token stream.
+		httpc: &http.Client{Transport: defaultUpstreamTransport()},
 	}
 	for _, o := range opts {
 		o(g)
@@ -330,9 +355,19 @@ func (g *Gateway) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Read and normalize the inbound body once (force stream:true).
-	inBody, err := io.ReadAll(io.LimitReader(r.Body, 32<<20))
+	// Read and normalize the inbound body once (force stream:true). The body is
+	// capped at maxRequestBody; an oversized body is rejected with 413 rather than
+	// silently truncated (which would otherwise surface as a confusing 400 JSON
+	// parse error).
+	inBody, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBody))
 	if err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			rec.finish(http.StatusRequestEntityTooLarge, model.Account{}, "payload_too_large", 0, 0)
+			writeError(w, http.StatusRequestEntityTooLarge, "poolgate_payload_too_large",
+				"payload_too_large", fmt.Sprintf("request body exceeds %d bytes", maxRequestBody))
+			return
+		}
 		rec.finish(http.StatusBadRequest, model.Account{}, "bad_request", 0, 0)
 		writeError(w, http.StatusBadRequest, "poolgate_bad_request",
 			"bad_request", "failed to read request body")
@@ -396,11 +431,17 @@ func (g *Gateway) handleResponses(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		triedAny = true
-		streamed, status, retryAfter, tokensIn, tokensOut := g.forward(w, r, target, upBody, acct)
+		streamed, status, retryAfter, tokensIn, tokensOut, streamErr := g.forward(w, r, target, upBody, acct)
 		g.inflight.done(acct.ID)
 		if streamed {
-			rec.trace = append(rec.trace, acct.ID+":streamed")
-			rec.finish(status, acct, "", tokensIn, tokensOut)
+			errType := ""
+			if streamErr != nil {
+				errType = "stream_truncated"
+				rec.trace = append(rec.trace, acct.ID+":stream_truncated")
+			} else {
+				rec.trace = append(rec.trace, acct.ID+":streamed")
+			}
+			rec.finish(status, acct, errType, tokensIn, tokensOut)
 			return // response already written to client; do not re-select.
 		}
 		rec.trace = append(rec.trace, fmt.Sprintf("%s:%d", acct.ID, status))
@@ -490,11 +531,13 @@ func (g *Gateway) recordFailure(ctx context.Context, accounts []model.Account, b
 // streamed=false, the upstream status (0 on transport error), and any parsed
 // Retry-After so the caller may cooldown-gate and try the next account. On a
 // streamed response it also returns best-effort token counts sniffed from the
-// SSE usage event (DESIGN.md §15 / §23.4).
-func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, target string, body []byte, acct model.Account) (streamed bool, status int, retryAfter time.Duration, tokensIn, tokensOut int) {
+// SSE usage event (DESIGN.md §15 / §23.4). streamErr is non-nil when a committed
+// stream ended abnormally (upstream read error or client write error) so the
+// caller can record the truncation instead of a clean success.
+func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, target string, body []byte, acct model.Account) (streamed bool, status int, retryAfter time.Duration, tokensIn, tokensOut int, streamErr error) {
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, target, bytes.NewReader(body))
 	if err != nil {
-		return false, 0, 0, 0, 0
+		return false, 0, 0, 0, 0, nil
 	}
 
 	// Translation-gateway rewrite: Authorization + ChatGPT-Account-ID TOGETHER.
@@ -512,23 +555,59 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, target string,
 
 	resp, err := g.httpc.Do(req)
 	if err != nil {
-		return false, 0, 0, 0, 0
+		return false, 0, 0, 0, 0, nil
 	}
 
-	// Pre-stream upstream error -> allow re-selection (nothing written yet).
 	if resp.StatusCode >= 400 {
 		ra := parseRetryAfter(resp.Header.Get("Retry-After"))
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
-		_ = resp.Body.Close()
-		return false, resp.StatusCode, ra, 0, 0
+		if retryableStatus(resp.StatusCode) {
+			// Account-related or transient upstream failure (401/408/425/429/5xx):
+			// nothing written to the client yet, so allow pre-first-byte re-selection.
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+			_ = resp.Body.Close()
+			return false, resp.StatusCode, ra, 0, 0, nil
+		}
+		// Non-retryable upstream error (e.g. a client 400/404/422 — a bad request,
+		// unknown model, or oversized context). This is NOT an account problem, so
+		// failing over to other accounts would just amplify one bad request into N
+		// and still return a misleading 502. Relay the upstream response verbatim
+		// and commit — the client gets the real error and status.
+		defer resp.Body.Close()
+		relayHeaders(w, resp)
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, io.LimitReader(resp.Body, 8<<20))
+		return true, resp.StatusCode, 0, 0, 0, nil
 	}
 
 	// Commit to this account: relay with per-chunk flush.
 	defer resp.Body.Close()
 	relayHeaders(w, resp)
 	w.WriteHeader(resp.StatusCode)
-	tin, tout := relayStream(w, resp.Body)
-	return true, resp.StatusCode, 0, tin, tout
+	tin, tout, serr := relayStream(w, resp.Body)
+	if serr != nil {
+		// The response was already committed (200 + partial SSE), so we cannot
+		// change the status — but we surface the truncation so the monitor does
+		// not record a broken stream as a clean success.
+		g.logger.Warn("upstream stream ended abnormally",
+			slog.String("account", acct.ID), slog.String("err", serr.Error()))
+	}
+	return true, resp.StatusCode, 0, tin, tout, serr
+}
+
+// retryableStatus reports whether an upstream >= 400 status is safe to fail over
+// on (account-related or transient) versus a client/request error that should be
+// relayed to the caller as-is. Network errors (status 0) are always retryable and
+// handled by the caller before this is consulted.
+func retryableStatus(status int) bool {
+	switch status {
+	case http.StatusUnauthorized, // 401 -> token refresh + retry
+		http.StatusForbidden,       // 403 -> account entitlement/region; try another account
+		http.StatusRequestTimeout,  // 408
+		http.StatusTooEarly,        // 425
+		http.StatusTooManyRequests: // 429 -> cooldown + next
+		return true
+	}
+	return status >= 500 // any 5xx is server-side, never the client's fault
 }
 
 // authenticate constant-time-compares the presented key against every stored
@@ -710,9 +789,15 @@ func (v *routeView) Weight(id string) int {
 	return 1
 }
 
+// unknownHeadroom marks a best-quota member with no usage snapshot. It is
+// negative so selectBestQuota (which picks the maximum headroom) ranks it below
+// any known [0,100] value — an unprobed account never outranks trusted data.
+const unknownHeadroom = -1.0
+
 // buildView builds the routeView for one request. Base routability comes from the
 // eligible members; best-quota additionally loads each member's latest usage
-// snapshot to compute min headroom (missing snapshot => 100, unconstrained).
+// snapshot to compute min headroom (missing snapshot => unknownHeadroom, ranked
+// below any known value).
 func (g *Gateway) buildView(ctx context.Context, group model.PolicyGroup, eligible []model.Account) *routeView {
 	v := &routeView{
 		healthy:   make(map[string]bool, len(eligible)),
@@ -729,7 +814,13 @@ func (g *Gateway) buildView(ctx context.Context, group model.PolicyGroup, eligib
 	if group.Strategy == model.StrategyBestQuota {
 		v.headroom = make(map[string]float64, len(eligible))
 		for _, a := range eligible {
-			h := 100.0
+			// A missing usage snapshot is UNKNOWN headroom, not "full". Treating it
+			// as 100 made never-probed accounts (and accounts whose usage probe keeps
+			// failing) outrank accounts with real, trusted headroom. Rank unknown
+			// below any known value (selectBestQuota compares numerically); an
+			// all-unknown pool still ties and falls back to deterministic ordering,
+			// and the usage poller fills the snapshot within a poll interval.
+			h := unknownHeadroom
 			if snap, err := g.store.GetLatestUsage(ctx, a.ID); err == nil {
 				h = policy.MinHeadroom(model.Usage{PlanType: snap.PlanType, Windows: snap.Windows})
 			}
@@ -805,18 +896,27 @@ func (g *Gateway) cursorFor(groupID string) *policy.Cursor {
 	return c
 }
 
-// parseRetryAfter parses a Retry-After header (delta-seconds only; the HTTP-date
-// form is treated as unknown => 0). Non-numeric or non-positive values => 0.
+// parseRetryAfter parses a Retry-After header. RFC 7231 permits either
+// delta-seconds ("120") or an HTTP-date ("Wed, 21 Oct 2026 07:28:00 GMT"); both
+// forms are honored. The HTTP-date form is converted to a delta from now and
+// clamped at 0. Empty, malformed, or non-positive values => 0.
 func parseRetryAfter(v string) time.Duration {
 	v = strings.TrimSpace(v)
 	if v == "" {
 		return 0
 	}
-	secs, err := strconv.Atoi(v)
-	if err != nil || secs <= 0 {
-		return 0
+	if secs, err := strconv.Atoi(v); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		return time.Duration(secs) * time.Second
 	}
-	return time.Duration(secs) * time.Second
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
 }
 
 // bearerToken extracts the sk- token from Authorization: Bearer <token>.
@@ -894,14 +994,18 @@ func isWebSocketUpgrade(r *http.Request) bool {
 }
 
 // forceStream sets "stream": true on a JSON request body (DESIGN.md §0 D1).
+// It decodes into map[string]json.RawMessage rather than map[string]any so that
+// every other field's exact bytes are preserved — integers larger than 2^53 keep
+// full precision and numeric formatting is not rewritten (a plain any decode
+// coerces all JSON numbers to float64).
 func forceStream(body []byte) ([]byte, error) {
-	var m map[string]any
+	var m map[string]json.RawMessage
 	if len(bytes.TrimSpace(body)) == 0 {
-		m = map[string]any{}
+		m = map[string]json.RawMessage{}
 	} else if err := json.Unmarshal(body, &m); err != nil {
 		return nil, err
 	}
-	m["stream"] = true
+	m["stream"] = json.RawMessage("true")
 	return json.Marshal(m)
 }
 
@@ -927,28 +1031,33 @@ func relayHeaders(w http.ResponseWriter, resp *http.Response) {
 // SSE events reach the caller immediately (DESIGN.md §14 streaming pass-through).
 // It also keeps a bounded tail of the stream and, at EOF, sniffs the final SSE
 // usage event for token counts (best-effort; 0 when absent — DESIGN.md §15/§23.4).
-func relayStream(w http.ResponseWriter, body io.Reader) (tokensIn, tokensOut int) {
+// It returns a non-nil err when the stream ended abnormally: an upstream read
+// error (truncated completion) or a client write error (caller disconnected). A
+// clean io.EOF returns nil.
+func relayStream(w http.ResponseWriter, body io.Reader) (tokensIn, tokensOut int, err error) {
 	flusher, _ := w.(http.Flusher)
 	tail := &tailBuffer{max: 64 << 10}
 	buf := make([]byte, 16<<10)
 	for {
-		n, err := body.Read(buf)
+		n, rerr := body.Read(buf)
 		if n > 0 {
 			if _, werr := w.Write(buf[:n]); werr != nil {
-				break
+				tin, tout := parseUsage(tail.bytes())
+				return tin, tout, fmt.Errorf("client write: %w", werr)
 			}
 			if flusher != nil {
 				flusher.Flush()
 			}
 			_, _ = tail.Write(buf[:n])
 		}
-		if err != nil {
-			// EOF or transport error: stop. Mid-stream we propagate nothing
-			// extra (§19.2).
-			break
+		if rerr != nil {
+			tin, tout := parseUsage(tail.bytes())
+			if errors.Is(rerr, io.EOF) {
+				return tin, tout, nil
+			}
+			return tin, tout, fmt.Errorf("upstream read: %w", rerr)
 		}
 	}
-	return parseUsage(tail.bytes())
 }
 
 // tailBuffer retains only the last max bytes written to it — enough to hold the

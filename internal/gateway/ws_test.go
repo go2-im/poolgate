@@ -42,6 +42,13 @@ func newWSUpstream(t *testing.T, reject map[string]int) *wsUpstream {
 			http.Error(w, "rejected", status)
 			return
 		}
+		// A plain (non-upgrade) POST exercises the HTTP transport path; answer it
+		// with a normal SSE 200 so http-only routing tests see the HTTP path served
+		// rather than the WS library's 426 upgrade-required response.
+		if !isWebSocketUpgrade(r) {
+			streamOK(w)
+			return
+		}
 		u.mu.Lock()
 		u.accepted = append(u.accepted, wsSeen{
 			accountID: acctID,
