@@ -463,11 +463,12 @@ func TestWriteRotationJournalOpenError(t *testing.T) {
 	}
 }
 
-// TestDeleteAccountAbortsWhenJournalUndeletable proves the fail-closed ordering in
-// DeleteAccount: if the rotation journal cannot be removed, the account is NOT deleted
-// (so we never report failure on an already-committed delete, and never strand an
-// orphan journal).
-func TestDeleteAccountAbortsWhenJournalUndeletable(t *testing.T) {
+// TestDeleteAccountSucceedsDespiteUndeletableJournal proves the P1#4 ordering: the DB
+// row is deleted first, so a failure to remove the (now-moot) rotation journal does
+// NOT fail the already-committed delete — the account is gone and the orphan journal
+// is left for the next startup replay to drop. (Contrast the old journal-first order,
+// which could destroy a STILL-LIVE account's recovery journal if the DB delete failed.)
+func TestDeleteAccountSucceedsDespiteUndeletableJournal(t *testing.T) {
 	dir := t.TempDir()
 	s := openStoreDir(t, dir)
 	ctx := context.Background()
@@ -483,11 +484,11 @@ func TestDeleteAccountAbortsWhenJournalUndeletable(t *testing.T) {
 	if err := os.WriteFile(jp+"/block", []byte("x"), 0o600); err != nil {
 		t.Fatalf("write blocker: %v", err)
 	}
-	if err := s.DeleteAccount(ctx, a.ID); err == nil {
-		t.Fatal("DeleteAccount must fail closed when the journal cannot be removed")
+	if err := s.DeleteAccount(ctx, a.ID); err != nil {
+		t.Fatalf("DeleteAccount must succeed even when the moot journal can't be removed: %v", err)
 	}
-	if _, err := s.GetAccount(ctx, a.ID); err != nil {
-		t.Fatalf("account must still exist after a failed-closed delete: %v", err)
+	if _, err := s.GetAccount(ctx, a.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("account must be deleted (DB row gone): got err %v", err)
 	}
 }
 

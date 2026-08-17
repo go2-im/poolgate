@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/go2-im/poolgate/internal/backup"
-	"github.com/go2-im/poolgate/internal/lock"
 	"github.com/go2-im/poolgate/internal/store"
 )
 
@@ -40,32 +39,17 @@ func cmdBackup(args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	// Refuse to back up over a half-committed restore (backup uses store.Snapshot,
-	// not openStore, so it needs its own guard).
-	if err := guardRestoreMarker(cfg); err != nil {
-		return err
-	}
-	// Take the single-instance lock so a live `poolgate serve` cannot run an online
-	// token refresh (which writes a rotation journal + updates the DB WITHOUT this
-	// lock) between our pending-journal check and the DB snapshot below — a TOCTOU
-	// that would otherwise let a bundle capture an already-consumed token. Backup is
-	// therefore an offline operation: stop serve first (matches restore/rotate-key).
-	ilk, err := lock.Acquire(filepath.Join(cfg.DataDir, lockFile))
-	if err != nil {
-		if errors.Is(err, lock.ErrLocked) {
-			return fmt.Errorf("a poolgate serve is running for %s — stop it before backing up (backup must snapshot without a concurrent token refresh)", cfg.DataDir)
-		}
-		return fmt.Errorf("acquire single-instance lock: %w", err)
-	}
-	defer ilk.Release()
-	// Hold the maintenance lock so a concurrent import/login/rotate/restore cannot
-	// slip between the key read and the DB snapshot below (which would pair an OLD
-	// key with a NEW-key DB image — a bundle that only fails at restore time).
-	mlk, err := acquireMaintenanceLock(cfg)
+	// Canonical one-shot guards (offline): single-instance lock (a live serve must
+	// not run an online token refresh between our pending-journal check and the DB
+	// snapshot — a TOCTOU that could capture an already-consumed token; backup is an
+	// offline op) + maintenance lock (exclude a concurrent import/login/rotate/restore)
+	// + restore-marker check UNDER the locks (previously the marker was checked BEFORE
+	// the locks — a TOCTOU vs a restore setting it in the gap; audit P1#5).
+	guards, err := acquireCommandGuards(cfg, true)
 	if err != nil {
 		return err
 	}
-	defer mlk.Release()
+	defer guards.Release()
 	// Refuse to back up while a refresh-token rotation is journaled but not yet
 	// persisted: the journal lives OUTSIDE the DB snapshot and is encrypted with the
 	// current key, so a bundle taken now would omit it and a restore would resurrect
@@ -182,42 +166,23 @@ func cmdRestore(args []string, stdout io.Writer) error {
 		return fmt.Errorf("create data dir: %w", err)
 	}
 
-	// Refuse to restore into a data dir that a live `poolgate serve` is using:
-	// restore renames the DB and deletes the -wal/-shm sidecars out from under the
-	// running server, silently losing its writes / risking corruption. The
-	// single-instance lock (held by serve) makes that detectable.
-	lk, err := lock.Acquire(filepath.Join(cfg.DataDir, lockFile))
-	if err != nil {
-		if errors.Is(err, lock.ErrLocked) {
-			return fmt.Errorf("a poolgate serve is running for %s — stop it before restoring", cfg.DataDir)
-		}
-		return fmt.Errorf("acquire lock: %w", err)
-	}
-	defer lk.Release()
-
-	// Also take the maintenance lock so a restore cannot race an import/login/backup
-	// (which don't take the single-instance lock but DO take the maintenance lock).
-	mlk, err := acquireMaintenanceLock(cfg)
+	// Canonical one-shot guards (offline): single-instance lock (restore renames the
+	// DB and deletes -wal/-shm out from under any running serve — refuse if serve
+	// holds it) + maintenance lock (a restore must not race import/login/backup, which
+	// take the maintenance lock but not the single-instance lock) + restore-marker
+	// check UNDER the locks: refuse when a PRIOR restore was interrupted mid-commit
+	// (its marker is still present), since a second restore would move the current
+	// generation onto the SAME fixed *.prev names, clobbering the first restore's saved
+	// originals. The operator must recover the interrupted restore by hand (the marker
+	// documents the .prev files) and remove the marker before restoring again.
+	guards, err := acquireCommandGuards(cfg, true)
 	if err != nil {
 		return err
 	}
-	defer mlk.Release()
+	defer guards.Release()
 
 	dbPath := filepath.Join(cfg.DataDir, store.DBFileName)
 	keyPath := filepath.Join(cfg.DataDir, masterKeyFile)
-
-	// Refuse to start when a PRIOR restore was interrupted mid-commit (its marker is
-	// still present). A second restore would move the current generation aside onto
-	// the SAME fixed *.prev names, clobbering the first restore's saved originals and
-	// producing a mixed DB/key generation. The operator must recover the interrupted
-	// restore by hand (the marker documents the .prev files to inspect) and remove
-	// the marker before restoring again.
-	if _, statErr := os.Stat(filepath.Join(cfg.DataDir, restoreMarkerFile)); statErr == nil {
-		return fmt.Errorf("a previous restore into %s did not finish (%s exists) — recover it manually (check the *.prev files) and remove the marker before restoring again",
-			cfg.DataDir, restoreMarkerFile)
-	} else if !errors.Is(statErr, os.ErrNotExist) {
-		return fmt.Errorf("stat restore marker: %w", statErr)
-	}
 
 	// Refuse to clobber an existing install unless --force.
 	if !force {

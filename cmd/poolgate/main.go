@@ -398,9 +398,16 @@ func cmdInit(_ []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
-		return fmt.Errorf("create data dir: %w", err)
+
+	// Hold the maintenance lock (concurrent-safe: init coordinates with any running
+	// serve via the in-store credential lock) and check the restore marker UNDER it,
+	// before openStore mints/opens the key + DB — previously init opened the store with
+	// NO lock, so its marker check raced a concurrent restore that set it (P1#5).
+	guards, err := acquireCommandGuards(cfg, false)
+	if err != nil {
+		return err
 	}
+	defer guards.Release()
 
 	// Open store: this generates the keyfile (if keyfile source) and migrates.
 	st, err := openStore(cfg)
@@ -470,6 +477,15 @@ func cmdAdminResetAuth(_ []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
+	// Hold the maintenance lock and check the restore marker UNDER it before opening
+	// the store (previously opened with NO lock — a marker-check TOCTOU vs a concurrent
+	// restore; P1#5). Concurrent-safe (offline=false): reset-auth may run while serve
+	// is up.
+	guards, err := acquireCommandGuards(cfg, false)
+	if err != nil {
+		return err
+	}
+	defer guards.Release()
 	st, err := openStore(cfg)
 	if err != nil {
 		return err
@@ -514,6 +530,72 @@ func acquireMaintenanceLock(cfg model.Config) (*lock.Lock, error) {
 		return nil, fmt.Errorf("acquire maintenance lock: %w", err)
 	}
 	return lk, nil
+}
+
+// commandGuards bundles the standard guards a credential-touching one-shot command
+// holds for its duration. Release() unwinds them in reverse acquisition order and is
+// safe to call via defer (and on a nil receiver).
+type commandGuards struct {
+	ilk *lock.Lock // single-instance lock (offline commands only); nil otherwise
+	mlk *lock.Lock // maintenance lock (always held)
+}
+
+// Release releases the held locks (maintenance first, then single-instance).
+func (g *commandGuards) Release() {
+	if g == nil {
+		return
+	}
+	if g.mlk != nil {
+		_ = g.mlk.Release()
+	}
+	if g.ilk != nil {
+		_ = g.ilk.Release()
+	}
+}
+
+// acquireCommandGuards takes the canonical guards for a credential-touching one-shot
+// command IN A FIXED ORDER, so the restore-marker check is always performed while the
+// locks are held. This closes the TOCTOU (audit P1#5) where a concurrent `restore`
+// could set the marker between an unlocked check and the lock — or, for `rotate-key`,
+// where the marker was not checked at all:
+//
+//  1. single-instance lock — ONLY when offline is true (backup / rotate-key / restore,
+//     which must exclude a live `serve`). Concurrent-safe commands (init / admin /
+//     import / login) pass offline=false: they coordinate with a running serve via the
+//     in-store credential lock and need only mutual exclusion against each other (the
+//     maintenance lock), which ALSO serializes them against restore (restore holds the
+//     maintenance lock too).
+//  2. maintenance lock — always (serializes credential one-shots, including restore).
+//  3. guardRestoreMarker — LAST, under the locks above.
+//
+// The caller must defer Release().
+func acquireCommandGuards(cfg model.Config, offline bool) (*commandGuards, error) {
+	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
+		return nil, fmt.Errorf("create data dir: %w", err)
+	}
+	g := &commandGuards{}
+	if offline {
+		ilk, err := lock.Acquire(filepath.Join(cfg.DataDir, lockFile))
+		if err != nil {
+			g.Release()
+			if errors.Is(err, lock.ErrLocked) {
+				return nil, fmt.Errorf("a poolgate serve is running for %s — stop it before running this offline command (backup / rotate-key / restore)", cfg.DataDir)
+			}
+			return nil, fmt.Errorf("acquire single-instance lock: %w", err)
+		}
+		g.ilk = ilk
+	}
+	mlk, err := acquireMaintenanceLock(cfg)
+	if err != nil {
+		g.Release()
+		return nil, err
+	}
+	g.mlk = mlk
+	if err := guardRestoreMarker(cfg); err != nil {
+		g.Release()
+		return nil, err
+	}
+	return g, nil
 }
 
 // cmdImport parses a Codex auth.json and stores the account. If the store has no
