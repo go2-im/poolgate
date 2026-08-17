@@ -832,16 +832,19 @@ FROM accounts WHERE id = ?`, id,
 }
 
 // SetAccountTiming persists the per-account scheduling/backoff state, bumping
-// updated_at. Zero-valued timestamps are written as SQL NULL.
+// updated_at. Zero-valued timestamps are written as SQL NULL. It deliberately
+// does NOT touch concurrency_cap — that is admin-owned config (UpdateAccountMeta),
+// and writing it back here would clobber an operator's just-changed cap with the
+// value the health engine happened to read earlier.
 func (s *Store) SetAccountTiming(ctx context.Context, id string, t model.AccountTiming) error {
 	res, err := s.db.ExecContext(ctx, `
 UPDATE accounts SET
 	cooldown_until = ?, next_probe_at = ?,
-	consecutive_failures = ?, backoff_level = ?, concurrency_cap = ?,
+	consecutive_failures = ?, backoff_level = ?,
 	updated_at = ?
 WHERE id = ?`,
 		nullableTime(t.CooldownUntil), nullableTime(t.NextProbeAt),
-		t.ConsecutiveFailures, t.BackoffLevel, t.ConcurrencyCap,
+		t.ConsecutiveFailures, t.BackoffLevel,
 		formatTime(time.Now().UTC()), id)
 	if err != nil {
 		return fmt.Errorf("store: set account timing: %w", err)
@@ -875,18 +878,19 @@ func (s *Store) GetAccountState(ctx context.Context, id string) (model.AccountSt
 // timing in ONE UPDATE statement, so the two can never be observed or persisted
 // out of sync (previously they were two separate statements — a crash or error
 // between them left state and cooldown inconsistent). Zero-valued timestamps are
-// written as SQL NULL.
+// written as SQL NULL. Like SetAccountTiming it does NOT write concurrency_cap
+// (admin-owned config), so a health transition can't clobber an operator's cap.
 func (s *Store) UpdateStateAndTiming(ctx context.Context, id string, state model.AccountState, t model.AccountTiming) error {
 	res, err := s.db.ExecContext(ctx, `
 UPDATE accounts SET
 	state = ?,
 	cooldown_until = ?, next_probe_at = ?,
-	consecutive_failures = ?, backoff_level = ?, concurrency_cap = ?,
+	consecutive_failures = ?, backoff_level = ?,
 	updated_at = ?
 WHERE id = ?`,
 		string(state),
 		nullableTime(t.CooldownUntil), nullableTime(t.NextProbeAt),
-		t.ConsecutiveFailures, t.BackoffLevel, t.ConcurrencyCap,
+		t.ConsecutiveFailures, t.BackoffLevel,
 		formatTime(time.Now().UTC()), id)
 	if err != nil {
 		return fmt.Errorf("store: update state and timing: %w", err)
@@ -1246,10 +1250,15 @@ func newID(prefix string) string {
 // row ids), the session id is ALSO the admin bearer cookie value and the only
 // secret gating authenticated endpoints, so it uses 256 bits of entropy — far
 // beyond any online guessing budget even without a per-request throttle.
-func newSessionID() string {
+// newSessionID mints an admin session id. Unlike newID (64-bit, fine for opaque
+// row ids), the session id is ALSO the admin bearer cookie value and the only
+// secret gating authenticated endpoints, so it uses 256 bits of entropy and FAILS
+// CLOSED: a CSPRNG error returns an error rather than degrading to a predictable
+// timestamp-derived value.
+func newSessionID() (string, error) {
 	var b [32]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		return fmt.Sprintf("sess_%d", time.Now().UnixNano())
+		return "", fmt.Errorf("store: session id entropy: %w", err)
 	}
-	return "sess_" + hex.EncodeToString(b[:])
+	return "sess_" + hex.EncodeToString(b[:]), nil
 }

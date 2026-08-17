@@ -149,8 +149,10 @@ func TestGetAccountStateAndUpdateStateAndTiming(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAccountTiming: %v", err)
 	}
+	// Timing round-trips EXCEPT concurrency_cap, which the health timing writes no
+	// longer touch (it is admin-owned config): it stays at the column default.
 	if !gotT.CooldownUntil.Equal(cooldown) || gotT.ConsecutiveFailures != 3 ||
-		gotT.BackoffLevel != 2 || gotT.ConcurrencyCap != 5 {
+		gotT.BackoffLevel != 2 || gotT.ConcurrencyCap != 0 {
 		t.Fatalf("timing round-trip mismatch: %+v", gotT)
 	}
 
@@ -160,6 +162,33 @@ func TestGetAccountStateAndUpdateStateAndTiming(t *testing.T) {
 	}
 	if err := s.UpdateStateAndTiming(ctx, "nope", model.StateOK, model.AccountTiming{}); err != ErrNotFound {
 		t.Fatalf("UpdateStateAndTiming(unknown) = %v, want ErrNotFound", err)
+	}
+}
+
+func TestConcurrencyCapNotClobberedByTimingWrite(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	acc, err := s.InsertAccount(ctx, model.Account{Label: "a", AccessToken: "a", RefreshToken: "r"})
+	if err != nil {
+		t.Fatalf("InsertAccount: %v", err)
+	}
+	// Admin sets a concurrency cap.
+	if err := s.UpdateAccountMeta(ctx, acc.ID, "a", 9); err != nil {
+		t.Fatalf("UpdateAccountMeta: %v", err)
+	}
+	// A health transition writes timing (carrying a DIFFERENT cap value) — it must
+	// NOT clobber the admin-set cap.
+	if err := s.UpdateStateAndTiming(ctx, acc.ID, model.StateCooldown, model.AccountTiming{
+		ConsecutiveFailures: 1, BackoffLevel: 1, ConcurrencyCap: 999,
+	}); err != nil {
+		t.Fatalf("UpdateStateAndTiming: %v", err)
+	}
+	got, err := s.GetAccount(ctx, acc.ID)
+	if err != nil {
+		t.Fatalf("GetAccount: %v", err)
+	}
+	if got.ConcurrencyCap != 9 {
+		t.Fatalf("concurrency_cap = %d, want 9 (admin value preserved, not clobbered by health)", got.ConcurrencyCap)
 	}
 }
 

@@ -253,7 +253,9 @@ func TestAccountTimingDefaultsAndUpdate(t *testing.T) {
 	if !got.CooldownUntil.Equal(cooldown) || !got.NextProbeAt.Equal(nextProbe) {
 		t.Errorf("timestamps = %+v, want cooldown=%v next=%v", got, cooldown, nextProbe)
 	}
-	if got.ConsecutiveFailures != 3 || got.BackoffLevel != 2 || got.ConcurrencyCap != 5 {
+	// concurrency_cap is admin-owned and NOT written by SetAccountTiming, so it
+	// stays at the column default regardless of what the timing struct carried.
+	if got.ConsecutiveFailures != 3 || got.BackoffLevel != 2 || got.ConcurrencyCap != 0 {
 		t.Errorf("counters = %+v", got)
 	}
 
