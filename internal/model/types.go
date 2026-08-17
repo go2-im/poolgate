@@ -331,6 +331,14 @@ type ServerConfig struct {
 	// double-execute / double-bill. Provably non-executing statuses (401/403/429) are
 	// always failover-eligible regardless of this flag (DESIGN.md §19.2).
 	AllowUncertainCrossAccountRetry bool `yaml:"allow_uncertain_cross_account_retry,omitempty" json:"allow_uncertain_cross_account_retry,omitempty"`
+	// ReadyzRequireHealthy makes /readyz require at least one endpoint with a
+	// PROVEN-healthy (state ok) account, instead of the default which — during a
+	// bounded cold-start grace after startup — also accepts freshly-imported
+	// (unknown, not-yet-probed) accounts so a fresh process reports ready promptly
+	// (DESIGN.md §21.1). Default false (cold-start-friendly). Set true for a strict
+	// readiness signal (e.g. a load balancer that must only route to a poolgate
+	// whose pool has a probe-confirmed account).
+	ReadyzRequireHealthy bool `yaml:"readyz_require_healthy,omitempty" json:"readyz_require_healthy,omitempty"`
 }
 
 // ListenConfig is a host:port bind pair. For the admin listener it also carries

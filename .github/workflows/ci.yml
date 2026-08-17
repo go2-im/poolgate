@@ -17,7 +17,7 @@ jobs:
   go:
     runs-on: ubuntu-latest
     steps:
-      # SHA-pinned per docs/SECURITY.md (audit finding C) — actions/checkout@v4
+      # SHA-pinned per docs/SECURITY.md (audit finding C) — actions/checkout v7.0.1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       # actions/setup-go@v5
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
@@ -89,3 +89,47 @@ jobs:
             echo "suspicious domain found"; exit 1
           fi
           echo "domain lint: OK"
+
+  # Frontend build gate (DESIGN §0 D10 / §CI): rebuild the admin SPA from source with
+  # the committed public-registry lockfile and verify the embedded internal/webui/dist
+  # matches — so a stale/hand-edited bundle can never ship. The Go binary embeds dist,
+  # so `go build` itself needs no npm; this job is the only place the frontend is built.
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      # actions/checkout v7.0.1 (SHA-pinned per docs/SECURITY.md — audit finding C)
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      # actions/setup-node v4.4.0 (SHA-pinned)
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          # The committed dist must be reproduced BYTE-IDENTICALLY here. The bundler
+          # is vite 8 (rolldown/lightningcss native binaries) + TypeScript 7 (tsgo),
+          # all pinned by the committed lockfile; Node is only the host runtime. If a
+          # future toolchain bump makes the output non-reproducible across platforms,
+          # the verify step below fails CLOSED (blocks the merge) — it never ships a
+          # mismatch. A red gate means "rebuild locally (cd web && npm ci && npm run
+          # build) and commit the result", not "flaky".
+          node-version: '22'
+
+      - name: install (npm ci — exact deps from the committed public-registry lockfile)
+        working-directory: web
+        run: npm ci --registry=https://registry.npmjs.org/ --no-audit --no-fund
+
+      - name: build the admin SPA
+        working-directory: web
+        run: npm run build
+
+      - name: verify embedded dist matches source
+        shell: bash
+        run: |
+          set -euo pipefail
+          # --porcelain catches modified AND newly-added/removed files (git diff
+          # --exit-code alone misses untracked additions).
+          if [ -n "$(git status --porcelain -- internal/webui/dist)" ]; then
+            echo "internal/webui/dist does not match a fresh build:"
+            git status --porcelain -- internal/webui/dist
+            git diff -- internal/webui/dist || true
+            echo "Fix: cd web && npm ci && npm run build, then commit internal/webui/dist."
+            exit 1
+          fi
+          echo "embedded dist: up to date"
