@@ -28,7 +28,6 @@ import (
 	"time"
 
 	"github.com/go2-im/poolgate/internal/crypto"
-	"github.com/go2-im/poolgate/internal/lock"
 	"github.com/go2-im/poolgate/internal/model"
 	"github.com/go2-im/poolgate/internal/store"
 )
@@ -38,30 +37,17 @@ func cmdRotateKey(_ []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
-		return fmt.Errorf("create data dir: %w", err)
-	}
 
-	// Single-instance guard: rotation must not race a running serve (which holds
-	// the old cipher in memory and would write old-key ciphertext mid-rotation).
-	lk, err := lock.Acquire(filepath.Join(cfg.DataDir, lockFile))
-	if err != nil {
-		if err == lock.ErrLocked {
-			return fmt.Errorf("another poolgate process holds the lock (is `serve` running?); stop it before rotating the key")
-		}
-		return fmt.Errorf("acquire single-instance lock: %w", err)
-	}
-	defer lk.Release()
-
-	// Also take the maintenance lock: import/login/backup do NOT take the
-	// single-instance lock above, so without this a rotate-key could race an
-	// in-flight login/import (sealing a new account under the OLD cipher) or a
-	// backup (pairing an old key with a new-key snapshot).
-	mlk, err := acquireMaintenanceLock(cfg)
+	// Canonical one-shot guards (offline): single-instance lock (rotation must not
+	// race a running serve holding the old cipher) + maintenance lock (import/login
+	// don't take the single-instance lock) + restore-marker check UNDER the locks.
+	// rotate-key previously took the two locks but NEVER checked the restore marker,
+	// so it could re-encrypt a half-restored DB (audit P1#5) — the guard closes that.
+	guards, err := acquireCommandGuards(cfg, true)
 	if err != nil {
 		return err
 	}
-	defer mlk.Release()
+	defer guards.Release()
 
 	// Open the store with the CURRENT (old) key.
 	oldKey, err := loadMasterKey(cfg)

@@ -79,7 +79,7 @@ func TestRestoreRefusesWithStaleMarker(t *testing.T) {
 		t.Fatalf("write marker: %v", err)
 	}
 	err := run(ctx, []string{"restore", bundle, "--force"}, io.Discard, io.Discard)
-	if err == nil || !strings.Contains(err.Error(), "did not finish") {
+	if err == nil || !strings.Contains(err.Error(), "recover it manually") {
 		t.Fatalf("restore err = %v, want a stale-marker refusal", err)
 	}
 }

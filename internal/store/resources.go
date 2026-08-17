@@ -18,16 +18,20 @@ import (
 // DeleteAccount removes one account by id. ErrNotFound if it does not exist.
 // Foreign keys ON DELETE CASCADE clean up usage_snapshots / health_checks; the
 // account's group_members rows are removed in the SAME transaction so a deleted
-// account never leaves a dangling member id that would break endpoint routing. The
-// whole delete runs under the credential lock and removes the account's rotation
-// journal FIRST (fail-closed): if the journal can't be dropped we abort BEFORE the
-// irreversible DB delete, so we never report failure on an already-committed delete
-// and never leave an orphan journal blocking backup/rotate.
+// account never leaves a dangling member id that would break endpoint routing.
+//
+// Ordering (audit P1#4): the DB row is deleted FIRST (inside the transaction), and
+// only AFTER the commit is the rotation journal removed — best-effort. The previous
+// order (drop the journal, THEN delete the row) meant that if the journal was removed
+// but the DB delete then failed, a STILL-LIVE account was left with its recovery
+// journal destroyed (a stranded, unrecoverable in-flight rotation). With the DB delete
+// first, a failed delete leaves the account AND its journal intact; and a
+// journal-removal failure AFTER a committed delete is harmless — the account no longer
+// exists, so any leftover journal is moot and is dropped by the next startup replay
+// (GetAccount→ErrNotFound). We therefore do NOT fail the delete on a journal-removal
+// error: the delete already succeeded. All under the credential lock.
 func (s *Store) DeleteAccount(ctx context.Context, id string) error {
 	return s.withCredentialLock(func() error {
-		if err := s.removeRotationJournal(id); err != nil {
-			return fmt.Errorf("store: remove rotation journal before delete: %w", err)
-		}
 		tx, err := s.db.BeginTx(ctx, nil)
 		if err != nil {
 			return fmt.Errorf("store: begin delete account: %w", err)
@@ -44,12 +48,16 @@ func (s *Store) DeleteAccount(ctx context.Context, id string) error {
 			return fmt.Errorf("store: delete account: %w", err)
 		}
 		if err := oneRow(res, "delete account"); err != nil {
-			_ = tx.Rollback()
+			_ = tx.Rollback() // ErrNotFound: journal untouched (nothing was deleted)
 			return err
 		}
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("store: commit delete account: %w", err)
 		}
+		// The account row is gone. Drop its now-moot rotation journal best-effort: a
+		// failure here does NOT fail the (already-committed) delete — the orphan journal
+		// references a non-existent account and is dropped by the next startup replay.
+		_ = s.removeRotationJournal(id)
 		return nil
 	})
 }

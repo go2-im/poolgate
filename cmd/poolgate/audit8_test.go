@@ -30,8 +30,8 @@ func TestBackupRefusesWhileServing(t *testing.T) {
 	defer held.Release()
 
 	err = run(ctx, []string{"backup", "--out", filepath.Join(t.TempDir(), "b.pgbak")}, io.Discard, io.Discard)
-	if err == nil || !strings.Contains(err.Error(), "stop it before backing up") {
-		t.Fatalf("backup-while-serving err = %v, want a 'stop it before backing up' message", err)
+	if err == nil || !strings.Contains(err.Error(), "serve is running") {
+		t.Fatalf("backup-while-serving err = %v, want a 'serve is running' refusal", err)
 	}
 }
 

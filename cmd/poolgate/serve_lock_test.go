@@ -62,8 +62,8 @@ func TestRestoreRefusesWhileServing(t *testing.T) {
 	defer held.Release()
 
 	err = run(ctx, []string{"restore", bundle, "--force"}, io.Discard, io.Discard)
-	if err == nil || !strings.Contains(err.Error(), "stop it before restoring") {
-		t.Fatalf("restore-while-serving error = %v, want a 'stop it before restoring' message", err)
+	if err == nil || !strings.Contains(err.Error(), "serve is running") {
+		t.Fatalf("restore-while-serving error = %v, want a 'serve is running' message", err)
 	}
 }
 
@@ -86,8 +86,8 @@ func TestRotateKeyRefusesWhileServing(t *testing.T) {
 	defer held.Release()
 
 	err = run(ctx, []string{"rotate-key"}, io.Discard, io.Discard)
-	if err == nil || !strings.Contains(err.Error(), "holds the lock") {
-		t.Fatalf("rotate-while-serving error = %v, want a 'holds the lock' message", err)
+	if err == nil || !strings.Contains(err.Error(), "serve is running") {
+		t.Fatalf("rotate-while-serving error = %v, want a 'serve is running' message", err)
 	}
 	// No pre-rotation snapshot should have been written (it aborts before that).
 	snaps, _ := filepath.Glob(filepath.Join(dir, "poolgate-pre-rotate-*.db"))
