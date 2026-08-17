@@ -713,11 +713,12 @@ func (s *Store) UpsertAccountByAccountID(ctx context.Context, a model.Account) (
 	if err != nil {
 		return model.Account{}, false, fmt.Errorf("store: lookup account by account_id: %w", err)
 	}
-	// Drop any pending rotation journal BEFORE overwriting, fail-closed: the fresh
-	// login credentials supersede it, and a surviving journal could later re-apply a
-	// stale rotated token over them.
-	if err := s.removeRotationJournal(existingID); err != nil {
-		return model.Account{}, false, fmt.Errorf("store: clear pending rotation before replace: %w", err)
+	// Write a recovery journal with the NEW credentials BEFORE overwriting the DB row
+	// (and OVERWRITING any stale pending journal), so a crash or failure during the
+	// update leaves the fresh token recoverable — never delete the only recovery copy
+	// first. The journal is removed only after the DB update succeeds.
+	if err := s.writeRotationJournal(existingID, a.AccessToken, a.RefreshToken); err != nil {
+		return model.Account{}, false, fmt.Errorf("store: journal credentials before replace: %w", err)
 	}
 	sealedAccess, err := s.cipher.Seal(a.AccessToken)
 	if err != nil {
@@ -733,7 +734,10 @@ func (s *Store) UpsertAccountByAccountID(ctx context.Context, a model.Account) (
 	if _, err := s.db.ExecContext(ctx, `
 UPDATE accounts SET access_token = ?, refresh_token = ?, id_token = '', state = ?, updated_at = ? WHERE id = ?`,
 		sealedAccess, sealedRefresh, string(model.StateUnknown), formatTime(time.Now().UTC()), existingID); err != nil {
-		return model.Account{}, false, fmt.Errorf("store: update account by account_id: %w", err)
+		return model.Account{}, false, fmt.Errorf("store: update account by account_id: %w", err) // journal retained for recovery
+	}
+	if err := s.removeRotationJournal(existingID); err != nil {
+		return model.Account{}, false, fmt.Errorf("store: clear journal after replace: %w", err)
 	}
 	updated, err := s.GetAccount(ctx, existingID)
 	return updated, true, err

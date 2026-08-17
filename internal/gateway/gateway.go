@@ -414,11 +414,14 @@ func (g *Gateway) handleResponses(w http.ResponseWriter, r *http.Request) {
 	//
 	// Cross-account POST retry is IDEMPOTENCY-GATED (§19.2): a pre-stream failure is
 	// only replayed on another account when the upstream provably did NOT execute the
-	// request (401/403/429), OR the client supplied an Idempotency-Key (forwarded
-	// upstream) opting into safe retry of an uncertain outcome (408/425/5xx/network).
-	// Without a key, an uncertain outcome is returned to the client instead of being
-	// replayed — a POST that may have executed must not be double-executed / double-billed.
-	allowUncertainFailover := strings.TrimSpace(r.Header.Get("Idempotency-Key")) != ""
+	// request (401/403/429). Replaying an UNCERTAIN outcome (408/425/5xx/network) is
+	// gated on BOTH an operator opt-in (server.allow_uncertain_cross_account_retry)
+	// AND a client Idempotency-Key — because a header alone does not prove the private
+	// upstream dedups the key ACROSS accounts (Authorization + account id change on
+	// failover). Default OFF: an uncertain outcome is returned to the client, never
+	// replayed, so a POST that may have executed is not double-executed / double-billed.
+	allowUncertainFailover := g.cfg.Server.AllowUncertainCrossAccountRetry &&
+		strings.TrimSpace(r.Header.Get("Idempotency-Key")) != ""
 	view := g.buildView(r.Context(), group, eligible)
 	byID := make(map[string]int, len(eligible))
 	for i, a := range eligible {

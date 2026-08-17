@@ -40,9 +40,22 @@ func cmdBackup(args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	// Hold the maintenance lock so a concurrent rotate-key cannot slip between the
-	// key read and the DB snapshot below (which would pair an OLD key with a NEW-key
-	// DB image — a bundle that only fails at restore time).
+	// Take the single-instance lock so a live `poolgate serve` cannot run an online
+	// token refresh (which writes a rotation journal + updates the DB WITHOUT this
+	// lock) between our pending-journal check and the DB snapshot below — a TOCTOU
+	// that would otherwise let a bundle capture an already-consumed token. Backup is
+	// therefore an offline operation: stop serve first (matches restore/rotate-key).
+	ilk, err := lock.Acquire(filepath.Join(cfg.DataDir, lockFile))
+	if err != nil {
+		if errors.Is(err, lock.ErrLocked) {
+			return fmt.Errorf("a poolgate serve is running for %s — stop it before backing up (backup must snapshot without a concurrent token refresh)", cfg.DataDir)
+		}
+		return fmt.Errorf("acquire single-instance lock: %w", err)
+	}
+	defer ilk.Release()
+	// Hold the maintenance lock so a concurrent import/login/rotate/restore cannot
+	// slip between the key read and the DB snapshot below (which would pair an OLD
+	// key with a NEW-key DB image — a bundle that only fails at restore time).
 	mlk, err := acquireMaintenanceLock(cfg)
 	if err != nil {
 		return err
@@ -340,7 +353,13 @@ func cmdRestore(args []string, stdout io.Writer) error {
 		}
 		return cause
 	}
-	aside := []string{dbPath, dbPath + "-wal", dbPath + "-shm"}
+	// Move the current generation aside so we can roll back on failure AND so a stale
+	// artifact is never applied to the new generation. This covers the DB + its
+	// WAL/SHM sidecars, the master key, AND the rotations/ journal directory: those
+	// journals are encrypted with the OLD key and belong to the OLD DB generation, so
+	// after a restore they would be undecryptable and would block backup/rotate — the
+	// restored bundle carries no in-flight rotations. Saved copies are removed on success.
+	aside := []string{dbPath, dbPath + "-wal", dbPath + "-shm", store.RotationsDir(cfg.DataDir)}
 	if writeKey {
 		aside = append(aside, keyPath)
 	}
@@ -375,7 +394,7 @@ func cmdRestore(args []string, stdout io.Writer) error {
 	}
 	syncDir(cfg.DataDir)
 	for _, bak := range prev {
-		_ = os.Remove(bak)
+		_ = os.RemoveAll(bak) // RemoveAll: some saved-aside entries (rotations/) are dirs
 	}
 
 	fmt.Fprintf(stdout, "restore complete into %s\n", cfg.DataDir)

@@ -42,10 +42,12 @@ func (s *Store) DeleteAccount(ctx context.Context, id string) error {
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("store: commit delete account: %w", err)
 	}
-	// Drop any pending rotation journal for the now-deleted account so a leftover
-	// entry can never be replayed against a reused id. Best-effort: replay also
-	// drops a journal whose account is gone (ErrNotFound).
-	_ = s.removeRotationJournal(id)
+	// Remove any pending rotation journal for the now-deleted account, fail-closed:
+	// a leftover journal (encrypted for a gone account) would otherwise permanently
+	// block backup / key rotation, which refuse while any journal is pending.
+	if err := s.removeRotationJournal(id); err != nil {
+		return fmt.Errorf("store: remove rotation journal for deleted account: %w", err)
+	}
 	return nil
 }
 
