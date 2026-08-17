@@ -57,11 +57,14 @@ func TestIntegrationInitImportServeProxy(t *testing.T) {
 	if err := os.WriteFile(authPath, []byte(authJSON), 0o600); err != nil {
 		t.Fatalf("write fake auth.json: %v", err)
 	}
-	if err := cmdImport([]string{authPath}, io.Discard); err != nil {
+	var importOut bytes.Buffer
+	if err := cmdImport([]string{authPath}, &importOut); err != nil {
 		t.Fatalf("cmdImport: %v", err)
 	}
 
-	// (3) reopen the store the way `serve` does and recover the generated sk- key.
+	// (3) reopen the store the way `serve` does. The proxy key is shown ONCE by
+	// import (it is stored hashed, never in the clear), so recover it from the
+	// import output rather than from the store.
 	cfg, err := loadConfig()
 	if err != nil {
 		t.Fatalf("loadConfig: %v", err)
@@ -80,7 +83,10 @@ func TestIntegrationInitImportServeProxy(t *testing.T) {
 	if len(keys) != 1 {
 		t.Fatalf("api keys = %d, want 1 (import creates one default key)", len(keys))
 	}
-	apiKey := keys[0].Key
+	if keys[0].Key != "" {
+		t.Fatalf("stored key should be hashed (Key empty on read), got %q", keys[0].Key)
+	}
+	apiKey := extractSKKey(t, importOut.String())
 	if !strings.HasPrefix(apiKey, "sk-") {
 		t.Fatalf("generated key %q lacks sk- prefix", apiKey)
 	}
@@ -394,5 +400,18 @@ func parseRotatedKey(t *testing.T, out string) string {
 		}
 	}
 	t.Fatalf("no key line found in output:\n%s", out)
+	return ""
+}
+
+// extractSKKey pulls the "shown once" sk- proxy key out of import/bootstrap output.
+func extractSKKey(t *testing.T, out string) string {
+	t.Helper()
+	for _, ln := range strings.Split(out, "\n") {
+		s := strings.TrimSpace(ln)
+		if strings.HasPrefix(s, "sk-") {
+			return s
+		}
+	}
+	t.Fatalf("no sk- key found in output:\n%s", out)
 	return ""
 }

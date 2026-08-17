@@ -67,10 +67,12 @@ func toApiKeyView(k model.ApiKey) apiKeyView {
 		allow = []string{}
 	}
 	v := apiKeyView{
-		ID:          k.ID,
-		Label:       k.Label,
-		Endpoints:   k.Endpoints,
-		KeyMasked:   maskKey(k.Key),
+		ID:        k.ID,
+		Label:     k.Label,
+		Endpoints: k.Endpoints,
+		// The plaintext key is never stored, so the masked display is built from
+		// the persisted short hint (last few chars) rather than the full key.
+		KeyMasked:   maskHint(k.KeyHint),
 		IPAllowlist: allow,
 	}
 	if !k.ExpiresAt.IsZero() {
@@ -79,7 +81,16 @@ func toApiKeyView(k model.ApiKey) apiKeyView {
 	return v
 }
 
-// maskKey shows only a short suffix of an sk- key, e.g. "sk-…a1b2".
+// maskHint renders the stored key hint (a short suffix) as "sk-…abcd".
+func maskHint(hint string) string {
+	if hint == "" {
+		return "sk-…"
+	}
+	return "sk-…" + hint
+}
+
+// maskKey shows only a short suffix of an sk- key, e.g. "sk-…a1b2". Used when the
+// full plaintext key is in hand (create/rotate responses).
 func maskKey(key string) string {
 	const tail = 4
 	if len(key) <= tail {

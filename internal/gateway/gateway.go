@@ -22,7 +22,9 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -638,11 +640,15 @@ func (g *Gateway) authenticate(ctx context.Context, presented string) (model.Api
 	if err != nil {
 		return model.ApiKey{}, false
 	}
+	// Keys are stored hashed; compare the SHA-256 of the presented secret against
+	// each stored KeyHash in constant time (comparing against all keys avoids
+	// leaking which key matched via timing).
+	sum := sha256.Sum256([]byte(presented))
+	ph := []byte(hex.EncodeToString(sum[:]))
 	var matched model.ApiKey
 	found := false
-	pb := []byte(presented)
 	for _, k := range keys {
-		if subtle.ConstantTimeCompare(pb, []byte(k.Key)) == 1 {
+		if subtle.ConstantTimeCompare(ph, []byte(k.KeyHash)) == 1 {
 			matched = k
 			found = true
 		}

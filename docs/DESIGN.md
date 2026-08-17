@@ -351,7 +351,7 @@ Driven by **GoReleaser** + **GitHub Actions**; every channel ships verifiable ar
 ## 22. Security hardening additions
 
 - **22.1 SSRF guard** (webhook + upstream-override egress): resolve-then-connect, **block private/loopback/link-local/`169.254.169.254`/ULA/`::1`**, re-validate at connect time (anti DNS-rebinding), HTTPS only.
-- **22.2 Proxy-key lifecycle:** per-key expiry + rotation via **multiple active keys + manual rotation** (dual-key grace window dropped); optional per-key IP allowlist; per-key/endpoint **rate-limit + endpoint scoping** (per-key **spend budgets** dropped — see §0 D9).
+- **22.2 Proxy-key lifecycle:** per-key expiry + rotation via **multiple active keys + manual rotation** (dual-key grace window dropped); optional per-key IP allowlist; **endpoint scoping** + per-account concurrency caps (a per-key request **rate-limit** is not implemented today — throttling is via the concurrency cap; per-key **spend budgets** dropped — see §0 D9). Keys are stored **hashed** (SHA-256 + a short display hint), never in the clear.
 - **22.3 Admin sessions:** lifetime + idle timeout, rotate on register/login, **"revoke all sessions"**; same-origin CORS by default.
 - **22.4 Anti-brute-force:** rate-limit + lockout + backoff on recovery-code and bootstrap-token attempts.
 - **22.5 Audit log:** completeness spec (auth, CRUD, key use, config changes) + **append-only**, and a **keyless SHA-256 hash chain** (re-added post-v1, PR #53) detecting accidental corruption + mid-log tamper/delete/reorder via `GET /admin/api/audit/verify`; it does NOT detect tail-truncation or a DB writer who recomputes the tail (would need an out-of-DB key / external notarization).

@@ -345,11 +345,12 @@ func TestListAccountsScanError(t *testing.T) {
 func TestListApiKeysScanError(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
-	if _, err := s.InsertApiKey(ctx, model.ApiKey{Key: "k1"}); err != nil {
+	k, err := s.InsertApiKey(ctx, model.ApiKey{Key: "k1"})
+	if err != nil {
 		t.Fatalf("InsertApiKey: %v", err)
 	}
 	if _, err := s.db.ExecContext(ctx,
-		`UPDATE api_keys SET endpoints = ? WHERE key = ?`, "not-json", "k1"); err != nil {
+		`UPDATE api_keys SET endpoints = ? WHERE id = ?`, "not-json", k.ID); err != nil {
 		t.Fatalf("corrupt endpoints: %v", err)
 	}
 	if _, err := s.ListApiKeys(ctx); err == nil {
@@ -361,13 +362,15 @@ func TestListApiKeysScanError(t *testing.T) {
 func TestGetApiKeyUnmarshalError(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
-	if _, err := s.InsertApiKey(ctx, model.ApiKey{Key: "k1"}); err != nil {
+	k, err := s.InsertApiKey(ctx, model.ApiKey{Key: "k1"})
+	if err != nil {
 		t.Fatalf("InsertApiKey: %v", err)
 	}
 	if _, err := s.db.ExecContext(ctx,
-		`UPDATE api_keys SET endpoints = ? WHERE key = ?`, "{bad", "k1"); err != nil {
+		`UPDATE api_keys SET endpoints = ? WHERE id = ?`, "{bad", k.ID); err != nil {
 		t.Fatalf("corrupt endpoints: %v", err)
 	}
+	// GetApiKeyByKey hashes the presented secret to find the (now-corrupt) row.
 	if _, err := s.GetApiKeyByKey(ctx, "k1"); err == nil {
 		t.Fatal("GetApiKeyByKey with corrupt endpoints: want error, got nil")
 	}
@@ -631,5 +634,55 @@ func TestUpdateAccountMeta(t *testing.T) {
 	}
 	if err := s.UpdateAccountMeta(ctx, "missing", "x", 0); err != ErrNotFound {
 		t.Errorf("UpdateAccountMeta(missing) = %v, want ErrNotFound", err)
+	}
+}
+
+func TestApiKeyHashedAtRestAndBackfill(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	// A freshly inserted key stores the HASH in `key`, never the plaintext.
+	k, err := s.InsertApiKey(ctx, model.ApiKey{Key: "sk-secret-123"})
+	if err != nil {
+		t.Fatalf("InsertApiKey: %v", err)
+	}
+	var raw, hint string
+	if err := s.db.QueryRowContext(ctx, `SELECT key, key_hint FROM api_keys WHERE id = ?`, k.ID).Scan(&raw, &hint); err != nil {
+		t.Fatalf("read raw: %v", err)
+	}
+	if raw == "sk-secret-123" {
+		t.Fatal("plaintext key stored at rest")
+	}
+	if raw != hashAPIKey("sk-secret-123") || hint != "-123" {
+		t.Fatalf("stored key=%q hint=%q, want hash + last-4 hint", raw, hint)
+	}
+	// Lookup by the plaintext secret still resolves the row.
+	if got, err := s.GetApiKeyByKey(ctx, "sk-secret-123"); err != nil || got.ID != k.ID {
+		t.Fatalf("GetApiKeyByKey(secret) = %+v, err %v", got, err)
+	}
+
+	// Legacy plaintext row (key_hint unset) is hashed in place by the backfill.
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO api_keys (id, key, key_hint, label, endpoints, expires_at, ip_allowlist) VALUES ('legacy', 'sk-old-key', '', '', '[]', '', '[]')`); err != nil {
+		t.Fatalf("insert legacy: %v", err)
+	}
+	if err := s.backfillAPIKeyHashes(ctx); err != nil {
+		t.Fatalf("backfill: %v", err)
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT key, key_hint FROM api_keys WHERE id = 'legacy'`).Scan(&raw, &hint); err != nil {
+		t.Fatalf("read legacy: %v", err)
+	}
+	if raw != hashAPIKey("sk-old-key") || hint != "-key" {
+		t.Fatalf("legacy after backfill: key=%q hint=%q, want hashed", raw, hint)
+	}
+	if got, err := s.GetApiKeyByKey(ctx, "sk-old-key"); err != nil || got.ID != "legacy" {
+		t.Fatalf("GetApiKeyByKey(legacy secret) = %+v, err %v", got, err)
+	}
+	// Backfill is idempotent (already-hashed rows untouched).
+	if err := s.backfillAPIKeyHashes(ctx); err != nil {
+		t.Fatalf("backfill idempotent: %v", err)
+	}
+	if got, err := s.GetApiKeyByKey(ctx, "sk-old-key"); err != nil || got.ID != "legacy" {
+		t.Fatalf("after second backfill: %+v, err %v", got, err)
 	}
 }

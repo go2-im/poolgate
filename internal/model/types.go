@@ -69,8 +69,18 @@ type Account struct {
 // ApiKey is an inbound `sk-` proxy credential. Key is compared constant-time.
 // Endpoints scopes the key to a set of endpoint names (empty = all endpoints).
 type ApiKey struct {
-	ID        string   `json:"id"`
-	Key       string   `json:"key"`
+	ID string `json:"id"`
+	// Key is the plaintext sk- secret. It is populated ONLY at create/rotate time
+	// (returned once for display); reads from the store leave it empty because the
+	// secret is not stored in the clear — only KeyHash (for lookup) and KeyHint
+	// (a short suffix for display) are persisted.
+	Key string `json:"key"`
+	// KeyHash is the SHA-256 hex of the secret, used for constant-time auth lookup.
+	// Never serialized.
+	KeyHash string `json:"-"`
+	// KeyHint is a short display suffix of the secret (e.g. the last 4 chars) so the
+	// admin UI can show "sk-…abcd" without storing the usable key. Never serialized.
+	KeyHint   string   `json:"-"`
 	Label     string   `json:"label"`
 	Endpoints []string `json:"endpoints"`
 	// ExpiresAt is when the key stops being accepted; zero = never expires.

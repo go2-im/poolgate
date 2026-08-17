@@ -50,7 +50,7 @@ func (s *Store) DeleteAccount(ctx context.Context, id string) error {
 // GetApiKeyByID loads one inbound key by its id (not its secret value).
 func (s *Store) GetApiKeyByID(ctx context.Context, id string) (model.ApiKey, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, key, label, endpoints, expires_at, ip_allowlist FROM api_keys WHERE id = ?`, id)
+		`SELECT id, key, key_hint, label, endpoints, expires_at, ip_allowlist FROM api_keys WHERE id = ?`, id)
 	return scanApiKey(row)
 }
 
