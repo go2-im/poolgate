@@ -74,16 +74,24 @@ func (a *authRecorder) tokens() []string {
 
 // fakeHealth records passive-hook calls and (for 401) returns a rotated token.
 type fakeHealth struct {
-	mu           sync.Mutex
-	unauthorized int
-	rateLimited  []time.Duration
-	quota        int
-	refreshTo    string // access token to swap in on OnUnauthorized; "" => error
+	mu              sync.Mutex
+	unauthorized    int
+	reauthExhausted int
+	rateLimited     []time.Duration
+	quota           int
+	refreshTo       string // access token to swap in on OnUnauthorized; "" => error
 }
 
 type errWrapper struct{ msg string }
 
 func (e errWrapper) Error() string { return e.msg }
+
+func (f *fakeHealth) OnReauthExhausted(_ context.Context, _ model.Account) error {
+	f.mu.Lock()
+	f.reauthExhausted++
+	f.mu.Unlock()
+	return nil
+}
 
 func (f *fakeHealth) OnUnauthorized(_ context.Context, acct model.Account) (model.Account, error) {
 	f.mu.Lock()
@@ -442,9 +450,10 @@ func TestForward5xxNoKeyRelayedNoFailover(t *testing.T) {
 	}
 }
 
-// A non-401/429/5xx error (e.g. 403) with health wired hits the default branch:
-// no hook is called, the account is marked tried, and failover advances.
-func TestForward403DefaultBranchFailover(t *testing.T) {
+// A 403 (entitlement/region) is treated like a 401 (DESIGN.md §0 D5): refresh once,
+// retry the same account, and — since it 403s AGAIN with the fresh token — converge
+// it to expired (OnReauthExhausted) and fail over to a healthy member (P2#9).
+func TestForward403RefreshThenConvergesAndFailsOver(t *testing.T) {
 	st, cfg := newStore(t)
 	a := seedAccount(t, st, "bad", "tok-bad", "id-bad")
 	b := seedAccount(t, st, "good", "tok-good", "id-good")
@@ -455,11 +464,11 @@ func TestForward403DefaultBranchFailover(t *testing.T) {
 			streamOK(w)
 			return
 		}
-		w.WriteHeader(http.StatusForbidden)
+		w.WriteHeader(http.StatusForbidden) // "bad" 403s with any token (incl. the refreshed one)
 	}))
 	defer upstream.Close()
 
-	fh := &fakeHealth{}
+	fh := &fakeHealth{refreshTo: "fresh-bad"}
 	cfg.UpstreamAllowlist = []string{mustHost(t, upstream.URL)}
 	gw := New(st, cfg, WithUpstreamBase(upstream.URL), WithHTTPClient(upstream.Client()),
 		WithLogger(quietLogger()), WithHealth(fh))
@@ -471,9 +480,44 @@ func TestForward403DefaultBranchFailover(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (failover past 403)", resp.StatusCode)
 	}
-	if fh.unauthorized != 0 || len(fh.rateLimited) != 0 || fh.quota != 0 {
-		t.Errorf("no hook should fire for 403: unauthorized=%d rateLimited=%v quota=%d",
-			fh.unauthorized, fh.rateLimited, fh.quota)
+	if fh.unauthorized != 1 {
+		t.Errorf("OnUnauthorized (403 refresh) calls = %d, want 1", fh.unauthorized)
+	}
+	if fh.reauthExhausted != 1 {
+		t.Errorf("OnReauthExhausted calls = %d, want 1 (403 recurred after refresh -> converge to expired)", fh.reauthExhausted)
+	}
+}
+
+// A 401 that recurs even after a successful refresh converges the account to expired
+// (OnReauthExhausted) instead of leaving it ok; with no other member the request ends
+// in all_exhausted. This is the 401 half of the P2#9 convergence fix.
+func TestForward401RecurringAfterRefreshConverges(t *testing.T) {
+	st, cfg := newStore(t)
+	a := seedAccount(t, st, "a", "stale", "id-a")
+	key := seedGroupEndpointKey(t, st, model.StrategyFallback, a.ID)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized) // 401 with ANY token, including the refreshed one
+	}))
+	defer upstream.Close()
+
+	fh := &fakeHealth{refreshTo: "fresh"} // refresh SUCCEEDS, but upstream still 401s
+	cfg.UpstreamAllowlist = []string{mustHost(t, upstream.URL)}
+	gw := New(st, cfg, WithUpstreamBase(upstream.URL), WithHTTPClient(upstream.Client()),
+		WithLogger(quietLogger()), WithHealth(fh))
+	srv := httptest.NewServer(gw.Routes())
+	defer srv.Close()
+
+	resp := doProxyPost(t, srv.URL, key)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 (all_exhausted)", resp.StatusCode)
+	}
+	if fh.unauthorized != 1 {
+		t.Errorf("OnUnauthorized calls = %d, want 1 (one refresh attempt)", fh.unauthorized)
+	}
+	if fh.reauthExhausted != 1 {
+		t.Errorf("OnReauthExhausted calls = %d, want 1 (401 recurred after refresh)", fh.reauthExhausted)
 	}
 }
 

@@ -70,6 +70,12 @@ type HealthHooks interface {
 	// return the refreshed account (state ok) on success, or the original account
 	// plus an error (state expired) on failure.
 	OnUnauthorized(ctx context.Context, acct model.Account) (model.Account, error)
+	// OnReauthExhausted converges an account to expired after a 401/403 that
+	// recurred even though a refresh in the same request already succeeded (the
+	// fresh token is itself rejected — revoked/entitlement). It does not refresh
+	// again; it just persists the terminal-for-now state so the account leaves the
+	// hot pool instead of being re-selected and re-failing every request.
+	OnReauthExhausted(ctx context.Context, acct model.Account) error
 	// OnRateLimited handles a 429/5xx: move the account to cooldown, gated on
 	// retryAfter (a conservative default is used when retryAfter <= 0).
 	OnRateLimited(ctx context.Context, acct model.Account, retryAfter time.Duration) error
@@ -525,9 +531,12 @@ func (rc *requestRecord) finish(status int, acct model.Account, errType string, 
 // recordFailure applies the health passive hook for a pre-stream upstream failure
 // and updates the routeView so the next policy.Select advances correctly:
 //
-//   - 401: refresh once via the shared single-flight. On success the account's
-//     token is swapped in place and it stays selectable (retried with fresh
-//     creds); on failure (or a repeat 401) it is marked tried.
+//   - 401/403: treated as a rejected credential (DESIGN.md §0 D5). Refresh once via
+//     the shared single-flight; on success the account's token is swapped in place
+//     and it stays selectable (retried with fresh creds). If it 401/403s AGAIN after
+//     that refresh, the fresh token doesn't help (revoked/entitlement) so the account
+//     is converged to expired (OnReauthExhausted) and marked tried — it leaves the hot
+//     pool instead of being re-selected and re-failing every request (P2#9).
 //   - 429: cooldown gated on Retry-After, then marked tried.
 //   - 5xx / transport error / other: cooldown (429/5xx) or just marked tried.
 //
@@ -539,9 +548,18 @@ func (g *Gateway) recordFailure(ctx context.Context, accounts []model.Account, b
 		return
 	}
 	switch {
-	case status == http.StatusUnauthorized:
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		// 401 (invalid token) and 403 (entitlement/region) are both treated as
+		// "credential rejected" (DESIGN.md §0 D5). First occurrence: refresh once via
+		// the shared single-flight and retry the SAME account with the rotated token.
 		if view.refreshed[acct.ID] {
-			view.tried[acct.ID] = true // already retried once; give up on it.
+			// We already refreshed this account once in this request and it STILL
+			// returned 401/403 — the fresh token doesn't help (revoked / no
+			// entitlement). Converge it to expired so it leaves the hot pool and is
+			// re-probed on the rare auth-check cadence, instead of being re-selected
+			// and re-failing on every subsequent request (P2#9 non-convergence).
+			_ = g.health.OnReauthExhausted(ctx, acct)
+			view.tried[acct.ID] = true
 			return
 		}
 		view.refreshed[acct.ID] = true
