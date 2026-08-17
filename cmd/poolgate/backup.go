@@ -188,9 +188,9 @@ func cmdRestore(args []string, stdout io.Writer) error {
 		}
 	}
 	// Commit the DB + key as a pair with rollback. A restore-in-progress marker is
-	// written first; `poolgate serve` refuses to start while it exists, so a crash
-	// mid-commit is caught before a mismatched DB/key generation (which would fail
-	// to decrypt) is ever used.
+	// written (and fsync'd, with the dir) FIRST so it is durable before any
+	// destructive rename; `poolgate serve` refuses to start while it exists, so a
+	// crash mid-commit is caught before a mismatched DB/key generation is used.
 	marker := filepath.Join(cfg.DataDir, restoreMarkerFile)
 	if err := os.WriteFile(marker, []byte("restore in progress\n"), 0o600); err != nil {
 		_ = os.Remove(dbTmp)
@@ -199,11 +199,17 @@ func cmdRestore(args []string, stdout io.Writer) error {
 		}
 		return fmt.Errorf("write restore marker: %w", err)
 	}
+	if f, ferr := os.Open(marker); ferr == nil {
+		_ = f.Sync()
+		_ = f.Close()
+	}
+	syncDir(cfg.DataDir)
 
 	// Move the current generation aside (DB + key + its WAL/SHM sidecars) so we can
 	// roll back on failure AND so a stale sidecar is never applied to the new DB
 	// (the restored image has none). Saved copies are removed on success.
 	prev := map[string]string{}
+	installedDB, installedKey := false, false
 	saveAside := func(p string) error {
 		if _, err := os.Stat(p); err == nil {
 			bak := p + ".prev"
@@ -217,8 +223,15 @@ func cmdRestore(args []string, stdout io.Writer) error {
 		return nil
 	}
 	rollback := func() {
-		_ = os.Remove(dbPath)
-		if writeKey {
+		// Remove ONLY files we actually INSTALLED (renamed from tmp). A path we
+		// never installed still holds the ORIGINAL file (e.g. a saveAside failed
+		// before it moved the key) and must not be deleted — it isn't in prev, so
+		// it could not be restored. This is what previously destroyed the live
+		// master key on a partial-aside failure.
+		if installedDB {
+			_ = os.Remove(dbPath)
+		}
+		if installedKey {
 			_ = os.Remove(keyPath)
 		}
 		for orig, bak := range prev {
@@ -246,11 +259,13 @@ func cmdRestore(args []string, stdout io.Writer) error {
 		rollback()
 		return fmt.Errorf("commit database: %w", err)
 	}
+	installedDB = true
 	if writeKey {
 		if err := os.Rename(keyTmp, keyPath); err != nil {
 			rollback()
 			return fmt.Errorf("commit master key: %w", err)
 		}
+		installedKey = true
 	}
 
 	// Success: clear the marker, fsync the directory, and drop the saved-aside old

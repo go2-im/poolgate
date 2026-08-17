@@ -2,7 +2,8 @@
 // re-encrypting every field-encrypted secret column from the store's current
 // cipher to a new one, atomically in a single transaction. The encrypted columns
 // are accounts.access_token / accounts.refresh_token and notify_channels.config
-// (id_token is stored in the clear). If any row fails to decrypt/re-encrypt the
+// (id_token is no longer persisted — it is purged to ” since v12, so there is
+// nothing to re-encrypt for it). If any row fails to decrypt/re-encrypt the
 // whole transaction rolls back, leaving the DB entirely on the old key.
 package store
 

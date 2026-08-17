@@ -29,6 +29,26 @@ type fakeStore struct {
 	inserted []model.WebAuthnCredential
 	updates  map[string]uint32
 	nextID   int
+
+	// bootstrap-consume simulation for ConsumeBootstrapAndInsertCredential.
+	bootstrapErr      error
+	consumedBootstrap int
+	lastBootstrapHash string
+}
+
+// ConsumeBootstrapAndInsertCredential simulates the atomic first-passkey op: on a
+// nil bootstrapErr/insertErr it records the token hash and inserts the credential;
+// otherwise it returns the error WITHOUT inserting (mirroring the tx rollback).
+func (f *fakeStore) ConsumeBootstrapAndInsertCredential(ctx context.Context, tokenHash string, _ time.Time, c model.WebAuthnCredential) (model.WebAuthnCredential, error) {
+	f.consumedBootstrap++
+	f.lastBootstrapHash = tokenHash
+	if f.bootstrapErr != nil {
+		return model.WebAuthnCredential{}, f.bootstrapErr
+	}
+	if f.insertErr != nil {
+		return model.WebAuthnCredential{}, f.insertErr
+	}
+	return f.InsertWebAuthnCredential(ctx, c)
 }
 
 func (f *fakeStore) ListWebAuthnCredentials(context.Context) ([]model.WebAuthnCredential, error) {

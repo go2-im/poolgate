@@ -35,7 +35,7 @@ Do these as separate branches → PRs (see §5). Each must keep the ≥80% cover
 
 Verified against `openai/codex@rust-v0.147.0` (see REVIEW.md §1):
 - **Translation gateway, not transparent proxy:** upstream `https://chatgpt.com/backend-api/codex/responses`, `stream:true` + `Accept: text/event-stream`; rewrite `Authorization` **and** `ChatGPT-Account-ID` **together**; preserve `originator`(=`codex_cli_rs`)/`User-Agent`/`OpenAI-Beta`/`x-codex-turn-state`.
-- **Transport:** Codex tries **WebSocket first**; v1 **does not accept the WS upgrade** → Codex falls back to stateless HTTP POST+SSE. WS proxying + turn-affinity is deferred.
+- **Transport:** Codex tries **WebSocket first**. v1 originally deferred it (HTTP POST+SSE only); **post-v1 (PR #46/#50) the WS upgrade IS accepted and proxied** (connection-scoped turn affinity + `x-codex-turn-state` pin, pre-first-frame failover) and the transport is configurable via `server.transport` (`both` default | `http-only` | `ws-only`), with HTTP+SSE as the fallback.
 - **Usage:** `GET /backend-api/wham/usage` → generic `plan_type` + percent windows `{used_percent, window_seconds, resets_at}` (NOT fixed 5h/1week token columns).
 - **Auth-check probe:** real `GET {base}/models?client_version=` (200 valid / 401·403 invalid).
 - **OAuth:** refresh **rotates** the refresh_token; a reused one permanently bricks the account → per-account single-flight refresh + atomic persistence (already implemented in `internal/oauth`).

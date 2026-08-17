@@ -686,3 +686,64 @@ func TestApiKeyHashedAtRestAndBackfill(t *testing.T) {
 		t.Fatalf("after second backfill: %+v, err %v", got, err)
 	}
 }
+
+func TestConsumeBootstrapAndInsertCredentialAtomic(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	hash := "abc123hash"
+	if _, err := s.InsertBootstrapToken(ctx, model.BootstrapToken{
+		TokenHash: hash, ExpiresAt: now.Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("InsertBootstrapToken: %v", err)
+	}
+	cred := model.WebAuthnCredential{CredID: []byte("cred-1"), PublicKey: []byte("pk"), Label: "phone"}
+
+	// Wrong hash: no token consumed, no credential inserted.
+	if _, err := s.ConsumeBootstrapAndInsertCredential(ctx, "wrong", now, cred); err != ErrNotFound {
+		t.Fatalf("wrong hash = %v, want ErrNotFound", err)
+	}
+	if n, _ := s.CountWebAuthnCredentials(ctx); n != 0 {
+		t.Fatalf("credential inserted on wrong-hash path: %d", n)
+	}
+
+	// Correct hash: token consumed + credential inserted atomically.
+	stored, err := s.ConsumeBootstrapAndInsertCredential(ctx, hash, now, cred)
+	if err != nil {
+		t.Fatalf("ConsumeBootstrapAndInsertCredential: %v", err)
+	}
+	if stored.ID == "" {
+		t.Fatal("stored credential has no id")
+	}
+	if n, _ := s.CountWebAuthnCredentials(ctx); n != 1 {
+		t.Fatalf("credential count = %d, want 1", n)
+	}
+
+	// Token is now used: second attempt is refused (single-use).
+	if _, err := s.ConsumeBootstrapAndInsertCredential(ctx, hash, now, model.WebAuthnCredential{
+		CredID: []byte("cred-2"), PublicKey: []byte("pk"),
+	}); err == nil {
+		t.Fatal("second consume of a used token should fail")
+	}
+	if n, _ := s.CountWebAuthnCredentials(ctx); n != 1 {
+		t.Fatalf("credential count = %d after refused second consume, want 1", n)
+	}
+
+	// Insert failure (missing public_key) rolls back the token consume: a fresh
+	// token stays usable.
+	if _, err := s.InsertBootstrapToken(ctx, model.BootstrapToken{
+		TokenHash: "hash2", ExpiresAt: now.Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("InsertBootstrapToken 2: %v", err)
+	}
+	if _, err := s.ConsumeBootstrapAndInsertCredential(ctx, "hash2", now,
+		model.WebAuthnCredential{CredID: []byte("cred-3")}); err == nil { // no public_key -> insert fails
+		t.Fatal("expected insert failure for missing public_key")
+	}
+	// hash2 must still be usable (consume rolled back with the failed insert).
+	if _, err := s.ConsumeBootstrapAndInsertCredential(ctx, "hash2", now,
+		model.WebAuthnCredential{CredID: []byte("cred-3"), PublicKey: []byte("pk")}); err != nil {
+		t.Fatalf("token should still be usable after a rolled-back insert: %v", err)
+	}
+}

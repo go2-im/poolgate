@@ -441,7 +441,41 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 			return fmt.Errorf("store: commit migration %d: %w", m.version, err)
 		}
 	}
+	// All pending migrations succeeded. The pre-migration snapshot is a raw,
+	// UNENCRYPTED SQLite image of the OLD schema — after a security migration
+	// (e.g. v11 API-key hashing / v12 id_token purge) it would otherwise leave the
+	// pre-migration plaintext keys and id_tokens on disk forever, defeating the
+	// migration's purpose. Its only job was failed-migration recovery, which is
+	// moot now that the migrations committed, so remove every pre-migration
+	// snapshot (this run's and any stale ones left by older builds).
+	s.removePreMigrationSnapshots()
 	return nil
+}
+
+// removePreMigrationSnapshots deletes all poolgate.pre-migration-v*.db files in
+// the data dir and fsyncs the directory. Best-effort: errors are ignored (the
+// files are only a transient recovery aid). Called after a successful Migrate so
+// no stale unencrypted schema image lingers on disk.
+func (s *Store) removePreMigrationSnapshots() {
+	if s.dataDir == "" {
+		return
+	}
+	matches, err := filepath.Glob(filepath.Join(s.dataDir, "poolgate.pre-migration-v*.db"))
+	if err != nil {
+		return
+	}
+	removed := false
+	for _, p := range matches {
+		if err := os.Remove(p); err == nil {
+			removed = true
+		}
+	}
+	if removed {
+		if d, derr := os.Open(s.dataDir); derr == nil {
+			_ = d.Sync()
+			_ = d.Close()
+		}
+	}
 }
 
 // appliedVersions returns the set of migration versions recorded in
@@ -948,12 +982,14 @@ func hashAPIKey(secret string) string {
 }
 
 // apiKeyHint returns a short, non-sensitive display suffix of a key secret so the
-// admin UI can render "sk-…abcd" without the store retaining the usable key.
+// admin UI can render "sk-…abcd" without the store retaining the usable key. For
+// a key too short to yield a safe suffix (<= 4 chars — never produced by the key
+// generator) it returns "" rather than leak the whole low-entropy secret.
 func apiKeyHint(secret string) string {
-	if n := len(secret); n > 4 {
-		return secret[n-4:]
+	if len(secret) > 4 {
+		return secret[len(secret)-4:]
 	}
-	return secret
+	return ""
 }
 
 // backfillAPIKeyHashes converts any legacy rows that still hold a plaintext key

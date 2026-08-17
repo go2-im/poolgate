@@ -271,8 +271,12 @@ func loadConfig() (model.Config, error) {
 	}
 	// Validate the optional backpressure wait (fail fast on a bad duration).
 	if s := strings.TrimSpace(cfg.Server.BackpressureWait); s != "" {
-		if _, err := time.ParseDuration(s); err != nil {
+		d, err := time.ParseDuration(s)
+		if err != nil {
 			return model.Config{}, fmt.Errorf("server.backpressure_wait %q is not a valid duration: %w", s, err)
+		}
+		if d < 0 {
+			return model.Config{}, fmt.Errorf("server.backpressure_wait %q must not be negative", s)
 		}
 	}
 	return cfg, nil
@@ -815,7 +819,7 @@ func serveBoth(ctx context.Context, cfg model.Config, gw *gateway.Gateway, admin
 // is cancelled. When onReady is non-nil it is invoked with the bound address
 // once the listener is open (used by tests to discover the ephemeral port).
 func serveGateway(ctx context.Context, cfg model.Config, gw *gateway.Gateway, logger *slog.Logger, onReady func(addr string)) error {
-	addr := fmt.Sprintf("%s:%d", cfg.Server.Proxy.Host, cfg.Server.Proxy.Port)
+	addr := net.JoinHostPort(cfg.Server.Proxy.Host, strconv.Itoa(cfg.Server.Proxy.Port))
 	// drainStreams=false: proxy relays are FINITE responses whose upstream request
 	// is bound to r.Context(); cancelling them at shutdown would truncate a
 	// response (losing the terminal usage event) that would otherwise complete
@@ -836,7 +840,7 @@ func serveGateway(ctx context.Context, cfg model.Config, gw *gateway.Gateway, lo
 // is cancelled. The admin surface is expected to stay loopback (DESIGN.md §3); a
 // non-loopback bind is a warning, not a refusal.
 func serveAdmin(ctx context.Context, cfg model.Config, handler http.Handler, logger *slog.Logger, onReady func(addr string)) error {
-	addr := fmt.Sprintf("%s:%d", cfg.Server.Admin.Host, cfg.Server.Admin.Port)
+	addr := net.JoinHostPort(cfg.Server.Admin.Host, strconv.Itoa(cfg.Server.Admin.Port))
 	// drainStreams=true: the monitor SSE feed is an INFINITE stream that never ends
 	// on its own, so cancelling its request context is the only way to drain it
 	// without waiting out the Shutdown deadline. Normal admin handlers finish their

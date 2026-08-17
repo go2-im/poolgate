@@ -484,7 +484,15 @@ func (s *Server) handlePolicyGroupCreate(w http.ResponseWriter, r *http.Request)
 		MemberWeights: req.MemberWeights,
 	})
 	if err != nil {
-		writeErr(w, http.StatusConflict, errConflict, "could not create policy group (name in use)")
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			// A referenced member account does not exist (validated in the store tx).
+			writeErr(w, http.StatusBadRequest, errBadRequest, "a member account does not exist")
+		case strings.Contains(err.Error(), "UNIQUE") || strings.Contains(err.Error(), "constraint"):
+			writeErr(w, http.StatusConflict, errConflict, "policy group name already in use")
+		default:
+			s.writeStoreErr(w, err, "policy group")
+		}
 		return
 	}
 	// Return the canonical stored representation (normalized member_weights) so
