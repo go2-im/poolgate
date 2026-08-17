@@ -713,31 +713,38 @@ func (s *Store) UpsertAccountByAccountID(ctx context.Context, a model.Account) (
 	if err != nil {
 		return model.Account{}, false, fmt.Errorf("store: lookup account by account_id: %w", err)
 	}
-	// Write a recovery journal with the NEW credentials BEFORE overwriting the DB row
-	// (and OVERWRITING any stale pending journal), so a crash or failure during the
-	// update leaves the fresh token recoverable — never delete the only recovery copy
-	// first. The journal is removed only after the DB update succeeds.
-	if err := s.writeRotationJournal(existingID, a.AccessToken, a.RefreshToken); err != nil {
-		return model.Account{}, false, fmt.Errorf("store: journal credentials before replace: %w", err)
-	}
-	sealedAccess, err := s.cipher.Seal(a.AccessToken)
-	if err != nil {
-		return model.Account{}, false, fmt.Errorf("store: seal access token: %w", err)
-	}
-	sealedRefresh, err := s.cipher.Seal(a.RefreshToken)
-	if err != nil {
-		return model.Account{}, false, fmt.Errorf("store: seal refresh token: %w", err)
-	}
-	// Refresh the existing row's credentials in place, resetting state to unknown so
-	// the health engine re-probes with the new tokens. id_token is never persisted;
-	// label and concurrency_cap are left untouched (operator-owned).
-	if _, err := s.db.ExecContext(ctx, `
+	// Replace the existing row's credentials under the cross-process credential lock,
+	// so a concurrent online refresh cannot interleave with (or clobber the journal
+	// of) this login. Write a recovery journal with the NEW credentials BEFORE
+	// overwriting the DB (and overwriting any stale pending journal), so a crash or
+	// failure during the update leaves the fresh token recoverable — never delete the
+	// only recovery copy first. The journal is removed only after the update succeeds.
+	if err := s.withCredentialLock(func() error {
+		if err := s.writeRotationJournal(existingID, a.AccessToken, a.RefreshToken); err != nil {
+			return fmt.Errorf("store: journal credentials before replace: %w", err)
+		}
+		sealedAccess, err := s.cipher.Seal(a.AccessToken)
+		if err != nil {
+			return fmt.Errorf("store: seal access token: %w", err)
+		}
+		sealedRefresh, err := s.cipher.Seal(a.RefreshToken)
+		if err != nil {
+			return fmt.Errorf("store: seal refresh token: %w", err)
+		}
+		// Refresh the existing row's credentials in place, resetting state to unknown
+		// so the health engine re-probes with the new tokens. id_token is never
+		// persisted; label and concurrency_cap are left untouched (operator-owned).
+		if _, err := s.db.ExecContext(ctx, `
 UPDATE accounts SET access_token = ?, refresh_token = ?, id_token = '', state = ?, updated_at = ? WHERE id = ?`,
-		sealedAccess, sealedRefresh, string(model.StateUnknown), formatTime(time.Now().UTC()), existingID); err != nil {
-		return model.Account{}, false, fmt.Errorf("store: update account by account_id: %w", err) // journal retained for recovery
-	}
-	if err := s.removeRotationJournal(existingID); err != nil {
-		return model.Account{}, false, fmt.Errorf("store: clear journal after replace: %w", err)
+			sealedAccess, sealedRefresh, string(model.StateUnknown), formatTime(time.Now().UTC()), existingID); err != nil {
+			return fmt.Errorf("store: update account by account_id: %w", err) // journal retained for recovery
+		}
+		if err := s.removeRotationJournal(existingID); err != nil {
+			return fmt.Errorf("store: clear journal after replace: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return model.Account{}, false, err
 	}
 	updated, err := s.GetAccount(ctx, existingID)
 	return updated, true, err

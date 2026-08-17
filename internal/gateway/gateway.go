@@ -480,7 +480,7 @@ func (g *Gateway) handleResponses(w http.ResponseWriter, r *http.Request) {
 			rec.trace = append(rec.trace, acct.ID+":upstream_unreachable")
 			rec.finish(http.StatusBadGateway, acct, "upstream_unreachable", 0, 0)
 			writeError(w, http.StatusBadGateway, "poolgate_upstream_error", "upstream_error",
-				"upstream request failed before any response and was not retried across accounts; resend with an Idempotency-Key to enable safe cross-account retry")
+				"upstream request failed with no response; whether it executed is UNKNOWN, so it was not retried on another account. Do not blindly resend — a retry is only safe if the original request already carried an Idempotency-Key AND the server has allow_uncertain_cross_account_retry enabled with an upstream that dedups it across accounts.")
 			return
 		}
 		rec.trace = append(rec.trace, fmt.Sprintf("%s:%d", acct.ID, status))

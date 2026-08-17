@@ -40,6 +40,11 @@ func cmdBackup(args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
+	// Refuse to back up over a half-committed restore (backup uses store.Snapshot,
+	// not openStore, so it needs its own guard).
+	if err := guardRestoreMarker(cfg); err != nil {
+		return err
+	}
 	// Take the single-instance lock so a live `poolgate serve` cannot run an online
 	// token refresh (which writes a rotation journal + updates the DB WITHOUT this
 	// lock) between our pending-journal check and the DB snapshot below — a TOCTOU
