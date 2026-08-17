@@ -323,6 +323,17 @@ ALTER TABLE group_members ADD COLUMN weight INTEGER NOT NULL DEFAULT 1;
 ALTER TABLE audit_log ADD COLUMN hash TEXT NOT NULL DEFAULT '';
 `,
 	},
+	{
+		version: 10,
+		sql: `
+-- Remove historical dangling account members left by older builds that deleted
+-- accounts without cleaning group_members. Prevents a deleted account from
+-- breaking endpoint routing for the whole group.
+DELETE FROM group_members
+WHERE member_type = 'account'
+  AND member_id NOT IN (SELECT id FROM accounts);
+`,
+	},
 }
 
 // Migrate applies any migrations whose version is not yet recorded. It is
@@ -1023,6 +1034,10 @@ func (s *Store) InsertPolicyGroup(ctx context.Context, g model.PolicyGroup) (mod
 		return model.PolicyGroup{}, fmt.Errorf("store: insert group: %w", err)
 	}
 	for i, accID := range g.MemberAccountIDs {
+		if err := assertAccountExistsTx(ctx, tx, accID); err != nil {
+			_ = tx.Rollback()
+			return model.PolicyGroup{}, err
+		}
 		if _, err := tx.ExecContext(ctx, `
 INSERT INTO group_members (group_id, member_type, member_id, position, weight) VALUES (?, ?, ?, ?, ?)`,
 			g.ID, memberTypeAccount, accID, i, g.Weight(accID)); err != nil {
@@ -1034,6 +1049,21 @@ INSERT INTO group_members (group_id, member_type, member_id, position, weight) V
 		return model.PolicyGroup{}, fmt.Errorf("store: commit insert group: %w", err)
 	}
 	return g, nil
+}
+
+// assertAccountExistsTx returns ErrNotFound (wrapped) when member id does not
+// reference a real account, so policy-group writes can't create a dangling
+// member that would degrade routing.
+func assertAccountExistsTx(ctx context.Context, tx *sql.Tx, id string) error {
+	var one int
+	err := tx.QueryRowContext(ctx, `SELECT 1 FROM accounts WHERE id = ?`, id).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("store: policy group member %q does not exist: %w", id, ErrNotFound)
+	}
+	if err != nil {
+		return fmt.Errorf("store: check member %q: %w", id, err)
+	}
+	return nil
 }
 
 // GetPolicyGroup loads a group and its ordered account member ids. Group-typed
@@ -1142,6 +1172,13 @@ func (s *Store) ResolveEndpoint(ctx context.Context, name string) (model.Endpoin
 	for _, id := range group.MemberAccountIDs {
 		a, err := s.GetAccount(ctx, id)
 		if err != nil {
+			// A dangling member (e.g. an account deleted by an older build that did
+			// not clean group_members) is SKIPPED rather than failing the whole
+			// endpoint — other healthy members must still route. A genuine store
+			// error still propagates.
+			if errors.Is(err, ErrNotFound) {
+				continue
+			}
 			return model.Endpoint{}, model.PolicyGroup{}, nil, fmt.Errorf("store: resolve member %q: %w", id, err)
 		}
 		accounts = append(accounts, a)

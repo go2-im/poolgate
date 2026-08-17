@@ -16,15 +16,33 @@ import (
 // ---- accounts -------------------------------------------------------------
 
 // DeleteAccount removes one account by id. ErrNotFound if it does not exist.
-// Foreign keys ON DELETE CASCADE clean up usage_snapshots / health_checks;
-// group_members referencing the account are left as dangling member ids (v1
-// keeps membership as opaque ids — the resolver surfaces the missing member).
+// Foreign keys ON DELETE CASCADE clean up usage_snapshots / health_checks; the
+// account's group_members rows are removed in the SAME transaction so a deleted
+// account never leaves a dangling member id that would break endpoint routing.
 func (s *Store) DeleteAccount(ctx context.Context, id string) error {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM accounts WHERE id = ?`, id)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
+		return fmt.Errorf("store: begin delete account: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM group_members WHERE member_type = ? AND member_id = ?`,
+		memberTypeAccount, id); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("store: clear account group memberships: %w", err)
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM accounts WHERE id = ?`, id)
+	if err != nil {
+		_ = tx.Rollback()
 		return fmt.Errorf("store: delete account: %w", err)
 	}
-	return oneRow(res, "delete account")
+	if err := oneRow(res, "delete account"); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: commit delete account: %w", err)
+	}
+	return nil
 }
 
 // ---- api keys -------------------------------------------------------------
@@ -141,6 +159,10 @@ func (s *Store) UpdatePolicyGroup(ctx context.Context, g model.PolicyGroup) erro
 		return fmt.Errorf("store: clear group members: %w", err)
 	}
 	for i, accID := range g.MemberAccountIDs {
+		if err := assertAccountExistsTx(ctx, tx, accID); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
 		if _, err := tx.ExecContext(ctx, `
 INSERT INTO group_members (group_id, member_type, member_id, position, weight) VALUES (?, ?, ?, ?, ?)`,
 			g.ID, memberTypeAccount, accID, i, g.Weight(accID)); err != nil {

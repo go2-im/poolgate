@@ -460,19 +460,68 @@ func TestResolveEndpointMissingMember(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
+	// A policy group can no longer be created with a member that has no account.
+	if _, err := s.InsertPolicyGroup(ctx, model.PolicyGroup{
+		Name: "ghost-pool", Strategy: model.StrategyFallback,
+		MemberAccountIDs: []string{"acct_ghost"},
+	}); err == nil {
+		t.Fatal("InsertPolicyGroup with a nonexistent member: want error, got nil")
+	}
+
+	// Create a valid group with one real account, then inject a DANGLING member
+	// row directly (the only way it can exist post-fix: legacy data) and assert
+	// ResolveEndpoint SKIPS it and still routes the healthy member.
+	acc, err := s.InsertAccount(ctx, model.Account{Label: "real", AccessToken: "a", RefreshToken: "r"})
+	if err != nil {
+		t.Fatalf("InsertAccount: %v", err)
+	}
 	grp, err := s.InsertPolicyGroup(ctx, model.PolicyGroup{
-		Name:             "ghost-pool",
-		Strategy:         model.StrategyFallback,
-		MemberAccountIDs: []string{"acct_ghost"}, // no matching account row
+		Name: "mixed-pool", Strategy: model.StrategyFallback,
+		MemberAccountIDs: []string{acc.ID},
 	})
 	if err != nil {
 		t.Fatalf("InsertPolicyGroup: %v", err)
 	}
-	if _, err := s.InsertEndpoint(ctx, model.Endpoint{Name: "ghost-ep", GroupID: grp.ID}); err != nil {
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO group_members (group_id, member_type, member_id, position, weight) VALUES (?, 'account', 'acct_ghost', 1, 1)`,
+		grp.ID); err != nil {
+		t.Fatalf("inject dangling member: %v", err)
+	}
+	if _, err := s.InsertEndpoint(ctx, model.Endpoint{Name: "mixed-ep", GroupID: grp.ID}); err != nil {
 		t.Fatalf("InsertEndpoint: %v", err)
 	}
-	if _, _, _, err := s.ResolveEndpoint(ctx, "ghost-ep"); err == nil {
-		t.Fatal("ResolveEndpoint with missing member: want error, got nil")
+	_, _, members, err := s.ResolveEndpoint(ctx, "mixed-ep")
+	if err != nil {
+		t.Fatalf("ResolveEndpoint should skip the dangling member, got error: %v", err)
+	}
+	if len(members) != 1 || members[0].ID != acc.ID {
+		t.Fatalf("resolved members = %+v, want only the real account %q", members, acc.ID)
+	}
+}
+
+func TestDeleteAccountCleansGroupMembers(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	acc, err := s.InsertAccount(ctx, model.Account{Label: "a", AccessToken: "a", RefreshToken: "r"})
+	if err != nil {
+		t.Fatalf("InsertAccount: %v", err)
+	}
+	grp, err := s.InsertPolicyGroup(ctx, model.PolicyGroup{
+		Name: "p", Strategy: model.StrategyFallback, MemberAccountIDs: []string{acc.ID},
+	})
+	if err != nil {
+		t.Fatalf("InsertPolicyGroup: %v", err)
+	}
+	if err := s.DeleteAccount(ctx, acc.ID); err != nil {
+		t.Fatalf("DeleteAccount: %v", err)
+	}
+	// The membership row must be gone (no dangling id left behind).
+	got, err := s.GetPolicyGroup(ctx, grp.ID)
+	if err != nil {
+		t.Fatalf("GetPolicyGroup: %v", err)
+	}
+	if len(got.MemberAccountIDs) != 0 {
+		t.Fatalf("group still has members %v after account delete; want cleaned up", got.MemberAccountIDs)
 	}
 }
 
