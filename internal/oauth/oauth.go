@@ -100,15 +100,17 @@ func (r *Refresher) refresh(ctx context.Context, acct model.Account) (model.Acco
 	// hold a stale account snapshot whose refresh_token was ALREADY rotated (and
 	// possibly single-use-invalidated) by an earlier refresh. Reusing that
 	// consumed refresh_token can trip the issuer's refresh-token reuse detection
-	// and revoke the entire token family — bricking the account. If the stored
-	// tokens have moved on since the caller's snapshot, adopt them instead of
-	// refreshing again; otherwise refresh using the authoritative refresh_token.
-	if cur, err := r.store.GetAccount(ctx, acct.ID); err == nil {
-		if cur.AccessToken != acct.AccessToken || cur.RefreshToken != acct.RefreshToken {
-			return cur, nil
-		}
-		acct = cur
+	// and revoke the entire token family — bricking the account. FAIL CLOSED: if
+	// the authoritative re-read fails we abort rather than fall back to the
+	// caller's (possibly stale) snapshot, which would reopen exactly that risk.
+	cur, err := r.store.GetAccount(ctx, acct.ID)
+	if err != nil {
+		return acct, fmt.Errorf("oauth: re-read account before refresh: %w", err)
 	}
+	if cur.AccessToken != acct.AccessToken || cur.RefreshToken != acct.RefreshToken {
+		return cur, nil
+	}
+	acct = cur
 
 	if acct.RefreshToken == "" {
 		return acct, fmt.Errorf("oauth: account %q has no refresh token", acct.ID)
