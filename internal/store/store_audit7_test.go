@@ -47,7 +47,7 @@ func TestUpsertReplaceClearsPendingJournal(t *testing.T) {
 		t.Fatalf("InsertAccount: %v", err)
 	}
 	// A pending rotation journal exists for the account.
-	if err := s.writeRotationJournal(a.ID, "aJ", "rJ"); err != nil {
+	if err := s.writeRotationJournal(a.ID, "aJ", "rJ", 0, 1, "refresh"); err != nil {
 		t.Fatalf("writeRotationJournal: %v", err)
 	}
 	// A login replace (fresh creds) must clear the pending journal so it can't later
@@ -72,7 +72,7 @@ func TestDeleteAccountRemovesJournal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InsertAccount: %v", err)
 	}
-	if err := s.writeRotationJournal(a.ID, "aJ", "rJ"); err != nil {
+	if err := s.writeRotationJournal(a.ID, "aJ", "rJ", 0, 1, "refresh"); err != nil {
 		t.Fatalf("writeRotationJournal: %v", err)
 	}
 	if err := s.DeleteAccount(ctx, a.ID); err != nil {
@@ -94,7 +94,7 @@ func TestPendingRotationIDs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InsertAccount: %v", err)
 	}
-	if err := s.writeRotationJournal(a.ID, "aJ", "rJ"); err != nil {
+	if err := s.writeRotationJournal(a.ID, "aJ", "rJ", 0, 1, "refresh"); err != nil {
 		t.Fatalf("writeRotationJournal: %v", err)
 	}
 	ids, err := s.PendingRotationIDs()

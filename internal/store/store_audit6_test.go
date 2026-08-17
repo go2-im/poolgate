@@ -142,19 +142,23 @@ func TestCommitRotatedTokensAndFlush(t *testing.T) {
 		t.Fatalf("InsertAccount: %v", err)
 	}
 
-	if err := s.CommitRotatedTokens(ctx, acct.ID, "r0", "a1", "r1"); err != nil {
+	if _, _, err := s.CommitRotatedTokens(ctx, acct.ID, 0, "a1", "r1"); err != nil {
 		t.Fatalf("CommitRotatedTokens: %v", err)
 	}
 	got, _ := s.GetAccount(ctx, acct.ID)
 	if got.AccessToken != "a1" || got.RefreshToken != "r1" {
 		t.Fatalf("tokens not committed: %+v", got)
 	}
+	if got.CredentialVersion != 1 {
+		t.Fatalf("credential_version = %d, want 1 after one rotation", got.CredentialVersion)
+	}
 	if _, ok, _ := s.readRotationJournal(acct.ID); ok {
 		t.Fatal("journal should be cleared after a successful commit")
 	}
 
-	// Simulate a rotation that was journaled but not yet persisted, then flush it.
-	if err := s.writeRotationJournal(acct.ID, "a2", "r2"); err != nil {
+	// Simulate a rotation that was journaled but not yet persisted, then flush it. The
+	// account is now at version 1, so the pending rotation is tagged base 1 -> target 2.
+	if err := s.writeRotationJournal(acct.ID, "a2", "r2", 1, 2, "refresh"); err != nil {
 		t.Fatalf("writeRotationJournal: %v", err)
 	}
 	if err := s.FlushPendingRotation(ctx, acct.ID); err != nil {
@@ -164,6 +168,9 @@ func TestCommitRotatedTokensAndFlush(t *testing.T) {
 	if got2.AccessToken != "a2" || got2.RefreshToken != "r2" {
 		t.Fatalf("flush did not apply journal: %+v", got2)
 	}
+	if got2.CredentialVersion != 2 {
+		t.Fatalf("credential_version = %d, want 2 after flush", got2.CredentialVersion)
+	}
 	if _, ok, _ := s.readRotationJournal(acct.ID); ok {
 		t.Fatal("journal should be removed after flush")
 	}
@@ -172,7 +179,7 @@ func TestCommitRotatedTokensAndFlush(t *testing.T) {
 		t.Fatalf("flush no-op: %v", err)
 	}
 	// A journal for a deleted account is dropped (not a hard error).
-	if err := s.writeRotationJournal("acct_gone", "a", "r"); err != nil {
+	if err := s.writeRotationJournal("acct_gone", "a", "r", 0, 1, "refresh"); err != nil {
 		t.Fatalf("writeRotationJournal(gone): %v", err)
 	}
 	if err := s.FlushPendingRotation(ctx, "acct_gone"); err != nil {
@@ -193,8 +200,9 @@ func TestReplayTokenRotationsOnOpen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InsertAccount: %v", err)
 	}
-	// Journal a rotation WITHOUT applying it to the DB (crash-after-journal sim).
-	if err := s.writeRotationJournal(acct.ID, "a9", "r9"); err != nil {
+	// Journal a rotation WITHOUT applying it to the DB (crash-after-journal sim). The
+	// fresh account is at version 0, so the pending rotation is tagged base 0 -> 1.
+	if err := s.writeRotationJournal(acct.ID, "a9", "r9", 0, 1, "refresh"); err != nil {
 		t.Fatalf("writeRotationJournal: %v", err)
 	}
 	_ = s.Close()
@@ -355,14 +363,15 @@ func TestCommitRotatedTokensErrorPaths(t *testing.T) {
 	s := openStoreDir(t, dir)
 	ctx := context.Background()
 
-	// Seed a real account. A CAS MISS (expectedRefresh != current) is a no-op: it
-	// must NOT overwrite the row and must leave no journal (a concurrent login won).
+	// Seed a real account (credential_version 0). A version-CAS MISS (baseVersion !=
+	// current) is a no-op: it must NOT overwrite the row and must leave no journal (a
+	// concurrent login/refresh with a newer generation won).
 	acct0, err := s.InsertAccount(ctx, model.Account{AccessToken: "a0", RefreshToken: "r0", State: model.StateOK})
 	if err != nil {
 		t.Fatalf("InsertAccount: %v", err)
 	}
-	if err := s.CommitRotatedTokens(ctx, acct0.ID, "STALE", "aX", "rX"); err != nil {
-		t.Fatalf("CAS-miss commit should be a no-op, got %v", err)
+	if _, applied, err := s.CommitRotatedTokens(ctx, acct0.ID, 99, "aX", "rX"); err != nil || applied {
+		t.Fatalf("CAS-miss commit should be a superseded no-op, got applied=%v err=%v", applied, err)
 	}
 	if got, _ := s.GetAccount(ctx, acct0.ID); got.RefreshToken != "r0" {
 		t.Fatalf("CAS-miss must not overwrite tokens: %+v", got)
@@ -371,18 +380,18 @@ func TestCommitRotatedTokensErrorPaths(t *testing.T) {
 		t.Fatal("CAS-miss must not leave a journal")
 	}
 	// A missing account → ErrNotFound and no journal created.
-	if err := s.CommitRotatedTokens(ctx, "acct_none", "whatever", "a", "r"); !errors.Is(err, ErrNotFound) {
+	if _, _, err := s.CommitRotatedTokens(ctx, "acct_none", 0, "a", "r"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("commit for a missing account = %v, want ErrNotFound", err)
 	}
 	if _, ok, _ := s.readRotationJournal("acct_none"); ok {
 		t.Fatal("missing-account commit must not create a journal")
 	}
 
-	// A dataDir-less store cannot journal; it falls back to a direct retrying write
-	// (no CAS, no journal). expectedRefresh is ignored on this path.
+	// A dataDir-less store cannot journal; it still does the version CAS against the DB
+	// (no journal). acct0 is still at version 0 (the CAS-miss above did not change it).
 	bare := &Store{db: s.DB(), cipher: s.cipher, dataDir: ""}
-	if err := bare.CommitRotatedTokens(ctx, acct0.ID, "r0", "a5", "r5"); err != nil {
-		t.Fatalf("dataDir-less commit: %v", err)
+	if _, applied, err := bare.CommitRotatedTokens(ctx, acct0.ID, 0, "a5", "r5"); err != nil || !applied {
+		t.Fatalf("dataDir-less commit: applied=%v err=%v", applied, err)
 	}
 	if got, _ := s.GetAccount(ctx, acct0.ID); got.RefreshToken != "r5" {
 		t.Fatalf("dataDir-less commit did not persist: %+v", got)
@@ -394,7 +403,7 @@ func TestCommitRotatedTokensErrorPaths(t *testing.T) {
 	if err := os.WriteFile(s2.rotationsDir(), []byte("x"), 0o600); err != nil {
 		t.Fatalf("occupy rotations dir path: %v", err)
 	}
-	if err := s2.writeRotationJournal("acct_z", "a", "r"); err == nil {
+	if err := s2.writeRotationJournal("acct_z", "a", "r", 0, 1, "refresh"); err == nil {
 		t.Fatal("writeRotationJournal should fail when the rotations dir path is a file")
 	}
 }
@@ -431,7 +440,7 @@ func TestRotationJournalMoreErrorBranches(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InsertAccount: %v", err)
 	}
-	if err := s2.CommitRotatedTokens(ctx, acct.ID, "r", "a2", "r2"); err == nil {
+	if _, _, err := s2.CommitRotatedTokens(ctx, acct.ID, 0, "a2", "r2"); err == nil {
 		t.Fatal("commit should fail when the journal cannot be written")
 	}
 
@@ -479,7 +488,7 @@ func TestWriteRotationJournalRenameFails(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(jp, "block"), []byte("x"), 0o600); err != nil {
 		t.Fatalf("write blocker: %v", err)
 	}
-	if err := s.writeRotationJournal("acct_rn", "a", "r"); err == nil {
+	if err := s.writeRotationJournal("acct_rn", "a", "r", 0, 1, "refresh"); err == nil {
 		t.Fatal("writeRotationJournal should fail when the target path is a non-empty dir")
 	}
 }
@@ -562,7 +571,7 @@ func TestRotationDataDirlessBranches(t *testing.T) {
 		t.Fatalf("bare flush = %v, want nil", err)
 	}
 	// A bare-store commit still surfaces the DB error for a missing account.
-	if err := bare.CommitRotatedTokens(ctx, "acct_missing", "old", "a", "r"); err == nil {
+	if _, _, err := bare.CommitRotatedTokens(ctx, "acct_missing", 0, "a", "r"); err == nil {
 		t.Fatal("bare commit for a missing account should error")
 	}
 }

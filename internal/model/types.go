@@ -57,6 +57,16 @@ type Account struct {
 	AccountID    string       `json:"account_id"` // ChatGPT-Account-ID rewritten on the proxy path
 	IDToken      string       `json:"id_token"`
 	State        AccountState `json:"state"`
+	// CredentialVersion is a per-account monotonic counter bumped by EVERY credential
+	// mutation (online refresh, interactive login, file import). It is the AUTHORITATIVE
+	// ordering of credential generations (DESIGN.md §19.3a): the online-refresh commit
+	// does a version compare-and-swap (write only when the DB version still equals the
+	// base it rotated from), and the rotation-recovery journal records base/target
+	// versions so a crash-interrupted rotation is applied only when the DB is still at
+	// its base — never re-applying a generation the DB has already moved past. A stale
+	// refresh_token string could collide across generations (the issuer may not rotate
+	// it), so the version — not the token string — is what disambiguates who won.
+	CredentialVersion int64 `json:"credential_version"`
 	// ConcurrencyCap is the max simultaneous in-flight upstream requests routed to
 	// this account (0 = unlimited). It backs least-in-flight selection + bounded
 	// backpressure (DESIGN.md §23.1). Persisted in the accounts.concurrency_cap
