@@ -66,3 +66,32 @@ func TestRestoreRefusesWhileServing(t *testing.T) {
 		t.Fatalf("restore-while-serving error = %v, want a 'stop it before restoring' message", err)
 	}
 }
+
+// TestRotateKeyRefusesWhileServing asserts key rotation won't run against a data
+// dir a live server is using (rotation would write new-key ciphertext under a
+// server still holding the old cipher in memory).
+func TestRotateKeyRefusesWhileServing(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	t.Setenv(envDataDir, dir)
+	t.Setenv(envMasterKey, "")
+	if err := run(ctx, []string{"init"}, io.Discard, io.Discard); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+
+	held, err := lock.Acquire(filepath.Join(dir, lockFile))
+	if err != nil {
+		t.Fatalf("hold lock: %v", err)
+	}
+	defer held.Release()
+
+	err = run(ctx, []string{"rotate-key"}, io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "holds the lock") {
+		t.Fatalf("rotate-while-serving error = %v, want a 'holds the lock' message", err)
+	}
+	// No pre-rotation snapshot should have been written (it aborts before that).
+	snaps, _ := filepath.Glob(filepath.Join(dir, "poolgate-pre-rotate-*.db"))
+	if len(snaps) != 0 {
+		t.Fatalf("rotate aborted at the lock must not write a snapshot, got %d", len(snaps))
+	}
+}

@@ -191,19 +191,44 @@ func cmdRestore(args []string, stdout io.Writer) error {
 	// written (and fsync'd, with the dir) FIRST so it is durable before any
 	// destructive rename; `poolgate serve` refuses to start while it exists, so a
 	// crash mid-commit is caught before a mismatched DB/key generation is used.
+	// Marker durability is REQUIRED, not best-effort: if the marker (or its
+	// directory entry) cannot be fsync'd we abort BEFORE touching the live
+	// generation, because a lost marker would let `serve` start on a half-committed
+	// restore.
 	marker := filepath.Join(cfg.DataDir, restoreMarkerFile)
-	if err := os.WriteFile(marker, []byte("restore in progress\n"), 0o600); err != nil {
+	cleanupTemps := func() {
 		_ = os.Remove(dbTmp)
 		if writeKey {
 			_ = os.Remove(keyTmp)
 		}
+	}
+	if err := os.WriteFile(marker, []byte("restore in progress\n"), 0o600); err != nil {
+		cleanupTemps()
 		return fmt.Errorf("write restore marker: %w", err)
 	}
-	if f, ferr := os.Open(marker); ferr == nil {
-		_ = f.Sync()
-		_ = f.Close()
+	mf, ferr := os.Open(marker)
+	if ferr != nil {
+		_ = os.Remove(marker)
+		cleanupTemps()
+		return fmt.Errorf("open restore marker for fsync: %w", ferr)
 	}
-	syncDir(cfg.DataDir)
+	syncErr := mf.Sync()
+	closeErr := mf.Close()
+	if syncErr != nil {
+		_ = os.Remove(marker)
+		cleanupTemps()
+		return fmt.Errorf("fsync restore marker: %w", syncErr)
+	}
+	if closeErr != nil {
+		_ = os.Remove(marker)
+		cleanupTemps()
+		return fmt.Errorf("close restore marker: %w", closeErr)
+	}
+	if err := syncDirErr(cfg.DataDir); err != nil {
+		_ = os.Remove(marker)
+		cleanupTemps()
+		return fmt.Errorf("fsync data dir for restore marker: %w", err)
+	}
 
 	// Move the current generation aside (DB + key + its WAL/SHM sidecars) so we can
 	// roll back on failure AND so a stale sidecar is never applied to the new DB
@@ -222,26 +247,52 @@ func cmdRestore(args []string, stdout io.Writer) error {
 		}
 		return nil
 	}
-	rollback := func() {
-		// Remove ONLY files we actually INSTALLED (renamed from tmp). A path we
-		// never installed still holds the ORIGINAL file (e.g. a saveAside failed
-		// before it moved the key) and must not be deleted — it isn't in prev, so
-		// it could not be restored. This is what previously destroyed the live
-		// master key on a partial-aside failure.
+	// rollback undoes a partial commit. It removes ONLY files we actually INSTALLED
+	// (renamed from tmp): a path we never installed still holds the ORIGINAL file
+	// (e.g. a saveAside failed before it moved the key) and must not be deleted — it
+	// isn't in prev, so it could not be restored (this is what previously destroyed
+	// the live master key). It returns a combined error if any restore-back step
+	// fails and, in that case, KEEPS the restore marker so `serve` refuses to start
+	// on a silently-mixed generation and the operator recovers by hand.
+	rollback := func() error {
+		var errs []error
 		if installedDB {
-			_ = os.Remove(dbPath)
+			if e := os.Remove(dbPath); e != nil && !errors.Is(e, os.ErrNotExist) {
+				errs = append(errs, fmt.Errorf("remove installed db %s: %w", dbPath, e))
+			}
 		}
 		if installedKey {
-			_ = os.Remove(keyPath)
+			if e := os.Remove(keyPath); e != nil && !errors.Is(e, os.ErrNotExist) {
+				errs = append(errs, fmt.Errorf("remove installed key %s: %w", keyPath, e))
+			}
 		}
 		for orig, bak := range prev {
-			_ = os.Rename(bak, orig)
+			if e := os.Rename(bak, orig); e != nil {
+				errs = append(errs, fmt.Errorf("restore %s from %s: %w", orig, bak, e))
+			}
 		}
 		_ = os.Remove(dbTmp)
 		if writeKey {
 			_ = os.Remove(keyTmp)
 		}
-		_ = os.Remove(marker)
+		if len(errs) == 0 {
+			// Old generation fully restored — clear the marker (durably).
+			_ = os.Remove(marker)
+			syncDir(cfg.DataDir)
+			return nil
+		}
+		// Could not fully restore: KEEP the marker so serve refuses to start.
+		syncDir(cfg.DataDir)
+		return errors.Join(errs...)
+	}
+	// fail runs rollback for cause and, if rollback could not fully restore the old
+	// generation, reports BOTH errors plus that the marker was kept for manual recovery.
+	fail := func(cause error) error {
+		if rbErr := rollback(); rbErr != nil {
+			return fmt.Errorf("%w; rollback FAILED, restore marker kept at %s — manual recovery required: %v",
+				cause, marker, rbErr)
+		}
+		return cause
 	}
 	aside := []string{dbPath, dbPath + "-wal", dbPath + "-shm"}
 	if writeKey {
@@ -249,28 +300,33 @@ func cmdRestore(args []string, stdout io.Writer) error {
 	}
 	for _, p := range aside {
 		if err := saveAside(p); err != nil {
-			rollback()
-			return fmt.Errorf("stage old %s aside: %w", p, err)
+			return fail(fmt.Errorf("stage old %s aside: %w", p, err))
 		}
 	}
 
 	// Install the new generation.
 	if err := os.Rename(dbTmp, dbPath); err != nil {
-		rollback()
-		return fmt.Errorf("commit database: %w", err)
+		return fail(fmt.Errorf("commit database: %w", err))
 	}
 	installedDB = true
 	if writeKey {
 		if err := os.Rename(keyTmp, keyPath); err != nil {
-			rollback()
-			return fmt.Errorf("commit master key: %w", err)
+			return fail(fmt.Errorf("commit master key: %w", err))
 		}
 		installedKey = true
 	}
 
-	// Success: clear the marker, fsync the directory, and drop the saved-aside old
-	// generation.
-	_ = os.Remove(marker)
+	// Success: the new generation is fully installed. Clear the marker and make its
+	// REMOVAL durable (fsync the dir) before dropping the saved-aside old generation,
+	// so a crash after this point can never resurrect the marker and block a
+	// completed restore. If clearing the marker fails, the restore itself still
+	// SUCCEEDED — do NOT roll back the good install; report it so the operator
+	// removes the marker by hand. The .prev cleanup is best-effort (harmless if left).
+	if err := os.Remove(marker); err != nil && !errors.Is(err, os.ErrNotExist) {
+		syncDir(cfg.DataDir)
+		return fmt.Errorf("restore committed into %s but clearing marker %s failed: %w — remove it manually, then run `poolgate serve`",
+			cfg.DataDir, marker, err)
+	}
 	syncDir(cfg.DataDir)
 	for _, bak := range prev {
 		_ = os.Remove(bak)
@@ -314,14 +370,27 @@ func stageTemp(tmpPath string, data []byte, perm os.FileMode) error {
 }
 
 // syncDir best-effort fsyncs a directory so a rename into it is durable across a
-// crash. Errors are ignored (not all platforms/filesystems support it).
+// crash. Errors are ignored (not all platforms/filesystems support it); callers
+// that MUST know the dir entry is durable use syncDirErr instead.
 func syncDir(dir string) {
+	_ = syncDirErr(dir)
+}
+
+// syncDirErr fsyncs a directory and RETURNS any error, for the durability-critical
+// callers (pre-rotation snapshot, restore marker) where a silently-unsynced
+// directory entry could forfeit a recovery artifact. A dir that cannot be opened
+// or synced surfaces the error so the caller can abort rather than proceed on a
+// false durability assumption.
+func syncDirErr(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
-		return
+		return err
 	}
-	defer d.Close()
-	_ = d.Sync()
+	if err := d.Sync(); err != nil {
+		_ = d.Close()
+		return err
+	}
+	return d.Close()
 }
 
 // parseBackupArgs parses `backup` flags (order-independent).

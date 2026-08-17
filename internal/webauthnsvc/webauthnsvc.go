@@ -200,12 +200,38 @@ func resolveRP(admin model.ListenConfig) (rpID string, origins []string, err err
 	if perr != nil {
 		return "", nil, fmt.Errorf("webauthnsvc: invalid admin external_origin %q: %w", origin, perr)
 	}
-	if u.Scheme == "" || u.Host == "" {
+	// A WebAuthn RP origin is exactly scheme://host[:port] — nothing else. Reject a
+	// malformed external_origin explicitly (rather than silently accepting a value
+	// the browser will never match): only http/https, no userinfo, and no
+	// path/query/fragment. This catches operator misconfig that would otherwise
+	// break registration in confusing ways.
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", nil, fmt.Errorf("webauthnsvc: admin external_origin %q must use http or https scheme", origin)
+	}
+	if u.Host == "" {
 		return "", nil, fmt.Errorf("webauthnsvc: admin external_origin %q must be an absolute origin (scheme://host)", origin)
+	}
+	if u.User != nil {
+		return "", nil, fmt.Errorf("webauthnsvc: admin external_origin %q must not contain userinfo", origin)
+	}
+	if (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+		return "", nil, fmt.Errorf("webauthnsvc: admin external_origin %q must be a bare origin with no path, query, or fragment", origin)
+	}
+	host := u.Hostname()
+	if host == "" {
+		return "", nil, fmt.Errorf("webauthnsvc: admin external_origin %q has no host", origin)
 	}
 	rpID = strings.TrimSpace(admin.RPID)
 	if rpID == "" {
-		rpID = u.Hostname()
+		rpID = host
+		return rpID, []string{origin}, nil
+	}
+	// An explicit rp_id must be the origin host or a registrable parent domain of it
+	// (WebAuthn requires the RP ID to be equal to or a registrable suffix of the
+	// origin's effective domain). A mismatched rp_id makes every ceremony fail, so
+	// reject it up front instead of at ceremony time.
+	if host != rpID && !strings.HasSuffix(host, "."+rpID) {
+		return "", nil, fmt.Errorf("webauthnsvc: admin rp_id %q is not the origin host %q nor a parent domain of it", rpID, host)
 	}
 	return rpID, []string{origin}, nil
 }

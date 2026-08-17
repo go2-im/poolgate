@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/go2-im/poolgate/internal/model"
+	"github.com/go2-im/poolgate/internal/store"
 )
 
 // TestBackupRestoreRoundTrip provisions a data dir, backs it up, restores into a
@@ -319,6 +320,69 @@ func TestRestoreLeavesNoResidue(t *testing.T) {
 		if n == restoreMarkerFile || strings.HasSuffix(n, ".prev") || strings.HasSuffix(n, ".tmp") {
 			t.Errorf("restore left residue file %q", n)
 		}
+	}
+}
+
+// TestRestoreRollbackRestoresOldGenerationOnFailure forces a failure DURING the
+// destructive commit (a saveAside that cannot move the old key aside) and asserts
+// the rollback (a) returns an error, (b) restores the original DB + key, and (c)
+// clears the restore marker because the old generation was fully recovered.
+func TestRestoreRollbackRestoresOldGenerationOnFailure(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	t.Setenv(envDataDir, dir)
+	if err := run(ctx, []string{"init"}, io.Discard, io.Discard); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	t.Setenv(envBackupPassphrase, "rollback-pass")
+	bundle := filepath.Join(t.TempDir(), "rb.pgbak")
+	if err := run(ctx, []string{"backup", "--out", bundle}, io.Discard, io.Discard); err != nil {
+		t.Fatalf("backup: %v", err)
+	}
+
+	keyPath := filepath.Join(dir, masterKeyFile)
+	origKey, err := os.ReadFile(keyPath)
+	if err != nil {
+		t.Fatalf("read original key: %v", err)
+	}
+	// Block saveAside(keyPath): make "<keyPath>.prev" a NON-EMPTY directory so the
+	// rename of the live key aside fails (ENOTEMPTY), triggering the rollback path
+	// AFTER the DB was already moved aside.
+	blocker := keyPath + ".prev"
+	if err := os.Mkdir(blocker, 0o700); err != nil {
+		t.Fatalf("mkdir blocker: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(blocker, "x"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("write blocker file: %v", err)
+	}
+
+	err = run(ctx, []string{"restore", bundle, "--force"}, io.Discard, io.Discard)
+	if err == nil {
+		t.Fatal("restore should fail when the old key cannot be staged aside")
+	}
+	// Clean the blocker so we can inspect the final state.
+	_ = os.RemoveAll(blocker)
+
+	// The original master key is back in place (rollback restored the DB it had
+	// moved aside; the key was never moved so it is untouched).
+	gotKey, err := os.ReadFile(keyPath)
+	if err != nil {
+		t.Fatalf("key missing after rollback: %v", err)
+	}
+	if !bytes.Equal(gotKey, origKey) {
+		t.Fatal("master key not preserved across a failed restore")
+	}
+	if _, err := os.Stat(filepath.Join(dir, store.DBFileName)); err != nil {
+		t.Fatalf("database not restored after rollback: %v", err)
+	}
+	// The rollback fully recovered the old generation, so the marker is cleared.
+	if _, err := os.Stat(filepath.Join(dir, restoreMarkerFile)); !os.IsNotExist(err) {
+		t.Fatalf("restore marker should be cleared after a clean rollback: %v", err)
+	}
+	// The recovered install still serves: a fresh backup (which opens the store with
+	// the restored key) succeeds.
+	if err := run(ctx, []string{"backup", "--out", filepath.Join(t.TempDir(), "after.pgbak")}, io.Discard, io.Discard); err != nil {
+		t.Fatalf("recovered install unusable: %v", err)
 	}
 }
 

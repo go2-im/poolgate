@@ -151,6 +151,18 @@ func TestResolveRP(t *testing.T) {
 			wantOrigins: []string{"http://192.168.1.5:7070"},
 		},
 		{
+			name:        "non-loopback IPv6 host is bracketed in the synthesized origin",
+			admin:       model.ListenConfig{Host: "2001:db8::1", Port: 7070},
+			wantRPID:    "2001:db8::1",
+			wantOrigins: []string{"http://[2001:db8::1]:7070"},
+		},
+		{
+			name:        "explicit rp_id as a registrable parent domain is accepted",
+			admin:       model.ListenConfig{ExternalOrigin: "https://admin.corp.example.com", RPID: "example.com"},
+			wantRPID:    "example.com",
+			wantOrigins: []string{"https://admin.corp.example.com"},
+		},
+		{
 			name:    "origin without scheme is rejected",
 			admin:   model.ListenConfig{ExternalOrigin: "admin.example.com"},
 			wantErr: true,
@@ -158,6 +170,41 @@ func TestResolveRP(t *testing.T) {
 		{
 			name:    "unparseable origin is rejected",
 			admin:   model.ListenConfig{ExternalOrigin: "http://[::1"},
+			wantErr: true,
+		},
+		{
+			name:    "non-http(s) scheme is rejected",
+			admin:   model.ListenConfig{ExternalOrigin: "ftp://admin.example.com"},
+			wantErr: true,
+		},
+		{
+			name:    "origin with userinfo is rejected",
+			admin:   model.ListenConfig{ExternalOrigin: "https://user:pass@admin.example.com"},
+			wantErr: true,
+		},
+		{
+			name:    "origin with a path is rejected",
+			admin:   model.ListenConfig{ExternalOrigin: "https://admin.example.com/login"},
+			wantErr: true,
+		},
+		{
+			name:    "origin with a query is rejected",
+			admin:   model.ListenConfig{ExternalOrigin: "https://admin.example.com?a=1"},
+			wantErr: true,
+		},
+		{
+			name:    "origin with a fragment is rejected",
+			admin:   model.ListenConfig{ExternalOrigin: "https://admin.example.com#frag"},
+			wantErr: true,
+		},
+		{
+			name:    "rp_id unrelated to the origin host is rejected",
+			admin:   model.ListenConfig{ExternalOrigin: "https://admin.example.com", RPID: "evil.com"},
+			wantErr: true,
+		},
+		{
+			name:    "rp_id that is a child (not parent) of the host is rejected",
+			admin:   model.ListenConfig{ExternalOrigin: "https://example.com", RPID: "admin.example.com"},
 			wantErr: true,
 		},
 	}

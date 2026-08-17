@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/go2-im/poolgate/internal/model"
@@ -37,7 +38,9 @@ func SynthesizeAdminOrigin(admin model.ListenConfig) string {
 	if port == 0 {
 		port = DefaultAdminPort
 	}
-	return fmt.Sprintf("http://%s:%d", host, port)
+	// net.JoinHostPort brackets an IPv6 host ("[2001:db8::1]:7070"); a bare
+	// fmt.Sprintf would emit an unparseable "http://2001:db8::1:7070".
+	return "http://" + net.JoinHostPort(host, strconv.Itoa(port))
 }
 
 // Defaults for the two listeners and pinned egress values.

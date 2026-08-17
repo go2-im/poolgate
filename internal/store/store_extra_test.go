@@ -687,6 +687,44 @@ func TestApiKeyHashedAtRestAndBackfill(t *testing.T) {
 	}
 }
 
+// TestConsumeBootstrapSkipsExpiredAndUsed covers the token-scan skip branches: an
+// expired token and an already-used token are both ignored, so a non-matching live
+// set yields ErrNotFound without consuming anything.
+func TestConsumeBootstrapSkipsExpiredAndUsed(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// An expired token (expires in the past).
+	if _, err := s.InsertBootstrapToken(ctx, model.BootstrapToken{
+		TokenHash: "expired", ExpiresAt: now.Add(-time.Hour),
+	}); err != nil {
+		t.Fatalf("insert expired: %v", err)
+	}
+	// An already-used token.
+	used, err := s.InsertBootstrapToken(ctx, model.BootstrapToken{
+		TokenHash: "used", ExpiresAt: now.Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("insert used: %v", err)
+	}
+	if err := s.ConsumeBootstrapToken(ctx, used.ID, now); err != nil {
+		t.Fatalf("mark used: %v", err)
+	}
+
+	// Neither the expired nor the used token can be matched: ErrNotFound, no credential.
+	cred := model.WebAuthnCredential{CredID: []byte("c"), PublicKey: []byte("pk")}
+	if _, err := s.ConsumeBootstrapAndInsertCredential(ctx, "expired", now, cred); err != ErrNotFound {
+		t.Fatalf("expired token = %v, want ErrNotFound", err)
+	}
+	if _, err := s.ConsumeBootstrapAndInsertCredential(ctx, "used", now, cred); err != ErrNotFound {
+		t.Fatalf("used token = %v, want ErrNotFound", err)
+	}
+	if n, _ := s.CountWebAuthnCredentials(ctx); n != 0 {
+		t.Fatalf("no credential should be inserted, got %d", n)
+	}
+}
+
 func TestConsumeBootstrapAndInsertCredentialAtomic(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
@@ -708,6 +746,16 @@ func TestConsumeBootstrapAndInsertCredentialAtomic(t *testing.T) {
 		t.Fatalf("credential inserted on wrong-hash path: %d", n)
 	}
 
+	// Insert failure (missing public_key) while still the first passkey rolls back
+	// the token consume: the token stays unconsumed and usable.
+	if _, err := s.ConsumeBootstrapAndInsertCredential(ctx, hash, now,
+		model.WebAuthnCredential{CredID: []byte("cred-x")}); err == nil { // no public_key -> insert fails
+		t.Fatal("expected insert failure for missing public_key")
+	}
+	if toks, _ := s.ListBootstrapTokens(ctx); len(toks) != 1 || !toks[0].UsedAt.IsZero() {
+		t.Fatalf("token must be unconsumed after a rolled-back insert: %+v", toks)
+	}
+
 	// Correct hash: token consumed + credential inserted atomically.
 	stored, err := s.ConsumeBootstrapAndInsertCredential(ctx, hash, now, cred)
 	if err != nil {
@@ -719,31 +767,28 @@ func TestConsumeBootstrapAndInsertCredentialAtomic(t *testing.T) {
 	if n, _ := s.CountWebAuthnCredentials(ctx); n != 1 {
 		t.Fatalf("credential count = %d, want 1", n)
 	}
+	// On first-passkey success ALL bootstrap tokens are purged (no leftover token
+	// can register another admin credential).
+	if toks, _ := s.ListBootstrapTokens(ctx); len(toks) != 0 {
+		t.Fatalf("bootstrap tokens must be purged after first passkey, got %d", len(toks))
+	}
 
-	// Token is now used: second attempt is refused (single-use).
-	if _, err := s.ConsumeBootstrapAndInsertCredential(ctx, hash, now, model.WebAuthnCredential{
-		CredID: []byte("cred-2"), PublicKey: []byte("pk"),
-	}); err == nil {
-		t.Fatal("second consume of a used token should fail")
+	// First-passkey invariant (the concurrency guard): once a credential exists, a
+	// FRESH valid, unused token is STILL refused with ErrAlreadyExists, and it is NOT
+	// consumed — so two racing registrations holding different tokens cannot both win.
+	if _, err := s.InsertBootstrapToken(ctx, model.BootstrapToken{
+		TokenHash: "second", ExpiresAt: now.Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("InsertBootstrapToken 2: %v", err)
+	}
+	if _, err := s.ConsumeBootstrapAndInsertCredential(ctx, "second", now,
+		model.WebAuthnCredential{CredID: []byte("cred-2"), PublicKey: []byte("pk")}); err != ErrAlreadyExists {
+		t.Fatalf("second credential via bootstrap = %v, want ErrAlreadyExists", err)
 	}
 	if n, _ := s.CountWebAuthnCredentials(ctx); n != 1 {
 		t.Fatalf("credential count = %d after refused second consume, want 1", n)
 	}
-
-	// Insert failure (missing public_key) rolls back the token consume: a fresh
-	// token stays usable.
-	if _, err := s.InsertBootstrapToken(ctx, model.BootstrapToken{
-		TokenHash: "hash2", ExpiresAt: now.Add(time.Hour),
-	}); err != nil {
-		t.Fatalf("InsertBootstrapToken 2: %v", err)
-	}
-	if _, err := s.ConsumeBootstrapAndInsertCredential(ctx, "hash2", now,
-		model.WebAuthnCredential{CredID: []byte("cred-3")}); err == nil { // no public_key -> insert fails
-		t.Fatal("expected insert failure for missing public_key")
-	}
-	// hash2 must still be usable (consume rolled back with the failed insert).
-	if _, err := s.ConsumeBootstrapAndInsertCredential(ctx, "hash2", now,
-		model.WebAuthnCredential{CredID: []byte("cred-3"), PublicKey: []byte("pk")}); err != nil {
-		t.Fatalf("token should still be usable after a rolled-back insert: %v", err)
+	if toks, _ := s.ListBootstrapTokens(ctx); len(toks) != 1 || !toks[0].UsedAt.IsZero() {
+		t.Fatalf("fresh token must be untouched when the first-passkey invariant blocks it: %+v", toks)
 	}
 }
