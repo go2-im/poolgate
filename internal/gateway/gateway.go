@@ -309,6 +309,11 @@ type errorDetail struct {
 	Message string `json:"message"`
 	Type    string `json:"type"`
 	Code    string `json:"code"`
+	// Param completes the OpenAI-compatible envelope shape (DESIGN.md §19.4). poolgate
+	// errors are proxy/routing-level, not request-field-specific, so it is empty for
+	// all currently-emitted errors — but it is always PRESENT (like code) so clients
+	// that read error.param never see a missing key.
+	Param string `json:"param"`
 }
 
 func writeError(w http.ResponseWriter, status int, typ, code, msg string) {

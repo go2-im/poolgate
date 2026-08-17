@@ -104,6 +104,7 @@ func TestWS_HappyPathRewriteAndEcho(t *testing.T) {
 	f := newFixture(t)
 	up := newWSUpstream(t, nil)
 	f.cfg.UpstreamAllowlist = []string{mustHost(t, up.srv.URL)}
+	f.cfg.Server.Transport = TransportBoth // WS tests opt into the upgrade (default is http-only)
 	gw := New(f.st, f.cfg, WithUpstreamBase(up.srv.URL), WithHTTPClient(up.srv.Client()))
 	srv := httptest.NewServer(gw.Routes())
 	defer srv.Close()
@@ -142,6 +143,7 @@ func TestWS_RejectsBadKey(t *testing.T) {
 	f := newFixture(t)
 	up := newWSUpstream(t, nil)
 	f.cfg.UpstreamAllowlist = []string{mustHost(t, up.srv.URL)}
+	f.cfg.Server.Transport = TransportBoth // WS tests opt into the upgrade (default is http-only)
 	gw := New(f.st, f.cfg, WithUpstreamBase(up.srv.URL), WithHTTPClient(up.srv.Client()))
 	srv := httptest.NewServer(gw.Routes())
 	defer srv.Close()
@@ -162,6 +164,7 @@ func TestWS_NonUpgradeGetIs400(t *testing.T) {
 	f := newFixture(t)
 	up := newWSUpstream(t, nil)
 	f.cfg.UpstreamAllowlist = []string{mustHost(t, up.srv.URL)}
+	f.cfg.Server.Transport = TransportBoth // WS tests opt into the upgrade (default is http-only)
 	gw := New(f.st, f.cfg, WithUpstreamBase(up.srv.URL), WithHTTPClient(up.srv.Client()))
 	srv := httptest.NewServer(gw.Routes())
 	defer srv.Close()
@@ -200,6 +203,7 @@ func TestWS_FailsOverToHealthyAccount(t *testing.T) {
 	// The first member (id-bad) is rejected upstream; failover must reach id-good.
 	up := newWSUpstream(t, map[string]int{"id-bad": http.StatusUnauthorized})
 	f.cfg.UpstreamAllowlist = []string{mustHost(t, up.srv.URL)}
+	f.cfg.Server.Transport = TransportBoth // WS tests opt into the upgrade (default is http-only)
 	gw := New(f.st, f.cfg, WithUpstreamBase(up.srv.URL), WithHTTPClient(up.srv.Client()))
 	srv := httptest.NewServer(gw.Routes())
 	defer srv.Close()
@@ -228,6 +232,7 @@ func TestWS_NonRetryable4xxRelayedNotFailedOver(t *testing.T) {
 	// id-good (which would amplify one bad request and mask the real status).
 	up := newWSUpstream(t, map[string]int{"id-bad": http.StatusBadRequest})
 	f.cfg.UpstreamAllowlist = []string{mustHost(t, up.srv.URL)}
+	f.cfg.Server.Transport = TransportBoth // WS tests opt into the upgrade (default is http-only)
 	gw := New(f.st, f.cfg, WithUpstreamBase(up.srv.URL), WithHTTPClient(up.srv.Client()))
 	srv := httptest.NewServer(gw.Routes())
 	defer srv.Close()
@@ -249,6 +254,7 @@ func TestWS_TurnStateAffinityPinsBackend(t *testing.T) {
 	setStrategy(t, f, model.StrategyLoadBalance)
 	up := newWSUpstream(t, nil)
 	f.cfg.UpstreamAllowlist = []string{mustHost(t, up.srv.URL)}
+	f.cfg.Server.Transport = TransportBoth // WS tests opt into the upgrade (default is http-only)
 	gw := New(f.st, f.cfg, WithUpstreamBase(up.srv.URL), WithHTTPClient(up.srv.Client()))
 	srv := httptest.NewServer(gw.Routes())
 	defer srv.Close()
@@ -284,12 +290,51 @@ func TestWS_TurnStateAffinityPinsBackend(t *testing.T) {
 func TestNormalizeTransport(t *testing.T) {
 	cases := map[string]string{
 		"both": TransportBoth, "http-only": TransportHTTPOnly, "ws-only": TransportWSOnly,
-		"": TransportBoth, "bogus": TransportBoth,
+		"": TransportHTTPOnly, "bogus": TransportHTTPOnly,
 	}
 	for in, want := range cases {
 		if got := normalizeTransport(in); got != want {
 			t.Errorf("normalizeTransport(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// TestTransportDefaultRefusesWSUpgrade proves the DEFAULT (unset) transport is
+// http-only end-to-end: the WS upgrade is refused (so Codex falls back to the
+// stateless HTTP+SSE path), while plain HTTP POST is served. WS is opt-in because
+// reconnect affinity is unreliable with current clients (audit P2#10 / §19.1).
+func TestTransportDefaultRefusesWSUpgrade(t *testing.T) {
+	f := newFixture(t)
+	up := newWSUpstream(t, nil)
+	f.cfg.UpstreamAllowlist = []string{mustHost(t, up.srv.URL)}
+	// Transport deliberately LEFT UNSET → normalizes to http-only (the new default).
+	gw := New(f.st, f.cfg, WithUpstreamBase(up.srv.URL), WithHTTPClient(up.srv.Client()))
+	srv := httptest.NewServer(gw.Routes())
+	defer srv.Close()
+
+	// WS upgrade is refused under the default (Codex falls back to HTTP+SSE).
+	_, resp, err := wsDial(t, srv.URL, "default", f.apiKey, "")
+	if err == nil {
+		t.Fatal("default transport must refuse the WS upgrade")
+	}
+	if resp == nil || resp.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("WS refusal status = %v, want 501", resp)
+	}
+	if len(up.seen()) != 0 {
+		t.Errorf("upstream contacted despite the default WS refusal")
+	}
+
+	// The stateless HTTP POST path is served (NOT a 426 upgrade-required).
+	postReq, _ := http.NewRequest(http.MethodPost, srv.URL+"/e/default/v1/responses",
+		strings.NewReader(`{"model":"gpt-5"}`))
+	postReq.Header.Set("Authorization", "Bearer "+f.apiKey)
+	postResp, err := http.DefaultClient.Do(postReq)
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer postResp.Body.Close()
+	if postResp.StatusCode == http.StatusUpgradeRequired {
+		t.Errorf("default-transport POST returned 426, want the HTTP path served")
 	}
 }
 

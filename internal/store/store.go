@@ -789,9 +789,13 @@ WHERE id = ? AND credential_version = ?`,
 			// vanished or the invariant is violated. Retain the journal, fail closed.
 			return fmt.Errorf("store: login replace version CAS failed for %s (row gone or version moved under the lock)", existingID)
 		}
-		if err := s.removeRotationJournal(existingID); err != nil {
-			return fmt.Errorf("store: clear journal after replace: %w", err)
-		}
+		// The credentials are now COMMITTED (version curVer -> target). Drop the journal
+		// best-effort: a removal failure must NOT fail the login (audit P2#8 — reporting
+		// failure on an already-committed credential replace would make a caller think the
+		// login didn't take and retry/re-login needlessly). The leftover journal is a
+		// versioned entry (base=curVer, target=curVer+1) now at/below the DB version, so
+		// recovery/flush recognizes it as already-applied (dbVer >= target) and drops it.
+		_ = s.removeRotationJournal(existingID)
 		updated, gerr := s.GetAccount(ctx, existingID)
 		if gerr != nil {
 			return fmt.Errorf("store: re-read after replace: %w", gerr)

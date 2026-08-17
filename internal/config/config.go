@@ -62,9 +62,12 @@ const (
 	// claim in imported tokens (DESIGN.md §0 D6 / §6).
 	DefaultIssuer = "https://auth.openai.com/oauth/token"
 
-	// DefaultTransport offers both proxy transports (accept the WS upgrade and
-	// serve HTTP+SSE). See model.ServerConfig.Transport (DESIGN.md §0 D2).
-	DefaultTransport = "both"
+	// DefaultTransport is the stateless HTTP POST+SSE path only (the WS upgrade is
+	// refused so Codex falls back to it). HTTP+SSE carries full turn context inline
+	// and needs no affinity, so it is always correct; WS reconnect affinity depends
+	// on an upgrade header current clients don't send (audit P2#10 / DESIGN §0 D2 /
+	// §19.1). Accept the WS upgrade explicitly via "both" or "ws-only".
+	DefaultTransport = "http-only"
 )
 
 // DefaultUpstreamAllowlist is the set of hosts poolgate may send
