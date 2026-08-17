@@ -12,19 +12,19 @@ import (
 
 func TestBlockedIP(t *testing.T) {
 	blocked := []string{
-		"127.0.0.1",       // loopback v4
-		"::1",             // loopback v6
-		"10.1.2.3",        // private
-		"172.16.0.1",      // private
-		"192.168.1.1",     // private
-		"169.254.169.254", // link-local / cloud metadata
-		"fe80::1",         // link-local v6
-		"fc00::1",         // ULA (private v6)
-		"fd12:3456::1",    // ULA
-		"0.0.0.0",         // unspecified
-		"::",              // unspecified v6
-		"224.0.0.1",       // multicast
-		"ff02::1",         // multicast v6
+		"127.0.0.1",        // loopback v4
+		"::1",              // loopback v6
+		"10.1.2.3",         // private
+		"172.16.0.1",       // private
+		"192.168.1.1",      // private
+		"169.254.169.254",  // link-local / cloud metadata
+		"fe80::1",          // link-local v6
+		"fc00::1",          // ULA (private v6)
+		"fd12:3456::1",     // ULA
+		"0.0.0.0",          // unspecified
+		"::",               // unspecified v6
+		"224.0.0.1",        // multicast
+		"ff02::1",          // multicast v6
 		"::ffff:127.0.0.1", // v4-in-v6 loopback
 		"::ffff:10.0.0.1",  // v4-in-v6 private
 		"100.64.0.1",       // RFC 6598 CGNAT

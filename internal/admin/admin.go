@@ -145,14 +145,14 @@ type Server struct {
 	skew     ClockSkewSource
 	spa      http.Handler
 
-	origin   string // canonical admin origin (scheme://host[:port]) for CORS
+	origin    string // canonical admin origin (scheme://host[:port]) for CORS
 	extOrigin string // configured external_origin (may be empty when synthesized)
 	proxyBase string // configured proxy base URL (http://host:port), a hint for the client-config generator
-	secure   bool   // set the Secure cookie flag (origin is https)
-	now      func() time.Time
-	logger   *slog.Logger
-	limiter  *limiter
-	recovery int // number of recovery codes minted with the first passkey
+	secure    bool   // set the Secure cookie flag (origin is https)
+	now       func() time.Time
+	logger    *slog.Logger
+	limiter   *limiter
+	recovery  int // number of recovery codes minted with the first passkey
 
 	// anti-brute-force tunables, applied to the limiter in New.
 	limiterMaxFailures int
@@ -203,7 +203,8 @@ func WithTrustedProxies(nets []*net.IPNet) Option {
 
 // WithRecoveryCodeCount overrides how many one-time recovery codes are minted and
 // returned (once) when the first passkey is registered. 0 keeps the default.
-func WithRecoveryCodeCount(n int) Option {	return func(s *Server) {
+func WithRecoveryCodeCount(n int) Option {
+	return func(s *Server) {
 		if n >= 0 {
 			s.recovery = n
 		}

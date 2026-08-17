@@ -10,10 +10,10 @@ func TestSanitizeField(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"", ""},
 		{"plain", "plain"},
-		{"a\nb\r\nc", "abc"},   // newlines stripped (SSE-safe)
-		{"a\tb", "ab"},         // tab stripped
+		{"a\nb\r\nc", "abc"},     // newlines stripped (SSE-safe)
+		{"a\tb", "ab"},           // tab stripped
 		{"x\x00\x1f\x7fy", "xy"}, // NUL, C0, DEL stripped
-		{"héllo", "héllo"},      // multibyte preserved
+		{"héllo", "héllo"},       // multibyte preserved
 	}
 	for _, c := range cases {
 		if got := SanitizeField(c.in); got != c.want {

@@ -112,4 +112,3 @@ func TestCursorNextZeroSafe(t *testing.T) {
 		t.Errorf("next(-3) = %d, want 0", got)
 	}
 }
-

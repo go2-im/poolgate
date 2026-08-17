@@ -1006,7 +1006,7 @@ func scanApiKey(sc rowScanner) (model.ApiKey, error) {
 	return k, nil
 }
 
-// formatExpiry renders an expiry timestamp for storage ('' when zero = never).
+// formatExpiry renders an expiry timestamp for storage (” when zero = never).
 func formatExpiry(t time.Time) string {
 	if t.IsZero() {
 		return ""

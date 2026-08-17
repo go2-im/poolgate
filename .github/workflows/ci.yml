@@ -30,6 +30,17 @@ jobs:
       - name: build
         run: go build ./...
 
+      - name: gofmt
+        shell: bash
+        run: |
+          set -euo pipefail
+          unformatted=$(gofmt -l cmd internal)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needs to be run on:"; echo "$unformatted"
+            exit 1
+          fi
+          echo "gofmt: OK"
+
       - name: vet
         run: go vet ./...
 
@@ -61,10 +72,9 @@ jobs:
           echo "total: $(go tool cover -func=cover.out | tail -1)"
 
       - name: govulncheck
-        # Advisory: reports vulns in logs but does not block merges. Stdlib CVEs
-        # get fixed by bumping the Go toolchain (setup-go 'stable'), not our code,
-        # so a hard gate here would flake on Go's disclosure schedule.
-        continue-on-error: true
+        # Blocking: stdlib CVEs are addressed by the pinned `toolchain` directive
+        # in go.mod (>= go1.25.13) plus setup-go 'stable', so a clean run is
+        # expected. If Go discloses a new CVE, bump the toolchain directive.
         run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
       - name: suspicious-domain lint

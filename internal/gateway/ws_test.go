@@ -244,7 +244,8 @@ func TestWS_NonRetryable4xxRelayedNotFailedOver(t *testing.T) {
 	}
 }
 
-func TestWS_TurnStateAffinityPinsBackend(t *testing.T) {	f := newTwoAccountFixture(t)
+func TestWS_TurnStateAffinityPinsBackend(t *testing.T) {
+	f := newTwoAccountFixture(t)
 	setStrategy(t, f, model.StrategyLoadBalance)
 	up := newWSUpstream(t, nil)
 	f.cfg.UpstreamAllowlist = []string{mustHost(t, up.srv.URL)}

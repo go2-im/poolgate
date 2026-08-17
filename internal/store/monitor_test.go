@@ -124,8 +124,8 @@ func TestRequestLogTimeOrderingAcrossFractionWidths(t *testing.T) {
 	// Same second, differing sub-second fraction widths — the case where naive
 	// variable-width RFC3339 string comparison misorders / misfilters.
 	times := []time.Time{
-		sec,                              // .000000000 (whole second)
-		sec.Add(500 * time.Millisecond),  // .5
+		sec,                             // .000000000 (whole second)
+		sec.Add(500 * time.Millisecond), // .5
 		sec.Add(123455 * time.Microsecond),
 		sec.Add(123456 * time.Microsecond),
 	}

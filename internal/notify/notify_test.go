@@ -252,7 +252,10 @@ func TestDeliverNoRetryOnBadScheme(t *testing.T) {
 	// An http URL is rejected by requireHTTPS (ErrInsecureScheme) — permanent.
 	ch := model.NotifyChannel{ID: "c", Type: model.ChannelWebhook, Config: model.NotifyConfig{URL: "http://insecure.example.com"}}
 	e := New(&fakeChannelStore{}, WithHTTPClient(http.DefaultClient), WithClock(fixedNow),
-		WithSleep(func(context.Context, time.Duration) error { t.Fatal("must not sleep/retry on permanent error"); return nil }),
+		WithSleep(func(context.Context, time.Duration) error {
+			t.Fatal("must not sleep/retry on permanent error")
+			return nil
+		}),
 		WithRetries(3))
 	if err := e.deliver(context.Background(), ch, testEvent()); err == nil {
 		t.Fatal("expected ErrInsecureScheme")

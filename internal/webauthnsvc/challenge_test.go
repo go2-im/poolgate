@@ -53,7 +53,8 @@ func TestChallengeStoreCapEvictsAndSweeps(t *testing.T) {
 	}
 }
 
-func TestChallengeStorePutTake(t *testing.T) {	clk := &fakeClock{t: time.Unix(1_700_000_000, 0).UTC()}
+func TestChallengeStorePutTake(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	cs := NewChallengeStore(time.Minute, WithChallengeClock(clk.now))
 
 	sess := &webauthn.SessionData{Challenge: "abc"}

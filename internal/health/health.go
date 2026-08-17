@@ -160,8 +160,8 @@ type Engine struct {
 	sched     Schedule
 	allowLive bool // global mode switch; false = usage-poll-only (the default)
 
-	events         EventSink // optional notification sink (DESIGN.md §11)
-	quotaLowPct    float64   // headroom% at/below which a quota_low event is emitted
+	events      EventSink // optional notification sink (DESIGN.md §11)
+	quotaLowPct float64   // headroom% at/below which a quota_low event is emitted
 
 	now    func() time.Time
 	rnd    func() float64

@@ -311,6 +311,7 @@ func relayWSHandshakeError(w http.ResponseWriter, status int, body []byte) {
 	writeError(w, status, "poolgate_upstream_error", "upstream_error",
 		"upstream rejected the request (status "+strconv.Itoa(status)+")")
 }
+
 // first (once, if still selectable), then the group strategy over the live view.
 func (g *Gateway) selectWSCandidate(group model.PolicyGroup, eligible []model.Account, view *routeView, turnState string, pinnedTried *bool) (model.Account, bool) {
 	if turnState != "" && !*pinnedTried {
@@ -500,4 +501,3 @@ func accountByID(eligible []model.Account, id string) (model.Account, bool) {
 
 // traceEntry formats an "account:status" trace crumb.
 func traceEntry(id string, status int) string { return id + ":" + strconv.Itoa(status) }
-

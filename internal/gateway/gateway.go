@@ -218,17 +218,18 @@ func defaultUpstreamTransport() *http.Transport {
 }
 
 // New builds a Gateway over st using cfg (for the upstream allowlist).
-func New(st *store.Store, cfg model.Config, opts ...Option) *Gateway {	g := &Gateway{
-		store:        st,
-		cfg:          cfg,
-		upstreamBase: DefaultUpstreamBase,
-		allowlist:    cfg.UpstreamAllowlist,
-		logger:       slog.Default(),
-		cursors:      make(map[string]*policy.Cursor),
-		inflight:     newInflight(),
-		wsAff:        newWSAffinity(),
-		authFail:     newFailWindow(authAnomalyThreshold, authAnomalyWindow),
-		transport:    normalizeTransport(cfg.Server.Transport),
+func New(st *store.Store, cfg model.Config, opts ...Option) *Gateway {
+	g := &Gateway{
+		store:          st,
+		cfg:            cfg,
+		upstreamBase:   DefaultUpstreamBase,
+		allowlist:      cfg.UpstreamAllowlist,
+		logger:         slog.Default(),
+		cursors:        make(map[string]*policy.Cursor),
+		inflight:       newInflight(),
+		wsAff:          newWSAffinity(),
+		authFail:       newFailWindow(authAnomalyThreshold, authAnomalyWindow),
+		transport:      normalizeTransport(cfg.Server.Transport),
 		retryAfterSecs: 1,
 		// No client Timeout: SSE streams are long-lived; cancellation rides the
 		// request context instead. We DO bound the pre-first-byte phase with a
