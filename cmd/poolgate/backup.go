@@ -40,6 +40,14 @@ func cmdBackup(args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
+	// Hold the maintenance lock so a concurrent rotate-key cannot slip between the
+	// key read and the DB snapshot below (which would pair an OLD key with a NEW-key
+	// DB image — a bundle that only fails at restore time).
+	mlk, err := acquireMaintenanceLock(cfg)
+	if err != nil {
+		return err
+	}
+	defer mlk.Release()
 	key, err := loadMasterKeyExisting(cfg)
 	if err != nil {
 		return fmt.Errorf("load master key: %w", err)
@@ -47,6 +55,11 @@ func cmdBackup(args []string, stdout io.Writer) error {
 	db, schemaVersion, err := store.Snapshot(cfg)
 	if err != nil {
 		return err
+	}
+	// Prove the key actually decrypts this snapshot BEFORE declaring success, so a
+	// bundle is never reported good unless it is genuinely restorable.
+	if err := store.VerifyRestoreBundle(db, key); err != nil {
+		return fmt.Errorf("backup self-check failed (master key does not match the snapshot): %w", err)
 	}
 
 	// O_EXCL: never silently clobber an existing bundle.
@@ -151,6 +164,14 @@ func cmdRestore(args []string, stdout io.Writer) error {
 		return fmt.Errorf("acquire lock: %w", err)
 	}
 	defer lk.Release()
+
+	// Also take the maintenance lock so a restore cannot race an import/login/backup
+	// (which don't take the single-instance lock but DO take the maintenance lock).
+	mlk, err := acquireMaintenanceLock(cfg)
+	if err != nil {
+		return err
+	}
+	defer mlk.Release()
 
 	dbPath := filepath.Join(cfg.DataDir, store.DBFileName)
 	keyPath := filepath.Join(cfg.DataDir, masterKeyFile)

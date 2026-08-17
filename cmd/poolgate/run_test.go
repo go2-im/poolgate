@@ -503,3 +503,42 @@ func TestLoadConfigBackpressureWait(t *testing.T) {
 		t.Errorf("loadConfig with invalid backpressure_wait should error")
 	}
 }
+
+// TestImportUpsertsDuplicateAccount imports the same auth.json twice and asserts a
+// single account remains (deduped by account_id), with the second import reported
+// as an update rather than creating a second row that would share the token family.
+func TestImportUpsertsDuplicateAccount(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	t.Setenv(envDataDir, dir)
+	t.Setenv(envMasterKey, "")
+	authPath := writeAuthJSON(t) // account_id "acct-123"
+
+	if err := run(ctx, []string{"import", authPath}, io.Discard, io.Discard); err != nil {
+		t.Fatalf("first import: %v", err)
+	}
+	var out bytes.Buffer
+	if err := run(ctx, []string{"import", authPath}, &out, io.Discard); err != nil {
+		t.Fatalf("second import: %v", err)
+	}
+	if !strings.Contains(out.String(), "updated existing account") {
+		t.Errorf("second import output = %q, want an 'updated existing account' notice", out.String())
+	}
+
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	st, err := openStore(cfg)
+	if err != nil {
+		t.Fatalf("openStore: %v", err)
+	}
+	defer st.Close()
+	accts, err := st.ListAccounts(ctx)
+	if err != nil {
+		t.Fatalf("ListAccounts: %v", err)
+	}
+	if len(accts) != 1 {
+		t.Fatalf("account count after re-import = %d, want 1 (deduped)", len(accts))
+	}
+}

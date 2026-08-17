@@ -136,12 +136,19 @@ func (s *Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	acct.Label = req.Label
-	created, err := s.store.InsertAccount(r.Context(), acct)
+	// Upsert by account_id so re-importing the same Codex account refreshes its
+	// credentials in place rather than creating a duplicate row that would share
+	// (and independently rotate) the same refresh-token family.
+	created, updated, err := s.store.UpsertAccountByAccountID(r.Context(), acct)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, errInternal, "could not store account")
 		return
 	}
-	s.audit(r.Context(), "account.import", created.ID, "label="+created.Label)
+	action := "account.import"
+	if updated {
+		action = "account.reimport"
+	}
+	s.audit(r.Context(), action, created.ID, "label="+created.Label)
 	writeJSON(w, http.StatusCreated, toAccountView(created))
 }
 
