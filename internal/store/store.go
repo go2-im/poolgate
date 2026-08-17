@@ -38,6 +38,11 @@ var ErrNotFound = errors.New("store: not found")
 // already been consumed (used_at is set).
 var ErrAlreadyUsed = errors.New("store: already used")
 
+// ErrAlreadyExists is returned when an operation that must be the FIRST of its
+// kind finds the invariant already broken — e.g. ConsumeBootstrapAndInsertCredential
+// running when a passkey is already registered (a concurrent first-passkey race).
+var ErrAlreadyExists = errors.New("store: already exists")
+
 // memberTypeAccount / memberTypeGroup are the polymorphic member kinds in
 // group_members. v1 is flat and only uses account members, but the column is
 // kept so nesting can land later without a schema break (DESIGN.md §0 D8).
@@ -94,12 +99,6 @@ func Open(cfg model.Config, cipher *crypto.Cipher) (*Store, error) {
 
 	s := &Store{db: db, cipher: cipher, dataDir: cfg.DataDir}
 	if err := s.Migrate(context.Background()); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-	// Hash any legacy plaintext API keys in place (idempotent). SQLite has no
-	// SHA-256 function, so this backfill runs in Go rather than in a migration.
-	if err := s.backfillAPIKeyHashes(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -441,34 +440,55 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 			return fmt.Errorf("store: commit migration %d: %w", m.version, err)
 		}
 	}
-	// All pending migrations succeeded. The pre-migration snapshot is a raw,
-	// UNENCRYPTED SQLite image of the OLD schema — after a security migration
-	// (e.g. v11 API-key hashing / v12 id_token purge) it would otherwise leave the
-	// pre-migration plaintext keys and id_tokens on disk forever, defeating the
-	// migration's purpose. Its only job was failed-migration recovery, which is
-	// moot now that the migrations committed, so remove every pre-migration
-	// snapshot (this run's and any stale ones left by older builds).
-	s.removePreMigrationSnapshots()
+	// All SQL migrations succeeded. Run the Go-level data migration that SQLite
+	// cannot express (SHA-256 hashing of any legacy plaintext API keys) as part of
+	// the same overall migration, BEFORE the recovery snapshot is dropped — so the
+	// snapshot still exists if the backfill fails and the whole security migration
+	// (SQL columns + Go backfill) can be retried on the next start. The snapshot is
+	// the only remaining copy of the pre-hash plaintext, so it must not be deleted
+	// until the data is durably in its hashed form.
+	if err := s.backfillAPIKeyHashes(ctx); err != nil {
+		// Snapshot is intentionally KEPT (recovery net); backfill is idempotent.
+		return fmt.Errorf("store: api key hash backfill: %w", err)
+	}
+	// The full migration (SQL + Go backfill) is now complete. The pre-migration
+	// snapshot is a raw, UNENCRYPTED SQLite image of the OLD schema — after a
+	// security migration (v11 API-key hashing / v12 id_token purge) it would
+	// otherwise leave the pre-hash plaintext keys and id_tokens on disk forever,
+	// defeating the migration's purpose. Its only job was failed-migration recovery,
+	// which is moot now that everything committed, so remove every pre-migration
+	// snapshot (this run's and any stale ones left by older builds). This is
+	// FAIL-CLOSED: if a plaintext shadow image cannot be removed, refuse to proceed
+	// rather than silently leaving usable secrets on disk.
+	if err := s.removePreMigrationSnapshots(); err != nil {
+		return fmt.Errorf("store: remove pre-migration snapshot: %w", err)
+	}
 	return nil
 }
 
 // removePreMigrationSnapshots deletes all poolgate.pre-migration-v*.db files in
-// the data dir and fsyncs the directory. Best-effort: errors are ignored (the
-// files are only a transient recovery aid). Called after a successful Migrate so
-// no stale unencrypted schema image lingers on disk.
-func (s *Store) removePreMigrationSnapshots() {
+// the data dir and fsyncs the directory. It is FAIL-CLOSED: a snapshot that
+// cannot be removed is a lingering unencrypted image of the pre-migration schema
+// (plaintext API keys / id_tokens), so a removal error is returned rather than
+// swallowed. Called only after a fully successful Migrate (SQL + backfill) so no
+// stale plaintext schema image lingers on disk.
+func (s *Store) removePreMigrationSnapshots() error {
 	if s.dataDir == "" {
-		return
+		return nil
 	}
 	matches, err := filepath.Glob(filepath.Join(s.dataDir, "poolgate.pre-migration-v*.db"))
 	if err != nil {
-		return
+		return fmt.Errorf("glob snapshots: %w", err)
 	}
 	removed := false
 	for _, p := range matches {
-		if err := os.Remove(p); err == nil {
-			removed = true
+		if err := os.Remove(p); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue // already gone (racing/idempotent) — fine
+			}
+			return fmt.Errorf("remove %s: %w", p, err)
 		}
+		removed = true
 	}
 	if removed {
 		if d, derr := os.Open(s.dataDir); derr == nil {
@@ -476,6 +496,7 @@ func (s *Store) removePreMigrationSnapshots() {
 			_ = d.Close()
 		}
 	}
+	return nil
 }
 
 // appliedVersions returns the set of migration versions recorded in

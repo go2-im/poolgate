@@ -183,3 +183,36 @@ func TestMigrateFreshNoSnapshot(t *testing.T) {
 		}
 	}
 }
+
+// TestRemovePreMigrationSnapshotsFailClosed proves snapshot cleanup is fail-closed:
+// a pre-migration image that cannot be removed surfaces an error rather than being
+// silently left on disk (it would be a lingering unencrypted plaintext shadow).
+func TestRemovePreMigrationSnapshotsFailClosed(t *testing.T) {
+	dir := t.TempDir()
+	s := openStoreDir(t, dir)
+
+	// Make a snapshot path that os.Remove cannot delete: a NON-EMPTY directory named
+	// like a snapshot file (os.Remove refuses a non-empty dir with ENOTEMPTY).
+	snapAsDir := filepath.Join(dir, "poolgate.pre-migration-v99.db")
+	if err := os.Mkdir(snapAsDir, 0o700); err != nil {
+		t.Fatalf("mkdir snapshot-as-dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(snapAsDir, "blocker"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("write blocker: %v", err)
+	}
+	if err := s.removePreMigrationSnapshots(); err == nil {
+		t.Fatal("removePreMigrationSnapshots should fail-closed when a snapshot cannot be removed")
+	}
+	// A removable snapshot alongside is fine: with the blocker cleared, removal succeeds.
+	_ = os.Remove(filepath.Join(snapAsDir, "blocker"))
+	_ = os.Remove(snapAsDir)
+	if err := os.WriteFile(filepath.Join(dir, "poolgate.pre-migration-v3.db"), []byte("img"), 0o600); err != nil {
+		t.Fatalf("write removable snapshot: %v", err)
+	}
+	if err := s.removePreMigrationSnapshots(); err != nil {
+		t.Fatalf("removePreMigrationSnapshots(removable) = %v, want nil", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "poolgate.pre-migration-v3.db")); !os.IsNotExist(err) {
+		t.Fatalf("removable snapshot should be gone: %v", err)
+	}
+}

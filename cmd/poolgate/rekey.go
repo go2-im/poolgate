@@ -85,10 +85,26 @@ func cmdRotateKey(_ []string, stdout io.Writer) error {
 		_ = os.Remove(snapPath)
 		return fmt.Errorf("write pre-rotation snapshot: %w", err)
 	}
+	// Durability: the snapshot is the ONLY recovery path if a crash lands in the
+	// window after the DB commits on the new key but before the new keyfile is
+	// durably swapped in. fsync the file AND the directory entry BEFORE re-encrypting
+	// so a power loss cannot leave the snapshot bytes (or its dir entry) only in the
+	// OS page cache — which would forfeit both the new key and the trusted old image.
+	// Any durability failure aborts the rotation while the DB is still on the old key.
+	if err := sf.Sync(); err != nil {
+		_ = sf.Close()
+		_ = os.Remove(snapPath)
+		return fmt.Errorf("fsync pre-rotation snapshot (aborting; DB unchanged): %w", err)
+	}
 	if err := sf.Close(); err != nil {
+		_ = os.Remove(snapPath)
 		return fmt.Errorf("close pre-rotation snapshot: %w", err)
 	}
-	fmt.Fprintf(stdout, "pre-rotation snapshot written: %s\n", snapPath)
+	if err := syncDirErr(cfg.DataDir); err != nil {
+		_ = os.Remove(snapPath)
+		return fmt.Errorf("fsync data dir for snapshot (aborting; DB unchanged): %w", err)
+	}
+	fmt.Fprintf(stdout, "pre-rotation snapshot written (fsync'd): %s\n", snapPath)
 
 	// Mint the new key and re-encrypt every secret column in one transaction.
 	newKey, err := crypto.GenerateKey()

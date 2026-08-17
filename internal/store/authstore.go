@@ -70,12 +70,34 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 // transaction. This makes first-passkey registration atomic: if the credential
 // insert fails, the token consume rolls back too, so the operator never ends up
 // with a spent token and no credential (previously an unrecoverable lockout short
-// of `admin reset-auth`). Returns ErrNotFound when no live matching token exists
-// and ErrAlreadyUsed on a concurrent consume race.
+// of `admin reset-auth`).
+//
+// It also enforces the "first passkey" invariant INSIDE the transaction: it
+// asserts no passkey exists yet (COUNT == 0) before consuming the token, so two
+// concurrent registrations each holding a DIFFERENT valid bootstrap token cannot
+// both succeed (the writer that commits first wins; the second sees COUNT == 1 and
+// is refused). On success it also DELETES every remaining bootstrap token, so once
+// an admin passkey exists no leftover token can ever register another — additional
+// passkeys are session-gated, not bootstrap-gated. Returns ErrAlreadyExists when a
+// passkey already exists, ErrNotFound when no live matching token exists, and
+// ErrAlreadyUsed on a concurrent consume race.
 func (s *Store) ConsumeBootstrapAndInsertCredential(ctx context.Context, tokenHash string, now time.Time, c model.WebAuthnCredential) (model.WebAuthnCredential, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return model.WebAuthnCredential{}, fmt.Errorf("store: begin first-passkey: %w", err)
+	}
+	// First-passkey invariant, checked in-transaction: if any credential already
+	// exists this is not the first passkey, so refuse before consuming the token.
+	// SQLite serializes writers (single writer connection), so a concurrent
+	// first-passkey registration that committed just before us is visible here.
+	var existing int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM webauthn_credentials`).Scan(&existing); err != nil {
+		_ = tx.Rollback()
+		return model.WebAuthnCredential{}, fmt.Errorf("store: count credentials: %w", err)
+	}
+	if existing != 0 {
+		_ = tx.Rollback()
+		return model.WebAuthnCredential{}, ErrAlreadyExists
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT id, token_hash, expires_at, used_at FROM bootstrap_tokens`)
 	if err != nil {
@@ -125,6 +147,13 @@ func (s *Store) ConsumeBootstrapAndInsertCredential(ctx context.Context, tokenHa
 	if err != nil {
 		_ = tx.Rollback() // credential insert failed -> token consume is undone
 		return model.WebAuthnCredential{}, err
+	}
+	// A passkey now exists: bootstrap tokens have served their one purpose. Purge
+	// ALL of them so no leftover token (e.g. a second one minted by a repeated
+	// `poolgate init`) can ever register another admin credential.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM bootstrap_tokens`); err != nil {
+		_ = tx.Rollback()
+		return model.WebAuthnCredential{}, fmt.Errorf("store: purge bootstrap tokens: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return model.WebAuthnCredential{}, fmt.Errorf("store: commit first-passkey: %w", err)

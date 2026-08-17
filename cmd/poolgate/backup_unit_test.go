@@ -122,6 +122,18 @@ func TestStageTempError(t *testing.T) {
 	}
 }
 
+func TestSyncDirErr(t *testing.T) {
+	// A real directory syncs without error.
+	if err := syncDirErr(t.TempDir()); err != nil {
+		t.Fatalf("syncDirErr(real dir) = %v, want nil", err)
+	}
+	// A path that cannot be opened surfaces the error (durability-critical callers
+	// must not proceed on a false assumption).
+	if err := syncDirErr(filepath.Join(t.TempDir(), "does-not-exist")); err == nil {
+		t.Fatal("syncDirErr(missing) = nil, want error")
+	}
+}
+
 func TestReadPassphrasePreservesInterior(t *testing.T) {
 	// readPassphrase trims only trailing newlines, not interior content.
 	t.Setenv(envBackupPassphrase, "a b\tc")
