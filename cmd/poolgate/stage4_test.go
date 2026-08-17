@@ -35,7 +35,7 @@ func TestParseImportArgs(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			path, strategy, err := parseImportArgs(tt.args)
+			path, strategy, _, err := parseImportArgs(tt.args)
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("parseImportArgs(%v) err = %v, wantErr = %v", tt.args, err, tt.wantErr)
 			}

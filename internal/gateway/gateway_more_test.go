@@ -268,7 +268,9 @@ func newTwoAccountFixture(t *testing.T) *twoAccountFixture {
 	return &twoAccountFixture{st: st, cfg: cfg, apiKey: apiKey, badToken: "token-bad", goodToken: "token-good"}
 }
 
-// First account returns 5xx pre-stream; gateway must fall over to the second.
+// First account returns 5xx pre-stream; with an Idempotency-Key (which authorizes
+// safe cross-account retry of an uncertain outcome, §19.2) the gateway falls over
+// to the second account.
 func TestForwardFallbackToSecondAccount(t *testing.T) {
 	f := newTwoAccountFixture(t)
 
@@ -303,6 +305,7 @@ func TestForwardFallbackToSecondAccount(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/e/default/v1/responses",
 		strings.NewReader(`{"model":"gpt-5"}`))
 	req.Header.Set("Authorization", "Bearer "+f.apiKey)
+	req.Header.Set("Idempotency-Key", "k-fallback")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("POST: %v", err)
@@ -321,6 +324,8 @@ func TestForwardFallbackToSecondAccount(t *testing.T) {
 }
 
 // All accounts fail pre-stream -> all_exhausted 502 with last upstream status.
+// (5xx is an uncertain outcome, so an Idempotency-Key is required to fail over at
+// all; without it the first 5xx is relayed — see TestForward5xxNoKeyRelayed.)
 func TestForwardAllExhausted(t *testing.T) {
 	f := newTwoAccountFixture(t)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -337,6 +342,7 @@ func TestForwardAllExhausted(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/e/default/v1/responses",
 		strings.NewReader(`{"model":"gpt-5"}`))
 	req.Header.Set("Authorization", "Bearer "+f.apiKey)
+	req.Header.Set("Idempotency-Key", "k-exhaust")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("POST: %v", err)
@@ -352,8 +358,9 @@ func TestForwardAllExhausted(t *testing.T) {
 	}
 }
 
-// Upstream transport error (connection refused) -> forward returns status 0,
-// then all_exhausted 502.
+// Upstream transport error (connection refused) with NO Idempotency-Key: the
+// outcome is uncertain (the request may have executed), so the gateway must NOT
+// replay it across accounts — it returns poolgate_upstream_error (502) instead.
 func TestForwardTransportError(t *testing.T) {
 	f := newFixture(t)
 	// Stand up then immediately close a server so its address refuses connections.
@@ -381,8 +388,8 @@ func TestForwardTransportError(t *testing.T) {
 	}
 	var eb errorBody
 	_ = json.NewDecoder(resp.Body).Decode(&eb)
-	if eb.Error.Type != "poolgate_all_exhausted" {
-		t.Errorf("type = %q, want poolgate_all_exhausted", eb.Error.Type)
+	if eb.Error.Type != "poolgate_upstream_error" {
+		t.Errorf("type = %q, want poolgate_upstream_error", eb.Error.Type)
 	}
 }
 

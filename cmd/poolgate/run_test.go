@@ -174,9 +174,14 @@ func TestRunInitImportDispatch(t *testing.T) {
 	if !strings.Contains(out.String(), "imported account") {
 		t.Errorf("import stdout missing confirmation: %q", out.String())
 	}
-	// A second import re-uses the existing endpoint (the "already exists" branch).
+	// A second import of a DISTINCT account re-uses the existing endpoint (the
+	// "already exists" bootstrap branch).
 	out.Reset()
-	authPath2 := writeAuthJSON(t)
+	authPath2 := filepath.Join(t.TempDir(), "auth2.json")
+	if err := os.WriteFile(authPath2,
+		[]byte(`{"tokens":{"access_token":"a2","refresh_token":"r2","account_id":"acct-456","id_token":"h.p.s"}}`), 0o600); err != nil {
+		t.Fatalf("write auth2.json: %v", err)
+	}
 	if err := run(context.Background(), []string{"import", authPath2}, &out, &errBuf); err != nil {
 		t.Fatalf("run import (second): %v", err)
 	}
@@ -504,10 +509,11 @@ func TestLoadConfigBackpressureWait(t *testing.T) {
 	}
 }
 
-// TestImportUpsertsDuplicateAccount imports the same auth.json twice and asserts a
-// single account remains (deduped by account_id), with the second import reported
-// as an update rather than creating a second row that would share the token family.
-func TestImportUpsertsDuplicateAccount(t *testing.T) {
+// TestImportRefusesDuplicateUnlessForce verifies file import is non-destructive: a
+// second import of the same ChatGPT account is refused (so a stale auth.json can't
+// roll the account back to a consumed token), while --force replaces it in place —
+// and either way only one account row exists.
+func TestImportRefusesDuplicateUnlessForce(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	t.Setenv(envDataDir, dir)
@@ -517,12 +523,18 @@ func TestImportUpsertsDuplicateAccount(t *testing.T) {
 	if err := run(ctx, []string{"import", authPath}, io.Discard, io.Discard); err != nil {
 		t.Fatalf("first import: %v", err)
 	}
-	var out bytes.Buffer
-	if err := run(ctx, []string{"import", authPath}, &out, io.Discard); err != nil {
-		t.Fatalf("second import: %v", err)
+	// A plain re-import is refused (non-destructive default).
+	err := run(ctx, []string{"import", authPath}, io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "already pooled") {
+		t.Fatalf("second import err = %v, want an 'already pooled' refusal", err)
 	}
-	if !strings.Contains(out.String(), "updated existing account") {
-		t.Errorf("second import output = %q, want an 'updated existing account' notice", out.String())
+	// --force replaces the credentials in place.
+	var out bytes.Buffer
+	if err := run(ctx, []string{"import", authPath, "--force"}, &out, io.Discard); err != nil {
+		t.Fatalf("forced import: %v", err)
+	}
+	if !strings.Contains(out.String(), "replaced existing account") {
+		t.Errorf("forced import output = %q, want a 'replaced existing account' notice", out.String())
 	}
 
 	cfg, err := loadConfig()
@@ -539,6 +551,6 @@ func TestImportUpsertsDuplicateAccount(t *testing.T) {
 		t.Fatalf("ListAccounts: %v", err)
 	}
 	if len(accts) != 1 {
-		t.Fatalf("account count after re-import = %d, want 1 (deduped)", len(accts))
+		t.Fatalf("account count = %d, want 1 (no duplicate row)", len(accts))
 	}
 }

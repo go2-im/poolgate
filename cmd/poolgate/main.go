@@ -504,7 +504,7 @@ func acquireMaintenanceLock(cfg model.Config) (*lock.Lock, error) {
 // account (strategy from --strategy, default fallback), a `default` endpoint, and
 // one sk- key (printed once).
 func cmdImport(args []string, stdout io.Writer) error {
-	path, strategy, err := parseImportArgs(args)
+	path, strategy, force, err := parseImportArgs(args)
 	if err != nil {
 		return err
 	}
@@ -532,12 +532,25 @@ func cmdImport(args []string, stdout io.Writer) error {
 		return err
 	}
 	acct.Label = "imported-" + time.Now().UTC().Format("20060102-150405")
-	acct, updated, err := st.UpsertAccountByAccountID(ctx, acct)
+
+	// File import defaults to NON-destructive: if this ChatGPT account is already
+	// pooled, refuse rather than overwrite — a stale auth.json would roll the live
+	// row back to an older, possibly already-consumed refresh token and revoke the
+	// family. `--force` opts into replacing (and clears any pending rotation).
+	updated := false
+	if force {
+		acct, updated, err = st.UpsertAccountByAccountID(ctx, acct)
+	} else {
+		acct, err = st.InsertAccountUnique(ctx, acct)
+		if errors.Is(err, store.ErrAlreadyExists) {
+			return fmt.Errorf("an account with this ChatGPT account id is already pooled; use `poolgate login` to refresh its credentials, or `poolgate import %s --force` to overwrite (WARNING: importing an older auth.json can roll the account back to a consumed refresh token)", path)
+		}
+	}
 	if err != nil {
 		return err
 	}
 	if updated {
-		fmt.Fprintf(stdout, "updated existing account %s (account_id already present; credentials refreshed)\n", acct.ID)
+		fmt.Fprintf(stdout, "replaced existing account %s (--force; credentials overwritten)\n", acct.ID)
 	} else {
 		fmt.Fprintf(stdout, "imported account %s (label %q, state %s)\n", acct.ID, acct.Label, acct.State)
 	}
@@ -583,14 +596,16 @@ func bootstrapDefaults(ctx context.Context, st *store.Store, cfg model.Config, a
 // parseImportArgs extracts the auth.json path and the optional --strategy value
 // (order-independent). The strategy defaults to fallback and must be one of the
 // three v1 strategies (DESIGN.md §0 D7).
-func parseImportArgs(args []string) (path string, strategy model.Strategy, err error) {
+func parseImportArgs(args []string) (path string, strategy model.Strategy, force bool, err error) {
 	strategy = model.StrategyFallback
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
+		case a == "--force":
+			force = true
 		case a == "--strategy" || a == "-strategy":
 			if i+1 >= len(args) {
-				return "", "", errors.New("usage: poolgate import <auth.json> [--strategy fallback|best-quota|load-balance|weighted]")
+				return "", "", false, errors.New("usage: poolgate import <auth.json> [--strategy fallback|best-quota|load-balance|weighted] [--force]")
 			}
 			strategy = model.Strategy(args[i+1])
 			i++
@@ -605,12 +620,12 @@ func parseImportArgs(args []string) (path string, strategy model.Strategy, err e
 		}
 	}
 	if path == "" {
-		return "", "", errors.New("usage: poolgate import <auth.json> [--strategy fallback|best-quota|load-balance|weighted]")
+		return "", "", false, errors.New("usage: poolgate import <auth.json> [--strategy fallback|best-quota|load-balance|weighted] [--force]")
 	}
 	if !validStrategy(strategy) {
-		return "", "", fmt.Errorf("invalid --strategy %q (want fallback, best-quota, load-balance, or weighted)", strategy)
+		return "", "", false, fmt.Errorf("invalid --strategy %q (want fallback, best-quota, load-balance, or weighted)", strategy)
 	}
-	return path, strategy, nil
+	return path, strategy, force, nil
 }
 
 // validStrategy reports whether s is one of the three v1 strategies.

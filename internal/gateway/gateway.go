@@ -411,6 +411,14 @@ func (g *Gateway) handleResponses(w http.ResponseWriter, r *http.Request) {
 	// (DESIGN.md §4 / §19.2). policy.Select picks per the group's Strategy over a
 	// health/usage View; on a pre-stream failure we record it (health passive
 	// hooks) and re-select the next candidate until one streams or none remain.
+	//
+	// Cross-account POST retry is IDEMPOTENCY-GATED (§19.2): a pre-stream failure is
+	// only replayed on another account when the upstream provably did NOT execute the
+	// request (401/403/429), OR the client supplied an Idempotency-Key (forwarded
+	// upstream) opting into safe retry of an uncertain outcome (408/425/5xx/network).
+	// Without a key, an uncertain outcome is returned to the client instead of being
+	// replayed — a POST that may have executed must not be double-executed / double-billed.
+	allowUncertainFailover := strings.TrimSpace(r.Header.Get("Idempotency-Key")) != ""
 	view := g.buildView(r.Context(), group, eligible)
 	byID := make(map[string]int, len(eligible))
 	for i, a := range eligible {
@@ -447,7 +455,7 @@ func (g *Gateway) handleResponses(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		triedAny = true
-		streamed, status, retryAfter, tokensIn, tokensOut, streamErr := g.forward(w, r, target, upBody, acct)
+		streamed, status, retryAfter, tokensIn, tokensOut, streamErr := g.forward(w, r, target, upBody, acct, allowUncertainFailover)
 		g.inflight.done(acct.ID)
 		if streamed {
 			errType := ""
@@ -459,6 +467,18 @@ func (g *Gateway) handleResponses(w http.ResponseWriter, r *http.Request) {
 			}
 			rec.finish(status, acct, errType, tokensIn, tokensOut)
 			return // response already written to client; do not re-select.
+		}
+		// Pre-stream failure. A transport error (status 0) with no idempotency key is
+		// an UNCERTAIN outcome — the request may already have executed upstream — so
+		// it must NOT be replayed on another account. (Retryable HTTP statuses were
+		// already gated inside forward, which relays an uncertain status to the client
+		// rather than returning streamed=false when no key is present.)
+		if status == 0 && !allowUncertainFailover {
+			rec.trace = append(rec.trace, acct.ID+":upstream_unreachable")
+			rec.finish(http.StatusBadGateway, acct, "upstream_unreachable", 0, 0)
+			writeError(w, http.StatusBadGateway, "poolgate_upstream_error", "upstream_error",
+				"upstream request failed before any response and was not retried across accounts; resend with an Idempotency-Key to enable safe cross-account retry")
+			return
 		}
 		rec.trace = append(rec.trace, fmt.Sprintf("%s:%d", acct.ID, status))
 		lastStatus = status
@@ -556,7 +576,7 @@ func (g *Gateway) recordFailure(ctx context.Context, accounts []model.Account, b
 // SSE usage event (DESIGN.md §15 / §23.4). streamErr is non-nil when a committed
 // stream ended abnormally (upstream read error or client write error) so the
 // caller can record the truncation instead of a clean success.
-func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, target string, body []byte, acct model.Account) (streamed bool, status int, retryAfter time.Duration, tokensIn, tokensOut int, streamErr error) {
+func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, target string, body []byte, acct model.Account, failoverUncertain bool) (streamed bool, status int, retryAfter time.Duration, tokensIn, tokensOut int, streamErr error) {
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, target, bytes.NewReader(body))
 	if err != nil {
 		return false, 0, 0, 0, 0, nil
@@ -571,6 +591,13 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, target string,
 	req.Header.Set("User-Agent", headerOrDefault(r, "User-Agent", DefaultUserAgent))
 	req.Header.Set("OpenAI-Beta", headerOrDefault(r, "OpenAI-Beta", DefaultOpenAIBeta))
 
+	// Pass through a client Idempotency-Key so the upstream can dedup a retried POST
+	// (DESIGN.md §19.2) — this is what makes an uncertain-outcome cross-account retry
+	// safe from double execution.
+	if k := strings.TrimSpace(r.Header.Get("Idempotency-Key")); k != "" {
+		req.Header.Set("Idempotency-Key", k)
+	}
+
 	// Force streaming.
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("Content-Type", "application/json")
@@ -582,18 +609,19 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, target string,
 
 	if resp.StatusCode >= 400 {
 		ra := parseRetryAfter(resp.Header.Get("Retry-After"))
-		if retryableStatus(resp.StatusCode) {
-			// Account-related or transient upstream failure (401/408/425/429/5xx):
-			// nothing written to the client yet, so allow pre-first-byte re-selection.
+		if postCanFailover(resp.StatusCode, failoverUncertain) {
+			// Either the upstream provably did NOT execute (401/403/429) or the client
+			// authorized retry of an uncertain outcome with an Idempotency-Key. Nothing
+			// written to the client yet, so allow pre-first-byte re-selection.
 			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 			_ = resp.Body.Close()
 			return false, resp.StatusCode, ra, 0, 0, nil
 		}
-		// Non-retryable upstream error (e.g. a client 400/404/422 — a bad request,
-		// unknown model, or oversized context). This is NOT an account problem, so
-		// failing over to other accounts would just amplify one bad request into N
-		// and still return a misleading 502. Relay the upstream response verbatim
-		// and commit — the client gets the real error and status.
+		// Not safe to fail over: a client error (400/404/422 — bad request, unknown
+		// model, oversized context), OR an UNCERTAIN outcome (408/425/5xx) with no
+		// Idempotency-Key — the upstream may have executed, so replaying it on another
+		// account risks double execution / double billing. Relay the upstream response
+		// verbatim and commit so the client sees the real status/body.
 		defer resp.Body.Close()
 		relayHeaders(w, resp)
 		w.WriteHeader(resp.StatusCode)
@@ -619,7 +647,9 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, target string,
 // retryableStatus reports whether an upstream >= 400 status is safe to fail over
 // on (account-related or transient) versus a client/request error that should be
 // relayed to the caller as-is. Network errors (status 0) are always retryable and
-// handled by the caller before this is consulted.
+// handled by the caller before this is consulted. Used by the WebSocket handshake
+// path (ws.go), where re-selecting a backend before any frame flows cannot
+// double-execute a turn; the HTTP POST path uses postCanFailover instead.
 func retryableStatus(status int) bool {
 	switch status {
 	case http.StatusUnauthorized, // 401 -> token refresh + retry
@@ -630,6 +660,32 @@ func retryableStatus(status int) bool {
 		return true
 	}
 	return status >= 500 // any 5xx is server-side, never the client's fault
+}
+
+// postCanFailover reports whether a POST that got upstream `status` may be safely
+// replayed on another account (DESIGN.md §19.2). It splits the retryable statuses
+// into two classes:
+//
+//   - PROVABLY non-executing (401 auth, 403 entitlement/region, 429 rate-limit): the
+//     upstream rejected the request before running the model, so re-selecting another
+//     account cannot double-execute. Always failover-eligible.
+//   - UNCERTAIN (408 timeout, 425 too-early, any 5xx): the upstream may have executed
+//     before failing, so replaying risks double execution / double billing. Only
+//     failover-eligible when the caller passed an Idempotency-Key (uncertain=true),
+//     which is forwarded upstream so it can dedup the retry.
+//
+// Client errors (400/404/422/…) are never failover-eligible — they are relayed as-is.
+func postCanFailover(status int, uncertain bool) bool {
+	switch status {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusTooManyRequests:
+		return true
+	case http.StatusRequestTimeout, http.StatusTooEarly:
+		return uncertain
+	}
+	if status >= 500 {
+		return uncertain
+	}
+	return false
 }
 
 // authenticate constant-time-compares the presented key against every stored

@@ -48,6 +48,16 @@ func cmdBackup(args []string, stdout io.Writer) error {
 		return err
 	}
 	defer mlk.Release()
+	// Refuse to back up while a refresh-token rotation is journaled but not yet
+	// persisted: the journal lives OUTSIDE the DB snapshot and is encrypted with the
+	// current key, so a bundle taken now would omit it and a restore would resurrect
+	// an older (already-consumed) refresh token. The pending rotation flushes during
+	// normal `poolgate serve`; retry the backup after it clears.
+	if pending, perr := store.PendingRotationIDsAt(cfg.DataDir); perr != nil {
+		return fmt.Errorf("check pending token rotations: %w", perr)
+	} else if len(pending) > 0 {
+		return fmt.Errorf("refusing to back up: %d account(s) have an unresolved token-rotation journal (%v) that the snapshot would omit; run `poolgate serve` briefly to let it flush, then retry", len(pending), pending)
+	}
 	key, err := loadMasterKeyExisting(cfg)
 	if err != nil {
 		return fmt.Errorf("load master key: %w", err)
@@ -88,7 +98,9 @@ func cmdBackup(args []string, stdout io.Writer) error {
 		return fmt.Errorf("close bundle: %w", closeErr)
 	}
 	if dir := filepath.Dir(out); dir != "" {
-		syncDir(dir)
+		if err := syncDirErr(dir); err != nil {
+			return fmt.Errorf("fsync bundle directory (bundle written but its directory entry may not be durable): %w", err)
+		}
 	}
 
 	fmt.Fprintf(stdout, "backup written: %s\n", out)
@@ -175,6 +187,19 @@ func cmdRestore(args []string, stdout io.Writer) error {
 
 	dbPath := filepath.Join(cfg.DataDir, store.DBFileName)
 	keyPath := filepath.Join(cfg.DataDir, masterKeyFile)
+
+	// Refuse to start when a PRIOR restore was interrupted mid-commit (its marker is
+	// still present). A second restore would move the current generation aside onto
+	// the SAME fixed *.prev names, clobbering the first restore's saved originals and
+	// producing a mixed DB/key generation. The operator must recover the interrupted
+	// restore by hand (the marker documents the .prev files to inspect) and remove
+	// the marker before restoring again.
+	if _, statErr := os.Stat(filepath.Join(cfg.DataDir, restoreMarkerFile)); statErr == nil {
+		return fmt.Errorf("a previous restore into %s did not finish (%s exists) — recover it manually (check the *.prev files) and remove the marker before restoring again",
+			cfg.DataDir, restoreMarkerFile)
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return fmt.Errorf("stat restore marker: %w", statErr)
+	}
 
 	// Refuse to clobber an existing install unless --force.
 	if !force {

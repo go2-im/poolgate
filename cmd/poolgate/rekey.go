@@ -79,6 +79,18 @@ func cmdRotateKey(_ []string, stdout io.Writer) error {
 	defer st.Close()
 	ctx := context.Background()
 
+	// Refuse to rotate while any refresh-token rotation journal is still pending.
+	// store.Open just replayed them; any that remain failed to flush and are
+	// encrypted with the OLD key — re-encrypting the DB without them would leave
+	// them permanently undecryptable (bricking those accounts fail-closed). The
+	// operator must resolve the pending rotation first (it retries on the next
+	// serve/refresh).
+	if pending, perr := st.PendingRotationIDs(); perr != nil {
+		return fmt.Errorf("check pending token rotations: %w", perr)
+	} else if len(pending) > 0 {
+		return fmt.Errorf("refusing to rotate the master key: %d account(s) have an unresolved token-rotation journal (%v); start `poolgate serve` briefly to let it flush, then retry", len(pending), pending)
+	}
+
 	// Pre-rotation safety snapshot (consistent VACUUM INTO copy of the live DB).
 	snapPath := filepath.Join(cfg.DataDir, "poolgate-pre-rotate-"+time.Now().UTC().Format("20060102-150405")+".db")
 	snap, _, err := store.Snapshot(cfg)
@@ -188,6 +200,10 @@ func writeKeyfileAtomic(path string, key []byte) error {
 		_ = os.Remove(tmp)
 		return err
 	}
-	syncDir(filepath.Dir(path))
+	// Make the new keyfile's directory entry durable, fail-closed: after a rotation
+	// the DB is already on the new key, so a lost keyfile dir entry would strand it.
+	if err := syncDirErr(filepath.Dir(path)); err != nil {
+		return fmt.Errorf("fsync key directory: %w", err)
+	}
 	return nil
 }
