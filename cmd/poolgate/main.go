@@ -287,6 +287,17 @@ func loadConfig() (model.Config, error) {
 			return model.Config{}, fmt.Errorf("server.backpressure_wait %q must not be negative", s)
 		}
 	}
+	// Validate the optional proactive-token-refresh interval (fail fast on a bad
+	// duration; "0" is valid and disables it).
+	if s := strings.TrimSpace(cfg.ProactiveTokenRefresh); s != "" {
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			return model.Config{}, fmt.Errorf("proactive_token_refresh %q is not a valid duration: %w", s, err)
+		}
+		if d < 0 {
+			return model.Config{}, fmt.Errorf("proactive_token_refresh %q must not be negative", s)
+		}
+	}
 	return cfg, nil
 }
 
@@ -812,7 +823,7 @@ func cmdServe(ctx context.Context, _ []string, stdout io.Writer) error {
 	// path uses (DESIGN.md §19.3), poll usage for zero-spend quota/recovery, and
 	// gate the probe cost by the configured mode (usage-poll-only by default).
 	refresher := oauth.NewRefresher(st, cfg.Issuer)
-	engine := newHealthEngine(st, refresher, cfg.HealthProbeMode, logger, notifier)
+	engine := newHealthEngine(st, refresher, cfg.HealthProbeMode, cfg.ProactiveTokenRefresh, logger, notifier)
 
 	// trusted_proxies were validated in loadConfig; parse is infallible here.
 	trusted, _ := clientip.ParseCIDRs(cfg.Server.TrustedProxies)
@@ -1060,7 +1071,7 @@ func serveListener(ctx context.Context, addr string, handler http.Handler, drain
 // always wired; small-live-requests are opt-in via probeMode == "allow-live"
 // (bounded by the per-account daily budget in the engine). When events is
 // non-nil, the engine emits secret-free notification events on state transitions.
-func newHealthEngine(st *store.Store, refresher *oauth.Refresher, probeMode string, logger *slog.Logger, events health.EventSink) *health.Engine {
+func newHealthEngine(st *store.Store, refresher *oauth.Refresher, probeMode, proactiveRefresh string, logger *slog.Logger, events health.EventSink) *health.Engine {
 	opts := []health.Option{
 		health.WithLogger(logger),
 		health.WithAuthProbe(health.NewModelsAuthChecker()),
@@ -1070,6 +1081,13 @@ func newHealthEngine(st *store.Store, refresher *oauth.Refresher, probeMode stri
 	}
 	if probeMode == "allow-live" {
 		opts = append(opts, health.WithAllowLive(true), health.WithLiveProbe(health.NewLiveRequester()))
+	}
+	// proactiveRefresh was validated at config load; empty keeps the engine default,
+	// an explicit value (incl. "0" to disable) overrides it.
+	if s := strings.TrimSpace(proactiveRefresh); s != "" {
+		if d, err := time.ParseDuration(s); err == nil {
+			opts = append(opts, health.WithProactiveRefresh(d))
+		}
 	}
 	return health.New(st, usagepkg.New(), refresher, opts...)
 }

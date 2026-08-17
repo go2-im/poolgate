@@ -350,6 +350,7 @@ master_key_source: keyfile          # keyfile | env
 upstream_allowlist: ["chatgpt.com", "api.openai.com"]
 issuer: "https://auth.openai.com/oauth/token"   # OAuth refresh, pinned
 health_probe_mode: usage-poll-only  # usage-poll-only (default) | allow-live
+proactive_token_refresh: 12h        # keep idle accounts' refresh_token warm; "0" disables (default 12h)
 ```
 
 Environment overrides:
