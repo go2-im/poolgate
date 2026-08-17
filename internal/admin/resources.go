@@ -136,19 +136,20 @@ func (s *Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	acct.Label = req.Label
-	// Upsert by account_id so re-importing the same Codex account refreshes its
-	// credentials in place rather than creating a duplicate row that would share
-	// (and independently rotate) the same refresh-token family.
-	created, updated, err := s.store.UpsertAccountByAccountID(r.Context(), acct)
+	// Import is non-destructive: refuse (409) if this ChatGPT account is already
+	// pooled rather than overwriting it — a stale auth.json would roll the live row
+	// back to an older, possibly consumed refresh token. Refreshing credentials is
+	// the interactive `poolgate login` path.
+	created, err := s.store.InsertAccountUnique(r.Context(), acct)
+	if errors.Is(err, store.ErrAlreadyExists) {
+		writeErr(w, http.StatusConflict, errConflict, "an account with this ChatGPT account id is already pooled; use login to refresh its credentials")
+		return
+	}
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, errInternal, "could not store account")
 		return
 	}
-	action := "account.import"
-	if updated {
-		action = "account.reimport"
-	}
-	s.audit(r.Context(), action, created.ID, "label="+created.Label)
+	s.audit(r.Context(), "account.import", created.ID, "label="+created.Label)
 	writeJSON(w, http.StatusCreated, toAccountView(created))
 }
 

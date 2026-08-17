@@ -196,15 +196,47 @@ func (s *Store) readRotationJournal(id string) (rotationJournalEntry, bool, erro
 
 // removeRotationJournal deletes an account's journal file and fsyncs the dir so the
 // deletion is durable (a resurrected journal would re-apply an already-applied token).
+// A missing journal (or rotations dir) is not an error.
 func (s *Store) removeRotationJournal(id string) error {
 	path, err := s.rotationJournalPath(id)
 	if err != nil {
 		return err
 	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := os.Remove(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil // nothing to remove (and no dir to sync)
+		}
 		return err
 	}
 	return syncDirStore(s.rotationsDir())
+}
+
+// PendingRotationIDs returns the account ids that currently have an un-flushed
+// rotation journal on disk. Backup and key rotation consult it to REFUSE to proceed
+// while any journaled-but-unpersisted rotation exists: the journal is encrypted with
+// the CURRENT master key and lives outside the DB snapshot, so backing up (which
+// would omit it) or rotating the key (which would leave it undecryptable) past a
+// pending journal would strand or lose the rotated token.
+func (s *Store) PendingRotationIDs() ([]string, error) {
+	return PendingRotationIDsAt(s.dataDir)
+}
+
+// PendingRotationIDsAt lists pending rotation-journal account ids under a data dir
+// WITHOUT opening the database, so a caller (e.g. `poolgate backup`) can check for
+// unresolved rotations without triggering an Open-time replay.
+func PendingRotationIDsAt(dataDir string) ([]string, error) {
+	if dataDir == "" {
+		return nil, nil
+	}
+	matches, err := filepath.Glob(filepath.Join(dataDir, rotationJournalDir, "*.json"))
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(matches))
+	for _, p := range matches {
+		ids = append(ids, strings.TrimSuffix(filepath.Base(p), ".json"))
+	}
+	return ids, nil
 }
 
 // updateTokensWithRetry writes rotated tokens with a small bounded backoff on

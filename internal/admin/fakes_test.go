@@ -243,17 +243,13 @@ func (f *fakeStore) InsertAccount(_ context.Context, a model.Account) (model.Acc
 	return a, nil
 }
 
-func (f *fakeStore) UpsertAccountByAccountID(_ context.Context, a model.Account) (model.Account, bool, error) {
+func (f *fakeStore) InsertAccountUnique(_ context.Context, a model.Account) (model.Account, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if a.AccountID != "" {
-		for id, existing := range f.accounts {
+		for _, existing := range f.accounts {
 			if existing.AccountID == a.AccountID {
-				existing.AccessToken = a.AccessToken
-				existing.RefreshToken = a.RefreshToken
-				existing.State = model.StateUnknown
-				f.accounts[id] = existing
-				return existing, true, nil
+				return model.Account{}, store.ErrAlreadyExists
 			}
 		}
 	}
@@ -261,7 +257,7 @@ func (f *fakeStore) UpsertAccountByAccountID(_ context.Context, a model.Account)
 		a.ID = f.id("acct")
 	}
 	f.accounts[a.ID] = a
-	return a, false, nil
+	return a, nil
 }
 
 func (f *fakeStore) GetAccount(_ context.Context, id string) (model.Account, error) {
@@ -572,8 +568,8 @@ func (failingInsertAccount) InsertAccount(context.Context, model.Account) (model
 	return model.Account{}, errors.New("insert failed")
 }
 
-func (failingInsertAccount) UpsertAccountByAccountID(context.Context, model.Account) (model.Account, bool, error) {
-	return model.Account{}, false, errors.New("insert failed")
+func (failingInsertAccount) InsertAccountUnique(context.Context, model.Account) (model.Account, error) {
+	return model.Account{}, errors.New("insert failed")
 }
 
 type failingInsertKey struct{ Store }

@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/go2-im/poolgate/internal/crypto"
@@ -688,13 +689,16 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 }
 
 // UpsertAccountByAccountID inserts a, or — when an account with the same non-empty
-// account_id already exists — refreshes THAT row's credentials in place instead of
-// creating a duplicate. Re-importing/re-logging-in the same Codex account thus
-// updates its tokens rather than creating a second row that would share (and
-// independently rotate) the same refresh-token family and eventually revoke it
-// (DESIGN.md §19.3). Accounts with an empty account_id always insert (they are not
-// yet identified upstream). It returns the stored account and whether an existing
-// row was updated (true) vs a new row inserted (false).
+// account_id already exists — REPLACES that row's credentials in place. It is the
+// interactive-login path: the caller has just obtained FRESH credentials from the
+// OAuth flow, so overwriting is correct. (File import must NOT use this — a stale
+// auth.json would roll a live account back to an older, possibly already-consumed
+// refresh token; import uses InsertAccountUnique instead.) On the replace path it
+// also removes any pending rotation journal for the row FIRST — the fresh
+// credentials supersede a half-finished rotation, and leaving the journal would let
+// a later flush overwrite them with the stale rotated token. Accounts with an empty
+// account_id always insert. Returns the stored account and whether an existing row
+// was replaced (true) vs a new row inserted (false).
 func (s *Store) UpsertAccountByAccountID(ctx context.Context, a model.Account) (model.Account, bool, error) {
 	if a.AccountID == "" {
 		acct, err := s.InsertAccount(ctx, a)
@@ -708,6 +712,12 @@ func (s *Store) UpsertAccountByAccountID(ctx context.Context, a model.Account) (
 	}
 	if err != nil {
 		return model.Account{}, false, fmt.Errorf("store: lookup account by account_id: %w", err)
+	}
+	// Drop any pending rotation journal BEFORE overwriting, fail-closed: the fresh
+	// login credentials supersede it, and a surviving journal could later re-apply a
+	// stale rotated token over them.
+	if err := s.removeRotationJournal(existingID); err != nil {
+		return model.Account{}, false, fmt.Errorf("store: clear pending rotation before replace: %w", err)
 	}
 	sealedAccess, err := s.cipher.Seal(a.AccessToken)
 	if err != nil {
@@ -727,6 +737,39 @@ UPDATE accounts SET access_token = ?, refresh_token = ?, id_token = '', state = 
 	}
 	updated, err := s.GetAccount(ctx, existingID)
 	return updated, true, err
+}
+
+// InsertAccountUnique inserts a as a NEW account, REFUSING with ErrAlreadyExists when
+// its non-empty account_id already exists rather than overwriting. It is the
+// file-import path: re-importing a possibly-stale auth.json must never roll a live
+// account back to an older, already-consumed refresh token (which would trip the
+// issuer's reuse detection and revoke the token family). Empty account_id always
+// inserts. The existence check and insert both rely on the partial UNIQUE index, so a
+// concurrent insert that loses the race surfaces as ErrAlreadyExists (not a 500).
+func (s *Store) InsertAccountUnique(ctx context.Context, a model.Account) (model.Account, error) {
+	if a.AccountID != "" {
+		var existing string
+		err := s.db.QueryRowContext(ctx, `SELECT id FROM accounts WHERE account_id = ?`, a.AccountID).Scan(&existing)
+		if err == nil {
+			return model.Account{}, ErrAlreadyExists
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return model.Account{}, fmt.Errorf("store: lookup account by account_id: %w", err)
+		}
+	}
+	acct, err := s.InsertAccount(ctx, a)
+	if err != nil {
+		if isUniqueViolation(err) {
+			return model.Account{}, ErrAlreadyExists // lost a concurrent insert race
+		}
+		return model.Account{}, err
+	}
+	return acct, nil
+}
+
+// isUniqueViolation reports whether err is a SQLite UNIQUE-constraint failure.
+func isUniqueViolation(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed")
 }
 
 // GetAccount loads and decrypts a single account by id.

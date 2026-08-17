@@ -48,7 +48,7 @@ const CSRFHeaderName = "X-CSRF-Token"
 type Store interface {
 	// accounts
 	InsertAccount(ctx context.Context, a model.Account) (model.Account, error)
-	UpsertAccountByAccountID(ctx context.Context, a model.Account) (model.Account, bool, error)
+	InsertAccountUnique(ctx context.Context, a model.Account) (model.Account, error)
 	GetAccount(ctx context.Context, id string) (model.Account, error)
 	ListAccounts(ctx context.Context) ([]model.Account, error)
 	DeleteAccount(ctx context.Context, id string) error

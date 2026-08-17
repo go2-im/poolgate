@@ -121,11 +121,14 @@ func streamOK(w http.ResponseWriter) {
 	_, _ = io.WriteString(w, "data: ok\n\n")
 }
 
-func doProxyPost(t *testing.T, url, key string) *http.Response {
+func doProxyPost(t *testing.T, url, key string, idem ...string) *http.Response {
 	t.Helper()
 	req, _ := http.NewRequest(http.MethodPost, url+"/e/default/v1/responses",
 		strings.NewReader(`{"model":"gpt-5"}`))
 	req.Header.Set("Authorization", "Bearer "+key)
+	if len(idem) > 0 && idem[0] != "" {
+		req.Header.Set("Idempotency-Key", idem[0])
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("POST: %v", err)
@@ -355,7 +358,8 @@ func TestForward429DrivesCooldown(t *testing.T) {
 	}
 }
 
-// A 5xx on the first member drives OnRateLimited(0) (cooldown) and fails over to
+// A 5xx on the first member, WITH an Idempotency-Key (which authorizes safe
+// cross-account retry, §19.2), drives OnRateLimited(0) (cooldown) and fails over to
 // the healthy second member.
 func TestForward5xxCooldownThenFailover(t *testing.T) {
 	st, cfg := newStore(t)
@@ -382,7 +386,7 @@ func TestForward5xxCooldownThenFailover(t *testing.T) {
 	srv := httptest.NewServer(gw.Routes())
 	defer srv.Close()
 
-	resp := doProxyPost(t, srv.URL, key)
+	resp := doProxyPost(t, srv.URL, key, "k-5xx")
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (failover to good)", resp.StatusCode)
@@ -393,6 +397,47 @@ func TestForward5xxCooldownThenFailover(t *testing.T) {
 	tokens := rec.tokens()
 	if len(tokens) != 2 || tokens[0] != "Bearer tok-bad" || tokens[1] != "Bearer tok-good" {
 		t.Errorf("upstream tokens = %v, want [Bearer tok-bad, Bearer tok-good]", tokens)
+	}
+}
+
+// Without an Idempotency-Key a 5xx is an UNCERTAIN outcome: the gateway must NOT
+// fail over (double-execution risk) — it relays the 5xx to the client and does not
+// cool the account down or touch the second member.
+func TestForward5xxNoKeyRelayedNoFailover(t *testing.T) {
+	st, cfg := newStore(t)
+	a := seedAccount(t, st, "bad", "tok-bad", "id-bad")
+	b := seedAccount(t, st, "good", "tok-good", "id-good")
+	key := seedGroupEndpointKey(t, st, model.StrategyFallback, a.ID, b.ID)
+
+	rec := &authRecorder{}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec.record(r.Header.Get("Authorization"))
+		if r.Header.Get("Authorization") == "Bearer tok-good" {
+			streamOK(w)
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, "upstream boom")
+	}))
+	defer upstream.Close()
+
+	fh := &fakeHealth{}
+	cfg.UpstreamAllowlist = []string{mustHost(t, upstream.URL)}
+	gw := New(st, cfg, WithUpstreamBase(upstream.URL), WithHTTPClient(upstream.Client()),
+		WithLogger(quietLogger()), WithHealth(fh))
+	srv := httptest.NewServer(gw.Routes())
+	defer srv.Close()
+
+	resp := doProxyPost(t, srv.URL, key)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 relayed (no failover without Idempotency-Key)", resp.StatusCode)
+	}
+	if len(fh.rateLimited) != 0 {
+		t.Errorf("OnRateLimited = %v, want none (an upstream 5xx must not cool the account down)", fh.rateLimited)
+	}
+	if tokens := rec.tokens(); len(tokens) != 1 {
+		t.Errorf("upstream attempts = %v, want exactly 1 (no cross-account replay)", tokens)
 	}
 }
 
