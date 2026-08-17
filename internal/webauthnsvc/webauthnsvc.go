@@ -26,7 +26,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/url"
 	"strings"
 	"time"
@@ -34,6 +33,7 @@ import (
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
 
+	"github.com/go2-im/poolgate/internal/config"
 	"github.com/go2-im/poolgate/internal/model"
 )
 
@@ -187,27 +187,11 @@ func (s *Service) RegistrationOptions() []webauthn.RegistrationOption {
 // hostname. This is the ONLY place RP identity is decided (DESIGN.md §0 fixes:
 // resolved once, never from forwarded headers).
 func resolveRP(admin model.ListenConfig) (rpID string, origins []string, err error) {
-	origin := strings.TrimSpace(admin.ExternalOrigin)
-	if origin == "" {
-		host := strings.TrimSpace(admin.Host)
-		if host == "" {
-			host = "127.0.0.1"
-		}
-		// WebAuthn RP IDs and origins cannot be bare IP literals — browsers reject
-		// an IP as the effective domain, so the default 127.0.0.1 bind would make
-		// passkey registration impossible out of the box. The loopback IP resolves
-		// from "localhost", which IS a valid RP ID, so synthesize a localhost
-		// origin for any loopback bind. Non-loopback IP binds still require an
-		// explicit external_origin/rp_id pointing at a real domain.
-		if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
-			host = "localhost"
-		}
-		port := admin.Port
-		if port == 0 {
-			port = 7070
-		}
-		origin = fmt.Sprintf("http://%s:%d", host, port)
-	}
+	// The origin is synthesized in ONE shared place (config.SynthesizeAdminOrigin)
+	// so the WebAuthn RP origin can never diverge from the admin server's canonical
+	// CORS/cookie origin — a past divergence (RP=localhost while the server said
+	// 127.0.0.1) silently broke passkey registration.
+	origin := config.SynthesizeAdminOrigin(admin)
 	u, perr := url.Parse(origin)
 	if perr != nil {
 		return "", nil, fmt.Errorf("webauthnsvc: invalid admin external_origin %q: %w", origin, perr)

@@ -7,11 +7,38 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
+	"strings"
 
 	"github.com/go2-im/poolgate/internal/model"
 	"gopkg.in/yaml.v3"
 )
+
+// SynthesizeAdminOrigin computes the single canonical browser-facing origin for
+// the admin listener (scheme://host[:port]). It is the ONE place the origin is
+// derived so the admin server's CORS/cookie origin and the WebAuthn RP origin can
+// never diverge. An explicit external_origin wins; otherwise the host/port
+// defaults apply and a loopback IP bind (127.0.0.1 / ::1) is mapped to
+// "localhost" — browsers reject bare-IP WebAuthn RP IDs, and localhost resolves
+// to the same loopback bind.
+func SynthesizeAdminOrigin(admin model.ListenConfig) string {
+	if o := strings.TrimSpace(admin.ExternalOrigin); o != "" {
+		return o
+	}
+	host := strings.TrimSpace(admin.Host)
+	if host == "" {
+		host = DefaultAdminHost
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		host = "localhost"
+	}
+	port := admin.Port
+	if port == 0 {
+		port = DefaultAdminPort
+	}
+	return fmt.Sprintf("http://%s:%d", host, port)
+}
 
 // Defaults for the two listeners and pinned egress values.
 const (

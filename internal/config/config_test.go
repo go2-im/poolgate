@@ -297,3 +297,25 @@ func TestApplyDefaultsPerField(t *testing.T) {
 		})
 	}
 }
+
+func TestSynthesizeAdminOrigin(t *testing.T) {
+	// Loopback IP bind maps to localhost (browsers reject bare-IP RP IDs).
+	if got := SynthesizeAdminOrigin(model.ListenConfig{Host: "127.0.0.1", Port: 7070}); got != "http://localhost:7070" {
+		t.Errorf("loopback origin = %q, want http://localhost:7070", got)
+	}
+	if got := SynthesizeAdminOrigin(model.ListenConfig{Host: "::1", Port: 7070}); got != "http://localhost:7070" {
+		t.Errorf("ipv6 loopback origin = %q, want http://localhost:7070", got)
+	}
+	// Defaults fill in host+port.
+	if got := SynthesizeAdminOrigin(model.ListenConfig{}); got != "http://localhost:7070" {
+		t.Errorf("default origin = %q, want http://localhost:7070", got)
+	}
+	// Explicit external_origin wins verbatim.
+	if got := SynthesizeAdminOrigin(model.ListenConfig{ExternalOrigin: "https://admin.example.com"}); got != "https://admin.example.com" {
+		t.Errorf("external_origin = %q, want it verbatim", got)
+	}
+	// Non-loopback host is preserved (operator must set a real domain for WebAuthn).
+	if got := SynthesizeAdminOrigin(model.ListenConfig{Host: "192.168.1.5", Port: 7070}); got != "http://192.168.1.5:7070" {
+		t.Errorf("non-loopback origin = %q, want preserved", got)
+	}
+}

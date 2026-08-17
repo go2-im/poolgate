@@ -49,8 +49,10 @@ poolgate import ~/.codex/auth.json  # explicit — accounts are never imported a
 poolgate serve                      # start the proxy (127.0.0.1:8787) + admin (127.0.0.1:7070)
 
 # open the passkey-protected admin UI (register your first passkey with the
-# bootstrap token from `poolgate init`):
-#   http://127.0.0.1:7070
+# bootstrap token from `poolgate init`). Use the localhost hostname, NOT the
+# 127.0.0.1 literal — browsers reject a bare-IP WebAuthn RP ID, and localhost
+# resolves to the same loopback bind:
+#   http://localhost:7070
 
 # point your Codex/Cursor/OpenAI client at:
 #   http://127.0.0.1:8787/e/<endpoint>/v1
