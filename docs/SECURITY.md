@@ -8,7 +8,7 @@ poolgate is designed against a security audit of a comparable tool (a multi-acco
 - **No outbound tunnel** — remote access is via the operator's own reverse proxy + TLS.
 - **Secrets encrypted at rest** — token fields encrypted (`nacl/secretbox`); master key from OS keychain/keyfile, never plaintext beside the DB. Backups encrypted too.
 - **Passkey admin login** — WebAuthn/FIDO2, phishing-resistant; sessions are `Secure/HttpOnly/SameSite=Strict`; CSRF on state-changing admin routes.
-- **Proxy inbound auth** — `sk-` keys, constant-time compare, per-key endpoint scoping + rate limit.
+- **Proxy inbound auth** — `sk-` keys stored **hashed** (SHA-256; a short suffix hint for display), constant-time compare, per-key endpoint scoping, optional per-key IP allowlist + expiry, and per-account concurrency caps. (There is no per-key request-rate limiter today — throttling is via the concurrency cap; a true per-key rate limit is a possible future addition.)
 - **Egress allowlist** — upstream + OAuth issuer pinned; `Authorization`-bearing requests to non-allowlisted hosts are refused.
 - **Logs carry no secrets** — no token/key material (not even prefixes) in logs; redaction middleware.
 - **No silent auto-update** — releases are signed + checksummed; any update is verified and user-confirmed.

@@ -51,8 +51,9 @@ func TestApiKeyByIDAndDelete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetApiKeyByID: %v", err)
 	}
-	if got.Key != "sk-abc" || len(got.Endpoints) != 1 || got.Endpoints[0] != "prod" {
-		t.Fatalf("GetApiKeyByID = %+v, unexpected", got)
+	if got.Key != "" || got.KeyHash != hashAPIKey("sk-abc") || got.KeyHint != "-abc" ||
+		len(got.Endpoints) != 1 || got.Endpoints[0] != "prod" {
+		t.Fatalf("GetApiKeyByID = %+v, unexpected (Key must be empty, hash/hint set)", got)
 	}
 	if _, err := s.GetApiKeyByID(ctx, "missing"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("GetApiKeyByID(missing) = %v, want ErrNotFound", err)

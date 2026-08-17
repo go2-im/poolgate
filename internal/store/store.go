@@ -11,6 +11,7 @@ package store
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -93,6 +94,12 @@ func Open(cfg model.Config, cipher *crypto.Cipher) (*Store, error) {
 
 	s := &Store{db: db, cipher: cipher, dataDir: cfg.DataDir}
 	if err := s.Migrate(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	// Hash any legacy plaintext API keys in place (idempotent). SQLite has no
+	// SHA-256 function, so this backfill runs in Go rather than in a migration.
+	if err := s.backfillAPIKeyHashes(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -334,6 +341,27 @@ WHERE member_type = 'account'
   AND member_id NOT IN (SELECT id FROM accounts);
 `,
 	},
+	{
+		// v11 — API keys are no longer stored in the clear. The existing (UNIQUE)
+		// `key` column is repurposed to hold the SHA-256 hex of the secret (distinct
+		// keys still hash distinctly, so UNIQUE holds), and a new key_hint column
+		// holds a short display suffix. A DB leak no longer exposes usable proxy
+		// keys. The plaintext->hash backfill runs in Go (openStore) since SQLite has
+		// no SHA-256 SQL function.
+		version: 11,
+		sql: `
+ALTER TABLE api_keys ADD COLUMN key_hint TEXT NOT NULL DEFAULT '';
+`,
+	},
+	{
+		// v12 — purge any stored id_token (raw JWT) plaintext. The chatgpt_account_id
+		// claim is extracted into account_id at import/login and the token is not read
+		// afterward, so it is no longer persisted; this clears legacy rows.
+		version: 12,
+		sql: `
+UPDATE accounts SET id_token = '' WHERE id_token != '';
+`,
+	},
 }
 
 // Migrate applies any migrations whose version is not yet recorded. It is
@@ -534,7 +562,11 @@ func (s *Store) InsertAccount(ctx context.Context, a model.Account) (model.Accou
 INSERT INTO accounts
 	(id, label, access_token, refresh_token, account_id, id_token, state, created_at, updated_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		a.ID, a.Label, sealedAccess, sealedRefresh, a.AccountID, a.IDToken,
+		// id_token is NOT persisted: the chatgpt_account_id claim is extracted into
+		// account_id at import/login and nothing reads the stored token afterward, so
+		// keeping the raw JWT at rest is needless credential exposure. The column is
+		// retained for schema stability but always written empty.
+		a.ID, a.Label, sealedAccess, sealedRefresh, a.AccountID, "",
 		string(a.State), formatTime(a.CreatedAt), formatTime(a.UpdatedAt),
 	); err != nil {
 		return model.Account{}, fmt.Errorf("store: insert account: %w", err)
@@ -907,9 +939,62 @@ WHERE id = ?`,
 
 // ---- api keys -------------------------------------------------------------
 
-// InsertApiKey inserts an inbound key. Endpoints scoping is stored as a JSON
-// array; an empty slice means "all endpoints". If k.ID is empty a random id is
-// generated. The stored key (with its final ID) is returned.
+// hashAPIKey returns the SHA-256 hex of an inbound key secret. Inbound keys are
+// high-entropy random tokens, so a fast hash (not a slow KDF) is appropriate —
+// there is nothing to brute-force, and constant-time comparison guards lookup.
+func hashAPIKey(secret string) string {
+	sum := sha256.Sum256([]byte(secret))
+	return hex.EncodeToString(sum[:])
+}
+
+// apiKeyHint returns a short, non-sensitive display suffix of a key secret so the
+// admin UI can render "sk-…abcd" without the store retaining the usable key.
+func apiKeyHint(secret string) string {
+	if n := len(secret); n > 4 {
+		return secret[n-4:]
+	}
+	return secret
+}
+
+// backfillAPIKeyHashes converts any legacy rows that still hold a plaintext key
+// (identified by an unset key_hint) into hashed form: the `key` column is set to
+// the SHA-256 of the secret and key_hint to its display suffix. Idempotent — rows
+// already hashed (key_hint set) are skipped.
+func (s *Store) backfillAPIKeyHashes(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, key FROM api_keys WHERE key_hint = '' AND key != ''`)
+	if err != nil {
+		return fmt.Errorf("store: scan legacy api keys: %w", err)
+	}
+	type row struct{ id, secret string }
+	var legacy []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.id, &r.secret); err != nil {
+			rows.Close()
+			return fmt.Errorf("store: read legacy api key: %w", err)
+		}
+		legacy = append(legacy, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, r := range legacy {
+		if _, err := s.db.ExecContext(ctx,
+			`UPDATE api_keys SET key = ?, key_hint = ? WHERE id = ?`,
+			hashAPIKey(r.secret), apiKeyHint(r.secret), r.id); err != nil {
+			return fmt.Errorf("store: backfill api key hash: %w", err)
+		}
+	}
+	return nil
+}
+
+// InsertApiKey inserts an inbound key. The secret is stored HASHED (the `key`
+// column holds its SHA-256; key_hint holds a display suffix) — never in the clear.
+// Endpoints scoping is a JSON array; empty = "all endpoints". If k.ID is empty a
+// random id is generated. The returned key keeps k.Key set to the plaintext for
+// the caller's one-time display.
 func (s *Store) InsertApiKey(ctx context.Context, k model.ApiKey) (model.ApiKey, error) {
 	if k.ID == "" {
 		k.ID = newID("key")
@@ -928,19 +1013,23 @@ func (s *Store) InsertApiKey(ctx context.Context, k model.ApiKey) (model.ApiKey,
 	if err != nil {
 		return model.ApiKey{}, fmt.Errorf("store: marshal key ip allowlist: %w", err)
 	}
+	k.KeyHash = hashAPIKey(k.Key)
+	k.KeyHint = apiKeyHint(k.Key)
 	if _, err := s.db.ExecContext(ctx,
-		`INSERT INTO api_keys (id, key, label, endpoints, expires_at, ip_allowlist) VALUES (?, ?, ?, ?, ?, ?)`,
-		k.ID, k.Key, k.Label, string(scopes), formatExpiry(k.ExpiresAt), string(allow)); err != nil {
+		`INSERT INTO api_keys (id, key, key_hint, label, endpoints, expires_at, ip_allowlist) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		k.ID, k.KeyHash, k.KeyHint, k.Label, string(scopes), formatExpiry(k.ExpiresAt), string(allow)); err != nil {
 		return model.ApiKey{}, fmt.Errorf("store: insert api key: %w", err)
 	}
 	return k, nil
 }
 
 // RotateApiKey replaces the secret of an existing key (same id, label, scope,
-// expiry, allowlist), returning the updated key. Used by the admin rotate action.
+// expiry, allowlist). The new secret is stored hashed; the returned key has Key
+// set to the plaintext newKey for one-time display.
 func (s *Store) RotateApiKey(ctx context.Context, id, newKey string) (model.ApiKey, error) {
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE api_keys SET key = ? WHERE id = ?`, newKey, id)
+		`UPDATE api_keys SET key = ?, key_hint = ? WHERE id = ?`,
+		hashAPIKey(newKey), apiKeyHint(newKey), id)
 	if err != nil {
 		return model.ApiKey{}, fmt.Errorf("store: rotate api key: %w", err)
 	}
@@ -948,13 +1037,18 @@ func (s *Store) RotateApiKey(ctx context.Context, id, newKey string) (model.ApiK
 	if n == 0 {
 		return model.ApiKey{}, ErrNotFound
 	}
-	return s.GetApiKeyByID(ctx, id)
+	k, err := s.GetApiKeyByID(ctx, id)
+	if err != nil {
+		return model.ApiKey{}, err
+	}
+	k.Key = newKey // one-time plaintext for the caller to display
+	return k, nil
 }
 
 // ListApiKeys returns all inbound keys ordered by id.
 func (s *Store) ListApiKeys(ctx context.Context) ([]model.ApiKey, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, key, label, endpoints, expires_at, ip_allowlist FROM api_keys ORDER BY id`)
+		`SELECT id, key, key_hint, label, endpoints, expires_at, ip_allowlist FROM api_keys ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("store: list api keys: %w", err)
 	}
@@ -971,13 +1065,12 @@ func (s *Store) ListApiKeys(ctx context.Context) ([]model.ApiKey, error) {
 	return out, rows.Err()
 }
 
-// GetApiKeyByKey looks up an inbound key by its secret value. Callers doing
-// inbound auth should still constant-time compare the returned key (the SQL
-// lookup itself is not constant-time); this method exists so that lookup has a
-// single home.
+// GetApiKeyByKey looks up an inbound key by its plaintext secret via the stored
+// hash. Callers doing inbound auth should still constant-time compare against the
+// returned KeyHash (the SQL lookup itself is not constant-time).
 func (s *Store) GetApiKeyByKey(ctx context.Context, key string) (model.ApiKey, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, key, label, endpoints, expires_at, ip_allowlist FROM api_keys WHERE key = ?`, key)
+		`SELECT id, key, key_hint, label, endpoints, expires_at, ip_allowlist FROM api_keys WHERE key = ?`, hashAPIKey(key))
 	return scanApiKey(row)
 }
 
@@ -988,7 +1081,9 @@ func scanApiKey(sc rowScanner) (model.ApiKey, error) {
 		expiry string
 		allow  string
 	)
-	if err := sc.Scan(&k.ID, &k.Key, &k.Label, &scopes, &expiry, &allow); err != nil {
+	// The `key` column stores the SHA-256 hash; read it into KeyHash and leave the
+	// plaintext Key empty (it is never stored).
+	if err := sc.Scan(&k.ID, &k.KeyHash, &k.KeyHint, &k.Label, &scopes, &expiry, &allow); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return model.ApiKey{}, ErrNotFound
 		}
