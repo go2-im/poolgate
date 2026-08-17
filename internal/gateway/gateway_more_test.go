@@ -297,6 +297,7 @@ func TestForwardFallbackToSecondAccount(t *testing.T) {
 	defer upstream.Close()
 
 	f.cfg.UpstreamAllowlist = []string{mustHost(t, upstream.URL)}
+	f.cfg.Server.AllowUncertainCrossAccountRetry = true
 	gw := New(f.st, f.cfg, WithUpstreamBase(upstream.URL), WithHTTPClient(upstream.Client()),
 		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
 	srv := httptest.NewServer(gw.Routes())
@@ -334,6 +335,7 @@ func TestForwardAllExhausted(t *testing.T) {
 	defer upstream.Close()
 
 	f.cfg.UpstreamAllowlist = []string{mustHost(t, upstream.URL)}
+	f.cfg.Server.AllowUncertainCrossAccountRetry = true
 	gw := New(f.st, f.cfg, WithUpstreamBase(upstream.URL), WithHTTPClient(upstream.Client()),
 		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
 	srv := httptest.NewServer(gw.Routes())

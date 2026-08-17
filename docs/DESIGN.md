@@ -17,7 +17,7 @@ Sections 1–27 grew incrementally; where they conflict with this ledger, **this
 
 **Scope trims (single-user; see REVIEW.md §3):**
 
-- **D7 — 3 strategies:** `fallback`, `best-quota`, `load-balance` (round-robin = its default mode; `select` = single-member group; weighted LB later). Define `best-quota` = max over accounts of `min` window `used_percent` headroom vs that plan's caps, deterministic tie-break.
+- **D7 — 4 strategies:** `fallback`, `best-quota`, `load-balance` (round-robin = its default mode; `select` = single-member group), and `weighted` (implemented — proportional distribution). Define `best-quota` = max over accounts of `min` window `used_percent` headroom vs that plan's caps, deterministic tie-break.
 - **D8 — Flat policy groups in v1** (Endpoint → PolicyGroup → Accounts; no nesting/DAG/cycle-check/tree-UI). Keep polymorphic `group_members` schema for later nesting.
 - **D9 — Trim:** 4 install channels (Release binaries + `install.sh` + Docker + Homebrew tap; Scoop/winget/deb-rpm deferred); append-only audit log (hash-chain re-added post-v1 — see §22.5); no per-key spend budgets (keep rate-limit + scoping); no dual-key grace (multiple keys + manual rotate); keep SHA256SUMS+cosign, drop full SLSA + reproducible-build CI gate; on-demand export (no scheduler); drop `/metrics` from v1 (slog JSON + in-app monitor); single UI language + dark mode (no i18n framework / a11y / mobile program); charts = 3–4 headline counters (no chart suite/rollup); defer match-rule engine AND per-key model allow-deny (v1 per-key controls = endpoint scoping + IP allowlist), subpath hosting.
 
@@ -89,10 +89,11 @@ The `proxy` package is a **translation gateway, not a transparent reverse proxy*
 Three entities:
 
 - **Account** — a pooled Codex/ChatGPT credential (the leaf "proxy"). Carries a **state** (`ok` / `cooldown` / `quota_exhausted` / `expired` / `unknown`, plus terminal `revoked` / `dead` which are **not** auto-recovered — see §12/§23.6), last usage snapshot (generic percent-usage windows + `plan_type`; e.g. a 5h and a weekly window shown as display labels — see §0 D4), and measured latency. State is maintained both passively (from real proxy traffic) and actively by the **health probe engine** (§12), which auto-recovers accounts when their quota/rate-limit clears. Also carries **management metadata** — **subscription type** (Free / Plus / Pro / Team / Enterprise / …, auto-detected from the plan endpoint where possible, editable), **subscription region/zone**, a human **label**, and free-form **tags/category** — used by the admin UI for grouping, search and sort (§13), and usable as account selectors when composing policies (e.g. "a policy over all Pro accounts in region US"). **v1 scope:** the *implemented* account model carries only a `label` and `concurrency_cap` (alongside state / usage snapshot / timing); **subscription type, region/zone, and tags/category are deferred** — not yet in the schema, admin API, or UI.
-- **PolicyGroup** — named, has a `type` (strategy) and an **ordered member list**. **v1 is flat** (Endpoint → PolicyGroup → Accounts): members are Accounts. The polymorphic `group_members` schema still permits a member to be another PolicyGroup, but **nesting / DAG / cycle-check / composition-tree UI are deferred** (v1: deferred — see §0 D8). Strategies (**3 in v1** — see §0 D7):
+- **PolicyGroup** — named, has a `type` (strategy) and an **ordered member list**. **v1 is flat** (Endpoint → PolicyGroup → Accounts): members are Accounts. The polymorphic `group_members` schema still permits a member to be another PolicyGroup, but **nesting / DAG / cycle-check / composition-tree UI are deferred** (v1: deferred — see §0 D8). Strategies (**4 in v1** — see §0 D7):
   - `fallback` — first healthy in order; on 401/429/5xx/timeout advance + cooldown the failed member.
   - `best-quota` — route to the account with the most remaining headroom. **Metric:** the `max` over accounts of that account's headroom, where an account's headroom = the `min` over its usage windows of `(100 − used_percent)`; **deterministic tie-break = lowest account id** (≈ codex-tools `switch --best`).
-  - `load-balance` — distribute across healthy members; **round-robin is its default mode** (weighted LB is a later addition). `select` (a manually pinned member) is expressed as a **single-member group**.
+  - `load-balance` — distribute across healthy members; **round-robin is its default mode**. `select` (a manually pinned member) is expressed as a **single-member group**.
+  - `weighted` — distribute across healthy members proportionally to each member's configured weight (implemented).
   - `url-test` *(optional, low-priority)* — periodic health/latency probe; route to lowest-latency healthy member (interval configurable). Kept but **coupled to the health engine** (§12) — see §0 D7. **Deferred — not implemented in v1; the v1 strategies are `fallback` / `best-quota` / `load-balance` / `weighted`.**
 - **Endpoint** — a named inbound route bound to one PolicyGroup, surfaced as a distinct URL: `/e/<endpoint>/v1/...`. The caller picks a strategy by choosing the URL. API keys can be scoped to specific endpoints.
 
@@ -169,13 +170,13 @@ endpoints:
 ## 9. Build phases
 
 1. **Core:** `config`, `store` (SQLite + field encryption; encrypt/decrypt round-trip test), `oauth` (login/import/refresh, issuer pinned). Plus **`poolgate init`** auto-provisioning + startup migrations (§17).
-2. **Policy + proxy:** `policy` engine (the **3 v1 strategies** + health; **nesting / cycle-check deferred** — v1 flat, see §0 D8), `proxy` server (`/e/<ep>/v1`, sk- auth, SSE, egress allowlist), **trusted-proxy header handling + streaming pass-through for tunnels/reverse-proxies (§14)**, per-request logging with session/model/tokens (§15).
+2. **Policy + proxy:** `policy` engine (the **4 v1 strategies** + health; **nesting / cycle-check deferred** — v1 flat, see §0 D8), `proxy` server (`/e/<ep>/v1`, sk- auth, SSE, egress allowlist), **trusted-proxy header handling + streaming pass-through for tunnels/reverse-proxies (§14)**, per-request logging with session/model/tokens (§15).
    - **`health`**: probe engine + account state machine (usage-poll / auth-check / small live request), adaptive per-state scheduling, auto-recovery, feeds `url-test`/`best-quota` (see §12).
 3. **Admin API + passkey:** WebAuthn register/login (bootstrap token, multiple passkeys, recovery codes, `admin reset-auth` CLI), session + CSRF, CRUD for accounts/groups/endpoints/keys. Accounts list API supports metadata (subscription type / region / tags), filter / search / sort / paginate in SQL (§13).
    - **`notify`**: channel CRUD (DingTalk / WeCom / custom webhook) + a "test" button; alert rules wired to policy/proxy events (see §11).
 4. **Web UI:** React pages (login, dashboard/usage, accounts w/ categorize·search·sort, policy groups w/ composition view, endpoints, keys, **real-time monitor** — live scrolling logs + charts filterable by session/api-key/model (§15), settings), `go:embed`. Admin server exposes an SSE/WS live-events stream.
 5. **Release:** GoReleaser-driven — cross-compiled single binary, `SHA256SUMS` + cosign signature, **4 channels** (GitHub Release binaries / verified `install.sh` / Docker / Homebrew tap; Scoop/deb-rpm deferred — see §0 D9), SHA-pinned CI, Dependabot, no silent auto-update, `docs/BUILD.md` (§18). Full SLSA provenance + reproducible-build gate deferred.
-6. **Optional / later (post-v1):** weighted load-balance, account cooldown tuning, expanded usage charts beyond the 3–4 headline counters (see §0 D7/D9), and WS proxying with `x-codex-turn-state` affinity (§0 D2/D3).
+6. **Optional / later (post-v1):** account cooldown tuning, expanded usage charts beyond the 3–4 headline counters (see §0 D7/D9), and WS proxying with `x-codex-turn-state` affinity (§0 D2/D3).
 
 ## 10. Development model
 
@@ -313,7 +314,7 @@ Driven by **GoReleaser** + **GitHub Actions**; every channel ships verifiable ar
 
 **Release CI (`release.yml`, on tag `v*`):** GoReleaser cross-compiles (darwin/linux/windows × amd64/arm64), builds archives + `SHA256SUMS`, **signs with cosign (keyless via GitHub OIDC)**, publishes the GitHub Release, updates the Homebrew tap, and pushes the Docker image (**full SLSA provenance + reproducible-build gate deferred** — see §0 D9; Scoop/deb-rpm not published in v1). All third-party Actions are **SHA-pinned**, `permissions` least-privileged, `id-token: write` only where needed — no long-lived signing key or registry token in the job env.
 
-**CI (`ci.yml`, on PR/push):** `go build ./...`, `go vet`, `staticcheck`, **`go test -race ./...` + coverage gate (≥80% `internal/*` — see §25)**, `govulncheck`, frontend build, and the suspicious-domain lint — all green required to merge.
+**CI (`ci.yml`, on PR/push):** `go build ./...`, `go vet`, `staticcheck`, **`go test -race ./...` + coverage gate (≥80% `internal/*` — see §25)**, `govulncheck`, and the suspicious-domain lint — all green required to merge. **Not yet wired (deferred):** a frontend `npm ci` + build + embedded-`dist` consistency check, and a committed frontend lockfile — the Go CI does not currently rebuild or verify `internal/webui/dist`.
 
 **Dependency automation:** **Dependabot** (or Renovate) for `gomod`, `github-actions`, and the frontend `npm` ecosystem — grouped, scheduled PRs, gated by `ci.yml` + `govulncheck`.
 
@@ -383,7 +384,7 @@ Driven by **GoReleaser** + **GitHub Actions**; every channel ships verifiable ar
 
 - **25.1 Fake upstream:** in-process `httptest` fake (scripted SSE, 401/429/5xx, latency, quota/plan JSON) + **golden contract fixtures** vs real OpenAI/ChatGPT shapes.
 - **25.2 Streaming chaos:** mid-stream account death, client-disconnect → upstream cancellation, failover-boundary (§19.2) correctness.
-- **25.3 Deterministic engine tests:** policy engine for the **3 v1 strategies** (fallback order, `load-balance` round-robin fairness, `best-quota` headroom + deterministic tie-break) + health state machine with an **injectable clock**. (Cycle-reject / nesting and weighted-LB tests are deferred with those features — see §0 D7/D8.)
+- **25.3 Deterministic engine tests:** policy engine for the **4 v1 strategies** (fallback order, `load-balance` round-robin fairness, `weighted` proportional split, `best-quota` headroom + deterministic tie-break) + health state machine with an **injectable clock**. (Cycle-reject / nesting tests are deferred with those features — see §0 D7/D8.)
 - **25.4 Concurrency/soak:** single-flight refresh under N concurrent 401s (§19.3); SQLite under load.
 - **25.5 CI matrix:** OS seams (keychain/DPAPI, modernc sqlite, migrations); fuzz SSE relay + trusted-proxy parsers. (Reproducible-build verification is deferred with the SLSA/reproducible-build gate — see §0 D9.)
 

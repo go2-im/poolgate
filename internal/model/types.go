@@ -313,6 +313,14 @@ type ServerConfig struct {
 	// (DESIGN.md §23.1). A duration string ("200ms"). Empty/"0" = fail fast
 	// (immediate 429 + Retry-After), which is the default.
 	BackpressureWait string `yaml:"backpressure_wait,omitempty" json:"backpressure_wait,omitempty"`
+	// AllowUncertainCrossAccountRetry opts into replaying a POST on ANOTHER account
+	// for an UNCERTAIN upstream outcome (408/425/5xx/transport error) when the client
+	// sent an Idempotency-Key. It defaults to FALSE and should stay off unless the
+	// upstream is KNOWN to honor the key AND to dedup it across different accounts
+	// (Authorization + ChatGPT-Account-ID change on failover) — otherwise a retry can
+	// double-execute / double-bill. Provably non-executing statuses (401/403/429) are
+	// always failover-eligible regardless of this flag (DESIGN.md §19.2).
+	AllowUncertainCrossAccountRetry bool `yaml:"allow_uncertain_cross_account_retry,omitempty" json:"allow_uncertain_cross_account_retry,omitempty"`
 }
 
 // ListenConfig is a host:port bind pair. For the admin listener it also carries

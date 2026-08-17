@@ -38,6 +38,11 @@ type rotationJournalEntry struct {
 
 func (s *Store) rotationsDir() string { return filepath.Join(s.dataDir, rotationJournalDir) }
 
+// RotationsDir returns the rotation-journal directory path under a data dir, so
+// out-of-package callers (e.g. `poolgate restore`) can move the whole journal
+// generation aside without hardcoding the layout.
+func RotationsDir(dataDir string) string { return filepath.Join(dataDir, rotationJournalDir) }
+
 // rotationJournalPath maps an account id to its journal file. Account ids are
 // store-generated (prefix + hex), never user input, but reject any separator/".."
 // defensively so a journal write can never escape the rotations dir.
@@ -99,18 +104,19 @@ func (s *Store) FlushPendingRotation(ctx context.Context, id string) error {
 
 // replayTokenRotations flushes every pending rotation journal at startup so a
 // rotation that failed to persist before a restart is reconciled before any request
-// can trigger a refresh with a stale token. Best-effort: a journal that still cannot
-// be applied is left in place for a later retry (never bricks Open).
+// can trigger a refresh with a stale token. It covers both committed (<id>.json) and
+// complete-but-unrenamed (<id>.json.tmp) journals via PendingRotationIDs. Best-effort:
+// a journal that still cannot be applied is left in place for a later retry (never
+// bricks Open) — and it keeps blocking backup/rotate-key until resolved.
 func (s *Store) replayTokenRotations(ctx context.Context) {
 	if s.dataDir == "" {
 		return
 	}
-	matches, err := filepath.Glob(filepath.Join(s.rotationsDir(), "*.json"))
+	ids, err := s.PendingRotationIDs()
 	if err != nil {
 		return
 	}
-	for _, p := range matches {
-		id := strings.TrimSuffix(filepath.Base(p), ".json")
+	for _, id := range ids {
 		_ = s.FlushPendingRotation(ctx, id)
 	}
 }
@@ -167,11 +173,31 @@ func (s *Store) writeRotationJournal(id, accessToken, refreshToken string) error
 }
 
 // readRotationJournal loads and decrypts the pending journal for an account, if any.
+// It prefers the committed <id>.json but falls back to a complete-but-unrenamed
+// <id>.json.tmp — a crash between fsync and rename leaves the ONLY copy of the new
+// token there, so ignoring it would lose the rotation and force a reuse of the stale
+// DB token. A partial/corrupt .tmp surfaces a decode error (the caller leaves it in
+// place, keeping the account blocked rather than silently reusing the old token).
 func (s *Store) readRotationJournal(id string) (rotationJournalEntry, bool, error) {
 	path, err := s.rotationJournalPath(id)
 	if err != nil {
 		return rotationJournalEntry{}, false, err
 	}
+	for _, p := range []string{path, path + ".tmp"} {
+		e, ok, rerr := s.readJournalFile(p)
+		if rerr != nil {
+			return rotationJournalEntry{}, false, rerr
+		}
+		if ok {
+			return e, true, nil
+		}
+	}
+	return rotationJournalEntry{}, false, nil
+}
+
+// readJournalFile reads, JSON-decodes, and decrypts a single journal file. ok is
+// false (nil error) when the file does not exist.
+func (s *Store) readJournalFile(path string) (rotationJournalEntry, bool, error) {
 	raw, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return rotationJournalEntry{}, false, nil
@@ -181,7 +207,7 @@ func (s *Store) readRotationJournal(id string) (rotationJournalEntry, bool, erro
 	}
 	var e rotationJournalEntry
 	if err := json.Unmarshal(raw, &e); err != nil {
-		return rotationJournalEntry{}, false, fmt.Errorf("store: decode rotation journal: %w", err)
+		return rotationJournalEntry{}, false, fmt.Errorf("store: decode rotation journal %s: %w", filepath.Base(path), err)
 	}
 	access, err := s.cipher.Open(e.Access)
 	if err != nil {
@@ -194,21 +220,29 @@ func (s *Store) readRotationJournal(id string) (rotationJournalEntry, bool, erro
 	return rotationJournalEntry{Access: access, Refresh: refresh, At: e.At}, true, nil
 }
 
-// removeRotationJournal deletes an account's journal file and fsyncs the dir so the
-// deletion is durable (a resurrected journal would re-apply an already-applied token).
-// A missing journal (or rotations dir) is not an error.
+// removeRotationJournal deletes an account's journal file(s) — both the committed
+// <id>.json and any leftover <id>.json.tmp — and fsyncs the dir so the deletion is
+// durable (a resurrected journal would re-apply an already-applied token). A missing
+// journal (or rotations dir) is not an error.
 func (s *Store) removeRotationJournal(id string) error {
 	path, err := s.rotationJournalPath(id)
 	if err != nil {
 		return err
 	}
-	if err := os.Remove(path); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil // nothing to remove (and no dir to sync)
+	removed := false
+	for _, p := range []string{path, path + ".tmp"} {
+		if err := os.Remove(p); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return err
 		}
-		return err
+		removed = true
 	}
-	return syncDirStore(s.rotationsDir())
+	if removed {
+		return syncDirStore(s.rotationsDir())
+	}
+	return nil
 }
 
 // PendingRotationIDs returns the account ids that currently have an un-flushed
@@ -223,20 +257,44 @@ func (s *Store) PendingRotationIDs() ([]string, error) {
 
 // PendingRotationIDsAt lists pending rotation-journal account ids under a data dir
 // WITHOUT opening the database, so a caller (e.g. `poolgate backup`) can check for
-// unresolved rotations without triggering an Open-time replay.
+// unresolved rotations without triggering an Open-time replay. It uses os.ReadDir so
+// a directory-read I/O error is SURFACED (fail-closed) rather than silently treated
+// as "no pending journals", and it counts a mid-write <id>.json.tmp as pending too.
 func PendingRotationIDsAt(dataDir string) ([]string, error) {
 	if dataDir == "" {
 		return nil, nil
 	}
-	matches, err := filepath.Glob(filepath.Join(dataDir, rotationJournalDir, "*.json"))
+	entries, err := os.ReadDir(filepath.Join(dataDir, rotationJournalDir))
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil // no journals ever written
+		}
 		return nil, err
 	}
-	ids := make([]string, 0, len(matches))
-	for _, p := range matches {
-		ids = append(ids, strings.TrimSuffix(filepath.Base(p), ".json"))
+	seen := make(map[string]bool)
+	ids := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if id, ok := journalIDFromName(e.Name()); ok && !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
 	}
 	return ids, nil
+}
+
+// journalIDFromName returns the account id for a rotation-journal filename — the
+// committed "<id>.json" or the mid-write "<id>.json.tmp" — and whether name is one.
+func journalIDFromName(name string) (string, bool) {
+	if strings.HasSuffix(name, ".json.tmp") {
+		return strings.TrimSuffix(name, ".json.tmp"), true
+	}
+	if strings.HasSuffix(name, ".json") {
+		return strings.TrimSuffix(name, ".json"), true
+	}
+	return "", false
 }
 
 // updateTokensWithRetry writes rotated tokens with a small bounded backoff on

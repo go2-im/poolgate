@@ -381,6 +381,7 @@ func TestForward5xxCooldownThenFailover(t *testing.T) {
 
 	fh := &fakeHealth{}
 	cfg.UpstreamAllowlist = []string{mustHost(t, upstream.URL)}
+	cfg.Server.AllowUncertainCrossAccountRetry = true
 	gw := New(st, cfg, WithUpstreamBase(upstream.URL), WithHTTPClient(upstream.Client()),
 		WithLogger(quietLogger()), WithHealth(fh))
 	srv := httptest.NewServer(gw.Routes())
@@ -557,5 +558,43 @@ func TestParseRetryAfter(t *testing.T) {
 		if got := parseRetryAfter(tt.in); got != tt.want {
 			t.Errorf("parseRetryAfter(%q) = %v, want %v", tt.in, got, tt.want)
 		}
+	}
+}
+
+// With server.allow_uncertain_cross_account_retry OFF (the default), an
+// Idempotency-Key alone does NOT enable cross-account replay of a 5xx — the key
+// can't be trusted to dedup across accounts on the private upstream, so the 5xx is
+// relayed and the second member is never tried.
+func TestForward5xxKeyButConfigOffNoFailover(t *testing.T) {
+	st, cfg := newStore(t)
+	a := seedAccount(t, st, "bad", "tok-bad", "id-bad")
+	b := seedAccount(t, st, "good", "tok-good", "id-good")
+	key := seedGroupEndpointKey(t, st, model.StrategyFallback, a.ID, b.ID)
+
+	rec := &authRecorder{}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec.record(r.Header.Get("Authorization"))
+		if r.Header.Get("Authorization") == "Bearer tok-good" {
+			streamOK(w)
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer upstream.Close()
+
+	cfg.UpstreamAllowlist = []string{mustHost(t, upstream.URL)}
+	// AllowUncertainCrossAccountRetry left at its zero value (false).
+	gw := New(st, cfg, WithUpstreamBase(upstream.URL), WithHTTPClient(upstream.Client()),
+		WithLogger(quietLogger()))
+	srv := httptest.NewServer(gw.Routes())
+	defer srv.Close()
+
+	resp := doProxyPost(t, srv.URL, key, "k-should-not-help")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 relayed (config off ⇒ no cross-account replay even with a key)", resp.StatusCode)
+	}
+	if tokens := rec.tokens(); len(tokens) != 1 {
+		t.Errorf("upstream attempts = %v, want exactly 1 (no replay)", tokens)
 	}
 }

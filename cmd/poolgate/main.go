@@ -660,8 +660,8 @@ func cmdServe(ctx context.Context, _ []string, stdout io.Writer) error {
 	// could belong to different generations. The operator recovers by re-running
 	// `poolgate restore` (the previous generation is preserved as *.prev files).
 	if _, err := os.Stat(filepath.Join(cfg.DataDir, restoreMarkerFile)); err == nil {
-		return fmt.Errorf("an interrupted restore was detected in %s (%s present) — re-run `poolgate restore` to finish; the previous generation is kept as *.prev files",
-			cfg.DataDir, restoreMarkerFile)
+		return fmt.Errorf("an interrupted restore was detected in %s (%s present) — recover it manually: inspect the *.prev files (the previous generation), move the intended DB/master.key/rotations back into place, then delete %s. (`poolgate restore` refuses to run while the marker exists.)",
+			cfg.DataDir, restoreMarkerFile, restoreMarkerFile)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("check restore marker: %w", err)
 	}
