@@ -9,6 +9,7 @@ package store
 
 import (
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -24,6 +25,16 @@ import (
 // random id is generated; if CreatedAt is zero it defaults to now. Transports is
 // stored as a JSON array. The stored credential (with its final ID) is returned.
 func (s *Store) InsertWebAuthnCredential(ctx context.Context, c model.WebAuthnCredential) (model.WebAuthnCredential, error) {
+	return insertWebAuthnCredentialExec(ctx, s.db, c)
+}
+
+// sqlExecer is satisfied by both *sql.DB and *sql.Tx, letting the credential
+// insert run either standalone or inside a larger transaction.
+type sqlExecer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+func insertWebAuthnCredentialExec(ctx context.Context, ex sqlExecer, c model.WebAuthnCredential) (model.WebAuthnCredential, error) {
 	if len(c.CredID) == 0 {
 		return model.WebAuthnCredential{}, errors.New("store: webauthn credential missing cred_id")
 	}
@@ -43,7 +54,7 @@ func (s *Store) InsertWebAuthnCredential(ctx context.Context, c model.WebAuthnCr
 	if err != nil {
 		return model.WebAuthnCredential{}, fmt.Errorf("store: marshal transports: %w", err)
 	}
-	if _, err := s.db.ExecContext(ctx, `
+	if _, err := ex.ExecContext(ctx, `
 INSERT INTO webauthn_credentials
 	(id, cred_id, public_key, sign_count, aaguid, transports, label, created_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -52,6 +63,73 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		return model.WebAuthnCredential{}, fmt.Errorf("store: insert webauthn credential: %w", err)
 	}
 	return c, nil
+}
+
+// ConsumeBootstrapAndInsertCredential validates+consumes the bootstrap token whose
+// SHA-256 is tokenHash AND inserts the first passkey credential in ONE
+// transaction. This makes first-passkey registration atomic: if the credential
+// insert fails, the token consume rolls back too, so the operator never ends up
+// with a spent token and no credential (previously an unrecoverable lockout short
+// of `admin reset-auth`). Returns ErrNotFound when no live matching token exists
+// and ErrAlreadyUsed on a concurrent consume race.
+func (s *Store) ConsumeBootstrapAndInsertCredential(ctx context.Context, tokenHash string, now time.Time, c model.WebAuthnCredential) (model.WebAuthnCredential, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return model.WebAuthnCredential{}, fmt.Errorf("store: begin first-passkey: %w", err)
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT id, token_hash, expires_at, used_at FROM bootstrap_tokens`)
+	if err != nil {
+		_ = tx.Rollback()
+		return model.WebAuthnCredential{}, fmt.Errorf("store: list bootstrap tokens: %w", err)
+	}
+	matchID := ""
+	for rows.Next() {
+		var id, hash, expires string
+		var used sql.NullString
+		if err := rows.Scan(&id, &hash, &expires, &used); err != nil {
+			rows.Close()
+			_ = tx.Rollback()
+			return model.WebAuthnCredential{}, fmt.Errorf("store: scan bootstrap token: %w", err)
+		}
+		if used.Valid && used.String != "" {
+			continue // already used
+		}
+		if exp := parseTime(expires); !now.Before(exp) {
+			continue // expired
+		}
+		if subtle.ConstantTimeCompare([]byte(tokenHash), []byte(hash)) == 1 {
+			matchID = id
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		_ = tx.Rollback()
+		return model.WebAuthnCredential{}, fmt.Errorf("store: iterate bootstrap tokens: %w", err)
+	}
+	if matchID == "" {
+		_ = tx.Rollback()
+		return model.WebAuthnCredential{}, ErrNotFound
+	}
+	res, err := tx.ExecContext(ctx,
+		`UPDATE bootstrap_tokens SET used_at = ? WHERE id = ? AND used_at IS NULL`,
+		formatTime(now.UTC()), matchID)
+	if err != nil {
+		_ = tx.Rollback()
+		return model.WebAuthnCredential{}, fmt.Errorf("store: consume bootstrap token: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		_ = tx.Rollback()
+		return model.WebAuthnCredential{}, ErrAlreadyUsed
+	}
+	stored, err := insertWebAuthnCredentialExec(ctx, tx, c)
+	if err != nil {
+		_ = tx.Rollback() // credential insert failed -> token consume is undone
+		return model.WebAuthnCredential{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return model.WebAuthnCredential{}, fmt.Errorf("store: commit first-passkey: %w", err)
+	}
+	return stored, nil
 }
 
 // ListWebAuthnCredentials returns all registered passkeys ordered by creation

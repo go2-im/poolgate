@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"testing"
@@ -220,8 +221,8 @@ func TestRegisterFirstPasskeyAndLogin(t *testing.T) {
 	if chID == "" || creation == nil {
 		t.Fatal("BeginRegistration returned empty challenge/creation")
 	}
-	if az.consumed != 0 {
-		t.Errorf("bootstrap consumed at Begin = %d, want 0 (consume only at Finish)", az.consumed)
+	if st.consumedBootstrap != 0 {
+		t.Errorf("bootstrap consumed at Begin = %d, want 0 (consume only at Finish)", st.consumedBootstrap)
 	}
 
 	stored, _, err := svc.FinishRegistration(ctx, RegisterGate{BootstrapToken: "pgbt_x", Label: "phone"},
@@ -229,8 +230,9 @@ func TestRegisterFirstPasskeyAndLogin(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FinishRegistration: %v", err)
 	}
-	if az.consumed != 1 || az.lastToken != "pgbt_x" {
-		t.Errorf("bootstrap consumed = %d token = %q, want 1 / pgbt_x", az.consumed, az.lastToken)
+	wantHash := sha256.Sum256([]byte("pgbt_x"))
+	if st.consumedBootstrap != 1 || st.lastBootstrapHash != hex.EncodeToString(wantHash[:]) {
+		t.Errorf("bootstrap consumed = %d hash = %q, want 1 / hash(pgbt_x)", st.consumedBootstrap, st.lastBootstrapHash)
 	}
 	if !bytes.Equal(stored.CredID, auth.credID) {
 		t.Errorf("stored CredID mismatch")
@@ -281,7 +283,7 @@ func TestRegisterAdditionalPasskeyWithSession(t *testing.T) {
 	if az.validated == 0 {
 		t.Error("session not validated at Begin")
 	}
-	if az.consumed != 0 {
+	if st.consumedBootstrap != 0 {
 		t.Error("bootstrap should never be consumed on the session path")
 	}
 	stored, _, err := svc.FinishRegistration(ctx, RegisterGate{SessionID: "sess-1"}, chID,
@@ -395,8 +397,8 @@ func TestFinishRegistrationErrors(t *testing.T) {
 	})
 
 	t.Run("bootstrap consume fails after verify", func(t *testing.T) {
-		st := &fakeStore{}
-		az := &fakeAuthorizer{bootstrapErr: errors.New("used")}
+		st := &fakeStore{bootstrapErr: errors.New("used")}
+		az := &fakeAuthorizer{}
 		svc := newCeremonyService(t, st, az)
 		auth := newAuthenticatorFor(t, svc)
 		creation, chID, err := svc.BeginRegistration(ctx, RegisterGate{BootstrapToken: "x"})

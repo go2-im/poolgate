@@ -56,6 +56,10 @@ type Store interface {
 	ListWebAuthnCredentials(ctx context.Context) ([]model.WebAuthnCredential, error)
 	CountWebAuthnCredentials(ctx context.Context) (int, error)
 	InsertWebAuthnCredential(ctx context.Context, c model.WebAuthnCredential) (model.WebAuthnCredential, error)
+	// ConsumeBootstrapAndInsertCredential atomically consumes the bootstrap token
+	// with the given SHA-256 hash and inserts the first passkey credential (used
+	// for first-passkey registration so the two can never diverge).
+	ConsumeBootstrapAndInsertCredential(ctx context.Context, tokenHash string, now time.Time, c model.WebAuthnCredential) (model.WebAuthnCredential, error)
 	GetWebAuthnCredentialByCredID(ctx context.Context, credID []byte) (model.WebAuthnCredential, error)
 	UpdateWebAuthnSignCount(ctx context.Context, id string, signCount uint32) error
 }

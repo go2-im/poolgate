@@ -20,6 +20,8 @@ package webauthnsvc
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 
@@ -157,22 +159,34 @@ func (s *Service) FinishRegistration(ctx context.Context, gate RegisterGate, cha
 		return model.WebAuthnCredential{}, false, fmt.Errorf("webauthnsvc: verify registration: %w", err)
 	}
 
-	// Attestation verified — now spend the single-use gate.
-	if first {
-		if err := s.authz.ConsumeBootstrapToken(ctx, gate.BootstrapToken); err != nil {
-			return model.WebAuthnCredential{}, false, ErrNotAuthorized
-		}
-	} else if err := s.validateSession(ctx, gate.SessionID); err != nil {
-		return model.WebAuthnCredential{}, false, err
-	}
-
 	m := credentialToModel(*cred)
 	m.Label = gate.Label
+
+	// Attestation verified — now spend the single-use gate and persist the
+	// credential.
+	if first {
+		// First passkey: consume the bootstrap token AND insert the credential in
+		// ONE transaction, so a failed insert rolls the token consume back too. This
+		// prevents the unrecoverable "token spent, no passkey" lockout. A failure
+		// here (invalid/used token, or a rolled-back insert) surfaces as
+		// not-authorized; because the token is untouched on rollback, a transient
+		// failure is safely retryable with the same token.
+		sum := sha256.Sum256([]byte(gate.BootstrapToken))
+		stored, err := s.store.ConsumeBootstrapAndInsertCredential(ctx, hex.EncodeToString(sum[:]), s.now(), m)
+		if err != nil {
+			return model.WebAuthnCredential{}, false, ErrNotAuthorized
+		}
+		return stored, true, nil
+	}
+
+	if err := s.validateSession(ctx, gate.SessionID); err != nil {
+		return model.WebAuthnCredential{}, false, err
+	}
 	stored, err := s.store.InsertWebAuthnCredential(ctx, m)
 	if err != nil {
 		return model.WebAuthnCredential{}, false, fmt.Errorf("webauthnsvc: store credential: %w", err)
 	}
-	return stored, first, nil
+	return stored, false, nil
 }
 
 // BeginLogin starts an assertion ceremony for the operator identity. It requires

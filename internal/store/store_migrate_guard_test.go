@@ -129,14 +129,42 @@ func TestMigratePreSnapshotOnPending(t *testing.T) {
 		t.Fatalf("Migrate with pending: %v", err)
 	}
 
+	// After a SUCCESSFUL migration the pre-migration snapshot is removed: it is a
+	// raw unencrypted image of the old schema and keeping it would leak pre-hash
+	// plaintext. Its only job (failed-migration recovery) is moot on success.
 	snap := filepath.Join(dir, fmt.Sprintf("poolgate.pre-migration-v%d.db", from))
-	if _, err := os.Stat(snap); err != nil {
-		t.Fatalf("expected pre-migration snapshot at %s: %v", snap, err)
+	if _, err := os.Stat(snap); !os.IsNotExist(err) {
+		t.Fatalf("pre-migration snapshot should be cleaned up after success, still present: %v", err)
 	}
 	// The pending migration was applied.
 	var n int
 	if err := s.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM tmg_pending`).Scan(&n); err != nil {
 		t.Fatalf("pending migration not applied: %v", err)
+	}
+}
+
+// TestMigrateSnapshotKeptOnFailure proves the snapshot IS created before applying
+// migrations and is PRESERVED when a migration fails (so a botched upgrade can be
+// recovered), i.e. it is only removed on full success.
+func TestMigrateSnapshotKeptOnFailure(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	s := openStoreDir(t, dir)
+	if _, err := s.InsertAccount(ctx, model.Account{Label: "x", State: model.StateOK}); err != nil {
+		t.Fatalf("InsertAccount: %v", err)
+	}
+	from := newestMigrationVersion()
+	orig := migrations
+	defer func() { migrations = orig }()
+	migrations = append(append([]migration{}, orig...),
+		migration{version: from + 1, sql: "THIS IS NOT VALID SQL"})
+
+	if err := s.Migrate(ctx); err == nil {
+		t.Fatal("Migrate with a broken pending migration should fail")
+	}
+	snap := filepath.Join(dir, fmt.Sprintf("poolgate.pre-migration-v%d.db", from))
+	if _, err := os.Stat(snap); err != nil {
+		t.Fatalf("pre-migration snapshot must be preserved on failure: %v", err)
 	}
 }
 

@@ -251,7 +251,7 @@ func (g *Gateway) handleResponsesWS(w http.ResponseWriter, r *http.Request) {
 		}
 		triedAny = true
 
-		uc, status, retryAfter, body, derr := g.dialUpstreamWS(ctx, r, acct, target)
+		uc, status, retryAfter, body, contentType, derr := g.dialUpstreamWS(ctx, r, acct, target)
 		if derr != nil {
 			g.inflight.done(acct.ID)
 			rec.trace = append(rec.trace, traceEntry(acct.ID, status))
@@ -265,7 +265,7 @@ func (g *Gateway) handleResponsesWS(w http.ResponseWriter, r *http.Request) {
 			// amplifying one bad request across every account and masking it as 502.
 			if status != 0 && !retryableStatus(status) {
 				rec.finish(status, acct, "upstream_"+strconv.Itoa(status), 0, 0)
-				relayWSHandshakeError(w, status, body)
+				relayWSHandshakeError(w, status, contentType, body)
 				return
 			}
 			g.recordFailure(ctx, eligible, byID, view, acct, status, retryAfter)
@@ -301,9 +301,17 @@ func (g *Gateway) handleResponsesWS(w http.ResponseWriter, r *http.Request) {
 // the client's (not-yet-upgraded) HTTP request, preserving the upstream status
 // and body so the client sees the real error instead of a misleading 502. The
 // WS upgrade never happens, so a plain HTTP response is correct here.
-func relayWSHandshakeError(w http.ResponseWriter, status int, body []byte) {
+// relayWSHandshakeError writes a non-retryable upstream handshake error back to
+// the client's (not-yet-upgraded) HTTP request, preserving the upstream status,
+// body, and Content-Type so the client sees the real error instead of a
+// misleading 502. The WS upgrade never happens, so a plain HTTP response is
+// correct here.
+func relayWSHandshakeError(w http.ResponseWriter, status int, contentType string, body []byte) {
 	if len(body) > 0 {
-		w.Header().Set("Content-Type", "application/json")
+		if contentType == "" {
+			contentType = "application/json"
+		}
+		w.Header().Set("Content-Type", contentType)
 		w.WriteHeader(status)
 		_, _ = w.Write(body)
 		return
@@ -333,7 +341,7 @@ func (g *Gateway) selectWSCandidate(group model.PolicyGroup, eligible []model.Ac
 // header rewrite (Authorization + ChatGPT-Account-ID together) and preserved Codex
 // identity/correlation headers. On failure it returns the upstream HTTP status (0
 // for a transport error) and Retry-After so the caller can drive health/failover.
-func (g *Gateway) dialUpstreamWS(ctx context.Context, r *http.Request, acct model.Account, httpsTarget string) (*websocket.Conn, int, time.Duration, []byte, error) {
+func (g *Gateway) dialUpstreamWS(ctx context.Context, r *http.Request, acct model.Account, httpsTarget string) (*websocket.Conn, int, time.Duration, []byte, string, error) {
 	hdr := http.Header{}
 	hdr.Set("Authorization", "Bearer "+acct.AccessToken)
 	hdr.Set("ChatGPT-Account-ID", acct.AccountID)
@@ -359,17 +367,20 @@ func (g *Gateway) dialUpstreamWS(ctx context.Context, r *http.Request, acct mode
 		status := 0
 		var ra time.Duration
 		var body []byte
+		var contentType string
 		if resp != nil {
 			status = resp.StatusCode
 			ra = parseRetryAfter(resp.Header.Get("Retry-After"))
-			// Capture the handshake error body so a non-retryable status can be
-			// relayed to the client verbatim (parity with the HTTP path).
+			contentType = resp.Header.Get("Content-Type")
+			// Capture the handshake error body + content type so a non-retryable
+			// status can be relayed to the client with its original status, body,
+			// and Content-Type (parity with the HTTP path).
 			body, _ = io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 			_ = resp.Body.Close()
 		}
-		return nil, status, ra, body, err
+		return nil, status, ra, body, contentType, err
 	}
-	return uc, 0, 0, nil, nil
+	return uc, 0, 0, nil, "", nil
 }
 
 // serveWSPair accepts the client upgrade (negotiating the same subprotocol the
