@@ -245,7 +245,8 @@ An active **`health`** engine periodically probes each account so the pool refle
    └──────────────── [ok] ◄──────────────────────────────┘
 ```
 
-- Real proxy traffic transitions passively (401→try refresh→`expired`; 429/5xx→`cooldown`; quota=0→`quota_exhausted`).
+- Real proxy traffic transitions passively (401/403→try refresh→retry same account→`expired` if it recurs; 429/5xx→`cooldown`; quota=0→`quota_exhausted`).
+- **401/403 convergence (passive):** a real-traffic **401 and 403 are treated identically** as a rejected credential (consistent with the §0 D5 auth-check, where GET /models 401/403 both = invalid). On the first occurrence the gateway refreshes once via the shared single-flight and retries the SAME account with the rotated token. If it 401/403s **again** after that refresh, the fresh token cannot fix it (the credential is revoked, or the account lacks entitlement/region access), so the account is **converged to `expired`** — it leaves the hot pool and is handed to the rare auth-check re-probe cadence, instead of being re-selected and re-failing on **every** request. Without this, a 403 (which drove no state transition) or a persistently-401ing account stayed `ok` and was hammered indefinitely (audit P2#9).
 - The probe engine transitions actively **and drives recovery**: degraded accounts (`cooldown` / `quota_exhausted`) are re-probed on a **shorter, backing-off interval** so recovery is discovered quickly; `ok` accounts are polled on a longer interval. On a successful probe, the account returns to `ok` and re-enters policy rotation automatically.
 - **Terminal states** `revoked` / `dead` (§23.6) are **never auto-recovered** by the probe engine — they require re-import / re-auth and are excluded from probing.
 

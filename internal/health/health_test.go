@@ -671,6 +671,37 @@ func TestOnUnauthorizedTimingLoadError(t *testing.T) {
 	}
 }
 
+// TestOnReauthExhaustedExpires proves the P2#9 convergence hook moves an ok account
+// to expired WITHOUT attempting a refresh (a 401/403 that recurred after a refresh
+// already succeeded must not spin the refresher again).
+func TestOnReauthExhaustedExpires(t *testing.T) {
+	acct := model.Account{ID: "a1", State: model.StateOK}
+	st := newFakeStore(acct)
+	rf := &fakeRefresher{}
+	e, _ := newTestEngine(t, st, &fakeUsage{}, rf)
+
+	if err := e.OnReauthExhausted(context.Background(), acct); err != nil {
+		t.Fatalf("OnReauthExhausted: %v", err)
+	}
+	if st.stateOf("a1") != model.StateExpired {
+		t.Fatalf("state=%q want expired", st.stateOf("a1"))
+	}
+	if rf.seen != 0 {
+		t.Fatalf("refresher called %d times, want 0 (no refresh on the exhausted path)", rf.seen)
+	}
+}
+
+// TestOnReauthExhaustedTimingLoadError covers the read-error branch (fail-closed).
+func TestOnReauthExhaustedTimingLoadError(t *testing.T) {
+	acct := model.Account{ID: "a1", State: model.StateOK}
+	st := newFakeStore(acct)
+	st.failTiming = true
+	e, _ := newTestEngine(t, st, &fakeUsage{}, &fakeRefresher{})
+	if err := e.OnReauthExhausted(context.Background(), acct); err == nil {
+		t.Fatal("expected timing load error")
+	}
+}
+
 func TestOnRateLimited(t *testing.T) {
 	acct := model.Account{ID: "a1", State: model.StateOK}
 	st := newFakeStore(acct)

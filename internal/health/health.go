@@ -490,6 +490,26 @@ func (e *Engine) OnUnauthorized(ctx context.Context, acct model.Account) (model.
 	return refreshed, nil
 }
 
+// OnReauthExhausted converges an account to expired after a real-traffic 401/403
+// that RECURRED even though a token refresh in the SAME request already succeeded —
+// the freshly-minted token is itself rejected (the credential is revoked, or the
+// account lacks entitlement/region access), so a refresh cannot fix it. Leaving the
+// account ok would let the gateway re-select and re-fail it on every request
+// (non-convergence); moving it to expired takes it out of the hot pool and hands it
+// to the rare auth-check re-probe cadence (DESIGN.md §12 / §0 D5). It does NOT attempt
+// another refresh. 401 and 403 are treated identically here, consistent with the
+// auth-check probe (§0 D5: GET /models 401/403 both = invalid).
+func (e *Engine) OnReauthExhausted(ctx context.Context, acct model.Account) error {
+	unlock := e.lockAccount(acct.ID)
+	defer unlock()
+	curState, t, err := e.readCurrent(ctx, acct)
+	if err != nil {
+		return err
+	}
+	tr := e.applyEvent(curState, t, evExpired, eventParams{now: e.now()})
+	return e.persist(ctx, acct, curState, tr)
+}
+
 // OnRateLimited handles a real-traffic 429: cooldown gated on retryAfter (a
 // conservative default is used when retryAfter <= 0).
 func (e *Engine) OnRateLimited(ctx context.Context, acct model.Account, retryAfter time.Duration) error {
