@@ -221,8 +221,30 @@ func TestWS_FailsOverToHealthyAccount(t *testing.T) {
 	}
 }
 
-func TestWS_TurnStateAffinityPinsBackend(t *testing.T) {
-	f := newTwoAccountFixture(t)
+func TestWS_NonRetryable4xxRelayedNotFailedOver(t *testing.T) {
+	f := newTwoAccountFixture(t) // fallback: id-bad first, then id-good
+	// id-bad returns a non-retryable client error (400) on the handshake. This is
+	// not an account problem, so poolgate must relay it and NOT fail over to
+	// id-good (which would amplify one bad request and mask the real status).
+	up := newWSUpstream(t, map[string]int{"id-bad": http.StatusBadRequest})
+	f.cfg.UpstreamAllowlist = []string{mustHost(t, up.srv.URL)}
+	gw := New(f.st, f.cfg, WithUpstreamBase(up.srv.URL), WithHTTPClient(up.srv.Client()))
+	srv := httptest.NewServer(gw.Routes())
+	defer srv.Close()
+
+	_, resp, err := wsDial(t, srv.URL, "default", f.apiKey, "")
+	if err == nil {
+		t.Fatal("ws dial should fail (upstream 400 relayed), not succeed via failover")
+	}
+	if resp == nil || resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("client saw status %v, want 400 relayed verbatim", resp)
+	}
+	if len(up.seen()) != 0 {
+		t.Errorf("upstream accepted %+v; a non-retryable 4xx must not fail over to another account", up.seen())
+	}
+}
+
+func TestWS_TurnStateAffinityPinsBackend(t *testing.T) {	f := newTwoAccountFixture(t)
 	setStrategy(t, f, model.StrategyLoadBalance)
 	up := newWSUpstream(t, nil)
 	f.cfg.UpstreamAllowlist = []string{mustHost(t, up.srv.URL)}
