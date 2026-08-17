@@ -22,7 +22,7 @@ func TestRecoverCompleteTmpJournal(t *testing.T) {
 	}
 	// Produce a committed journal, then rename it to .tmp to simulate a crash that
 	// happened after fsync+close but before the rename to <id>.json.
-	if err := s.writeRotationJournal(a.ID, "aT", "rT"); err != nil {
+	if err := s.writeRotationJournal(a.ID, "aT", "rT", 0, 1, "refresh"); err != nil {
 		t.Fatalf("writeRotationJournal: %v", err)
 	}
 	jp, _ := s.rotationJournalPath(a.ID)

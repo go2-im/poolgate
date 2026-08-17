@@ -23,12 +23,12 @@ import (
 // and can be programmed to fail, so the persist-error path is exercised without the
 // real SQLite store.
 type fakeStore struct {
-	err         error
-	calls       int
-	gotID       string
-	gotExpected string
-	gotAccess   string
-	gotRefresh  string
+	err        error
+	calls      int
+	gotID      string
+	gotBase    int64
+	gotAccess  string
+	gotRefresh string
 
 	// flushErr, when set, is returned by FlushPendingRotation so the fail-closed
 	// pending-flush path can be exercised.
@@ -41,6 +41,10 @@ type fakeStore struct {
 	// successful refresh must seed getAcct with the account under refresh.
 	getAcct *model.Account
 	getErr  error
+
+	// supersededWinner, when set, makes CommitRotatedTokens report applied=false and
+	// return this account as the authoritative winner (a concurrent mutation won).
+	supersededWinner *model.Account
 }
 
 func (f *fakeStore) GetAccount(_ context.Context, id string) (model.Account, error) {
@@ -53,13 +57,21 @@ func (f *fakeStore) GetAccount(_ context.Context, id string) (model.Account, err
 	return model.Account{}, errors.New("not found")
 }
 
-func (f *fakeStore) CommitRotatedTokens(_ context.Context, id, expectedRefresh, accessToken, refreshToken string) error {
+func (f *fakeStore) CommitRotatedTokens(_ context.Context, id string, baseVersion int64, accessToken, refreshToken string) (model.Account, bool, error) {
 	f.calls++
 	f.gotID = id
-	f.gotExpected = expectedRefresh
+	f.gotBase = baseVersion
 	f.gotAccess = accessToken
 	f.gotRefresh = refreshToken
-	return f.err
+	if f.err != nil {
+		return model.Account{}, false, f.err
+	}
+	if f.supersededWinner != nil {
+		return *f.supersededWinner, false, nil
+	}
+	// Simulate a successful (applied) commit: the returned account is ignored by
+	// refresh() on the applied path, which rebuilds it from the fetched tokens.
+	return model.Account{ID: id, AccessToken: accessToken, RefreshToken: refreshToken, CredentialVersion: baseVersion + 1}, true, nil
 }
 
 func (f *fakeStore) FlushPendingRotation(_ context.Context, id string) error {
@@ -386,6 +398,41 @@ func TestRefreshKeepsOldRefreshTokenWhenNotRotated(t *testing.T) {
 	if fs.calls != 1 || fs.gotRefresh != "rt-keep" || fs.gotAccess != "at-new" {
 		t.Errorf("UpdateTokens got id=%q access=%q refresh=%q calls=%d",
 			fs.gotID, fs.gotAccess, fs.gotRefresh, fs.calls)
+	}
+}
+
+// TestRefreshSupersededReturnsWinnerNotFetchedTokens proves the P2#6 fix: when the
+// version CAS in CommitRotatedTokens does NOT apply (a concurrent login/refresh
+// advanced the generation while our HTTP refresh was in flight), refresh() returns
+// the authoritative winner the store reports — NOT the tokens it just fetched, which
+// were never persisted. Returning the non-persisted tokens would let the gateway use
+// (and later re-refresh from) a refresh_token the DB never recorded, risking reuse
+// detection and a revoked token family.
+func TestRefreshSupersededReturnsWinnerNotFetchedTokens(t *testing.T) {
+	ctx := context.Background()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(refreshResponse{AccessToken: "at-fetched", RefreshToken: "rt-fetched"})
+	}))
+	defer srv.Close()
+
+	acct := model.Account{ID: "acct-1", AccessToken: "at-old", RefreshToken: "rt-old", State: model.StateOK, CredentialVersion: 3}
+	winner := model.Account{ID: "acct-1", AccessToken: "at-winner", RefreshToken: "rt-winner", State: model.StateOK, CredentialVersion: 4}
+	fs := &fakeStore{getAcct: &acct, supersededWinner: &winner}
+	r := NewRefresher(fs, srv.URL, WithHTTPClient(srv.Client()))
+
+	got, err := r.RefreshAccount(ctx, acct)
+	if err != nil {
+		t.Fatalf("RefreshAccount: %v", err)
+	}
+	if got.AccessToken != "at-winner" || got.RefreshToken != "rt-winner" {
+		t.Errorf("returned %q/%q, want the winner at-winner/rt-winner (not the non-persisted fetched tokens)", got.AccessToken, got.RefreshToken)
+	}
+	if got.CredentialVersion != 4 {
+		t.Errorf("CredentialVersion = %d, want 4 (winner generation)", got.CredentialVersion)
+	}
+	// The commit was attempted with the base version we read.
+	if fs.calls != 1 || fs.gotBase != 3 {
+		t.Errorf("commit calls=%d base=%d, want 1 call at base 3", fs.calls, fs.gotBase)
 	}
 }
 

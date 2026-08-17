@@ -31,11 +31,18 @@ const DefaultClientID = "app_EMoamEEZ73f0CkXaXp7hrann"
 // TokenStore is the persistence surface oauth needs: authoritative re-read, a
 // durable rotation commit, and reconciliation of a previously-journaled rotation.
 // *store.Store satisfies it. CommitRotatedTokens journals the new token before the
-// DB write so a failed write cannot lose it; FlushPendingRotation applies any such
-// journaled-but-unpersisted rotation before this account's stored token is reused.
+// DB write so a failed write cannot lose it, using a credential_version
+// compare-and-swap keyed on the base version the caller read; FlushPendingRotation
+// applies any journaled-but-unpersisted rotation before this account's stored token
+// is reused.
 type TokenStore interface {
 	GetAccount(ctx context.Context, id string) (model.Account, error)
-	CommitRotatedTokens(ctx context.Context, id, expectedRefresh, accessToken, refreshToken string) error
+	// CommitRotatedTokens persists the rotated tokens iff the account's
+	// credential_version still equals baseVersion. It returns the authoritative
+	// account and whether the write applied: applied==false (err==nil) means a
+	// concurrent mutation superseded this rotation and the returned account is the
+	// current winner (which the caller MUST adopt instead of its non-persisted tokens).
+	CommitRotatedTokens(ctx context.Context, id string, baseVersion int64, accessToken, refreshToken string) (model.Account, bool, error)
 	FlushPendingRotation(ctx context.Context, id string) error
 }
 
@@ -172,16 +179,23 @@ func (r *Refresher) refresh(ctx context.Context, acct model.Account) (model.Acco
 
 	// Persist DURABLY before returning so waiters never observe a half-rotated state
 	// and a failed DB write can never lose the rotated token (DESIGN.md §19.3 / §0
-	// D6): CommitRotatedTokens journals the new token first, then writes the DB, and
-	// only clears the journal on success. It also CAS-checks that the account's DB
-	// refresh token is STILL the one we rotated from (acct.RefreshToken) — if a
-	// concurrent login replaced it, the commit is skipped and the fresh creds win.
-	if err := r.store.CommitRotatedTokens(ctx, acct.ID, acct.RefreshToken, rr.AccessToken, newRefresh); err != nil {
+	// D6): CommitRotatedTokens journals the new token first, then writes the DB with a
+	// credential_version compare-and-swap keyed on the base version we read (acct's).
+	// If a concurrent login/refresh advanced the generation while our HTTP refresh was
+	// in flight, the CAS does NOT apply: our tokens were never persisted, so we MUST
+	// return the authoritative winner rather than the non-persisted rotation (reusing
+	// it could resubmit an already-consumed refresh_token and revoke the family).
+	committed, applied, err := r.store.CommitRotatedTokens(ctx, acct.ID, acct.CredentialVersion, rr.AccessToken, newRefresh)
+	if err != nil {
 		return acct, fmt.Errorf("oauth: persist rotated tokens: %w", err)
+	}
+	if !applied {
+		return committed, nil
 	}
 
 	acct.AccessToken = rr.AccessToken
 	acct.RefreshToken = newRefresh
+	acct.CredentialVersion = acct.CredentialVersion + 1
 	if rr.IDToken != "" {
 		acct.IDToken = rr.IDToken
 	}

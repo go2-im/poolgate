@@ -408,6 +408,23 @@ DROP TABLE _acct_survivor;
 CREATE UNIQUE INDEX idx_accounts_account_id ON accounts(account_id) WHERE account_id <> '';
 `,
 	},
+	{
+		// v14 — credential generation counter. Every credential mutation (online
+		// refresh, interactive login, file import) bumps accounts.credential_version
+		// monotonically, giving an AUTHORITATIVE ordering of credential generations
+		// independent of the refresh_token string (which the issuer may not rotate, so
+		// two generations can share it). The online-refresh commit writes with a version
+		// compare-and-swap (only when the DB version still equals the base it rotated
+		// from) and the rotation-recovery journal records base/target versions, so a
+		// crash-interrupted rotation is re-applied ONLY while the DB is still at its base
+		// — never clobbering a newer generation a concurrent login already wrote
+		// (DESIGN.md §19.3a). Existing rows default to 0. Append-only: v1–v13 above are
+		// never edited.
+		version: 14,
+		sql: `
+ALTER TABLE accounts ADD COLUMN credential_version INTEGER NOT NULL DEFAULT 0;
+`,
+	},
 }
 
 // Migrate applies any migrations whose version is not yet recorded. It is
@@ -704,23 +721,43 @@ func (s *Store) UpsertAccountByAccountID(ctx context.Context, a model.Account) (
 		acct, err := s.InsertAccount(ctx, a)
 		return acct, false, err
 	}
-	var existingID string
-	err := s.db.QueryRowContext(ctx, `SELECT id FROM accounts WHERE account_id = ?`, a.AccountID).Scan(&existingID)
-	if errors.Is(err, sql.ErrNoRows) {
-		acct, ierr := s.InsertAccount(ctx, a)
-		return acct, false, ierr
-	}
-	if err != nil {
-		return model.Account{}, false, fmt.Errorf("store: lookup account by account_id: %w", err)
-	}
-	// Replace the existing row's credentials under the cross-process credential lock,
-	// so a concurrent online refresh cannot interleave with (or clobber the journal
-	// of) this login. Write a recovery journal with the NEW credentials BEFORE
-	// overwriting the DB (and overwriting any stale pending journal), so a crash or
-	// failure during the update leaves the fresh token recoverable — never delete the
-	// only recovery copy first. The journal is removed only after the update succeeds.
+	var (
+		result   model.Account
+		replaced bool
+	)
+	// EVERYTHING — the account_id lookup, the credential_version read, the journal
+	// write, and the DB update — runs under the cross-process credential lock. The
+	// version MUST be read inside the lock: reading it outside would let a concurrent
+	// serve-process refresh advance the generation in the gap before we acquire the
+	// lock, so our precomputed target could collide with (or fall behind) a version a
+	// refresh already committed — silently dropping the freshly-minted login creds or
+	// driving credential_version backward. Reading under the lock makes curVer the true
+	// current version, and the write CAS-guards on it (belt-and-suspenders).
 	if err := s.withCredentialLock(func() error {
-		if err := s.writeRotationJournal(existingID, a.AccessToken, a.RefreshToken); err != nil {
+		var existingID string
+		var curVer int64
+		lookErr := s.db.QueryRowContext(ctx, `SELECT id, credential_version FROM accounts WHERE account_id = ?`, a.AccountID).Scan(&existingID, &curVer)
+		if errors.Is(lookErr, sql.ErrNoRows) {
+			acct, ierr := s.InsertAccount(ctx, a)
+			if ierr != nil {
+				return ierr
+			}
+			result = acct
+			return nil
+		}
+		if lookErr != nil {
+			return fmt.Errorf("store: lookup account by account_id: %w", lookErr)
+		}
+		// Login is an UNCONDITIONAL new credential generation (curVer -> curVer+1) that
+		// always wins over an in-flight refresh derived from an older base: any
+		// concurrent refresh that read base=curVer loses its version CAS and is
+		// discarded (DESIGN.md §19.3a). Write a recovery journal TAGGED with
+		// base=curVer/target=curVer+1 BEFORE overwriting the DB (and overwriting any
+		// stale pending journal), so a crash during the update leaves the fresh token
+		// recoverable AND version-ordered — recovery re-applies it only while the DB is
+		// still at curVer. The journal is removed only after the update succeeds.
+		target := curVer + 1
+		if err := s.writeRotationJournal(existingID, a.AccessToken, a.RefreshToken, curVer, target, "login"); err != nil {
 			return fmt.Errorf("store: journal credentials before replace: %w", err)
 		}
 		sealedAccess, err := s.cipher.Seal(a.AccessToken)
@@ -731,23 +768,40 @@ func (s *Store) UpsertAccountByAccountID(ctx context.Context, a model.Account) (
 		if err != nil {
 			return fmt.Errorf("store: seal refresh token: %w", err)
 		}
-		// Refresh the existing row's credentials in place, resetting state to unknown
-		// so the health engine re-probes with the new tokens. id_token is never
-		// persisted; label and concurrency_cap are left untouched (operator-owned).
-		if _, err := s.db.ExecContext(ctx, `
-UPDATE accounts SET access_token = ?, refresh_token = ?, id_token = '', state = ?, updated_at = ? WHERE id = ?`,
-			sealedAccess, sealedRefresh, string(model.StateUnknown), formatTime(time.Now().UTC()), existingID); err != nil {
+		// Refresh the existing row's credentials in place, resetting state to unknown so
+		// the health engine re-probes with the new tokens, and advancing
+		// credential_version to the new generation. The CAS on curVer must match (we
+		// read it under the lock); a 0-row result means the invariant broke. id_token is
+		// never persisted; label and concurrency_cap are left untouched (operator-owned).
+		res, err := s.db.ExecContext(ctx, `
+UPDATE accounts SET access_token = ?, refresh_token = ?, id_token = '', state = ?, credential_version = ?, updated_at = ?
+WHERE id = ? AND credential_version = ?`,
+			sealedAccess, sealedRefresh, string(model.StateUnknown), target, formatTime(time.Now().UTC()), existingID, curVer)
+		if err != nil {
 			return fmt.Errorf("store: update account by account_id: %w", err) // journal retained for recovery
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("store: update account rows: %w", err)
+		}
+		if n == 0 {
+			// Under the lock the version cannot change beneath us; a miss means the row
+			// vanished or the invariant is violated. Retain the journal, fail closed.
+			return fmt.Errorf("store: login replace version CAS failed for %s (row gone or version moved under the lock)", existingID)
 		}
 		if err := s.removeRotationJournal(existingID); err != nil {
 			return fmt.Errorf("store: clear journal after replace: %w", err)
 		}
+		updated, gerr := s.GetAccount(ctx, existingID)
+		if gerr != nil {
+			return fmt.Errorf("store: re-read after replace: %w", gerr)
+		}
+		result, replaced = updated, true
 		return nil
 	}); err != nil {
 		return model.Account{}, false, err
 	}
-	updated, err := s.GetAccount(ctx, existingID)
-	return updated, true, err
+	return result, replaced, nil
 }
 
 // InsertAccountUnique inserts a as a NEW account, REFUSING with ErrAlreadyExists when
@@ -786,7 +840,7 @@ func isUniqueViolation(err error) bool {
 // GetAccount loads and decrypts a single account by id.
 func (s *Store) GetAccount(ctx context.Context, id string) (model.Account, error) {
 	row := s.db.QueryRowContext(ctx, `
-SELECT id, label, access_token, refresh_token, account_id, id_token, state, concurrency_cap, created_at, updated_at
+SELECT id, label, access_token, refresh_token, account_id, id_token, state, concurrency_cap, created_at, updated_at, credential_version
 FROM accounts WHERE id = ?`, id)
 	return s.scanAccount(row)
 }
@@ -794,7 +848,7 @@ FROM accounts WHERE id = ?`, id)
 // ListAccounts returns all accounts ordered by creation time then id.
 func (s *Store) ListAccounts(ctx context.Context) ([]model.Account, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, label, access_token, refresh_token, account_id, id_token, state, concurrency_cap, created_at, updated_at
+SELECT id, label, access_token, refresh_token, account_id, id_token, state, concurrency_cap, created_at, updated_at, credential_version
 FROM accounts ORDER BY created_at, id`)
 	if err != nil {
 		return nil, fmt.Errorf("store: list accounts: %w", err)
@@ -812,10 +866,12 @@ FROM accounts ORDER BY created_at, id`)
 	return out, rows.Err()
 }
 
-// UpdateTokens atomically rewrites the (rotated) token columns for one account
-// inside a transaction, bumping updated_at. This is the persistence half of the
-// single-flight refresh (DESIGN.md §0 D6 / §19.3): waiters must not proceed
-// until the rotated refresh_token is durably committed.
+// UpdateTokens atomically rewrites the token columns for one account inside a
+// transaction, bumping updated_at. It does NOT touch credential_version and performs
+// no version compare-and-swap, so it MUST NOT be used for online-refresh persistence
+// (that path is updateTokensCAS / CommitRotatedTokens, DESIGN.md §19.3a — a plain write
+// here would let a concurrent refresh's CAS silently clobber it). It remains as a
+// low-level primitive for tests and non-credential-generation token edits only.
 func (s *Store) UpdateTokens(ctx context.Context, id, accessToken, refreshToken string) error {
 	sealedAccess, err := s.cipher.Seal(accessToken)
 	if err != nil {
@@ -852,7 +908,59 @@ UPDATE accounts SET access_token = ?, refresh_token = ?, updated_at = ? WHERE id
 	return nil
 }
 
-// UpdateState sets the lifecycle state for one account, bumping updated_at.
+// updateTokensCAS atomically rewrites the token columns AND bumps credential_version
+// from base to target, but ONLY when the row's credential_version still equals base
+// (a version compare-and-swap). It reports whether the row matched (applied). A false
+// return (0 rows) means the credential generation moved on — a concurrent login or
+// another refresh already advanced it — so this rotation is stale and must NOT be
+// written (DESIGN.md §19.3a): reusing/overwriting with a superseded generation could
+// resurrect an already-consumed refresh_token and trip the issuer's reuse detection.
+// ErrNotFound is returned only when the account row does not exist at all.
+func (s *Store) updateTokensCAS(ctx context.Context, id string, base, target int64, accessToken, refreshToken string) (bool, error) {
+	sealedAccess, err := s.cipher.Seal(accessToken)
+	if err != nil {
+		return false, fmt.Errorf("store: seal access token: %w", err)
+	}
+	sealedRefresh, err := s.cipher.Seal(refreshToken)
+	if err != nil {
+		return false, fmt.Errorf("store: seal refresh token: %w", err)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("store: begin update tokens cas: %w", err)
+	}
+	res, err := tx.ExecContext(ctx, `
+UPDATE accounts SET access_token = ?, refresh_token = ?, credential_version = ?, updated_at = ?
+WHERE id = ? AND credential_version = ?`,
+		sealedAccess, sealedRefresh, target, formatTime(time.Now().UTC()), id, base)
+	if err != nil {
+		_ = tx.Rollback()
+		return false, fmt.Errorf("store: update tokens cas: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		_ = tx.Rollback()
+		return false, fmt.Errorf("store: update tokens cas rows: %w", err)
+	}
+	if n == 0 {
+		// Distinguish "row gone" from "version moved on" so callers can drop a moot
+		// journal (ErrNotFound) vs. treat the write as superseded (applied=false).
+		var exists int
+		qerr := tx.QueryRowContext(ctx, `SELECT 1 FROM accounts WHERE id = ?`, id).Scan(&exists)
+		_ = tx.Rollback()
+		if errors.Is(qerr, sql.ErrNoRows) {
+			return false, ErrNotFound
+		}
+		if qerr != nil {
+			return false, fmt.Errorf("store: update tokens cas existence: %w", qerr)
+		}
+		return false, nil // row exists but version advanced → superseded
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("store: commit update tokens cas: %w", err)
+	}
+	return true, nil
+}
 func (s *Store) UpdateState(ctx context.Context, id string, state model.AccountState) error {
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE accounts SET state = ?, updated_at = ? WHERE id = ?`,
@@ -903,7 +1011,7 @@ func (s *Store) scanAccount(sc rowScanner) (model.Account, error) {
 		createdAt, updatedAt  string
 	)
 	if err := sc.Scan(&a.ID, &a.Label, &sealedAccess, &refresh, &a.AccountID,
-		&a.IDToken, &state, &a.ConcurrencyCap, &createdAt, &updatedAt); err != nil {
+		&a.IDToken, &state, &a.ConcurrencyCap, &createdAt, &updatedAt, &a.CredentialVersion); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return model.Account{}, ErrNotFound
 		}
