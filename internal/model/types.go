@@ -308,9 +308,12 @@ type ServerConfig struct {
 	Admin ListenConfig `yaml:"admin" json:"admin"`
 	Proxy ListenConfig `yaml:"proxy" json:"proxy"`
 	// Transport selects which proxy transport(s) the /responses surface offers
-	// (DESIGN.md §0 D2): "both" (default — accept the WS upgrade AND serve HTTP+SSE),
-	// "http-only" (refuse the WS upgrade so Codex falls back to HTTP+SSE), or
-	// "ws-only" (require the WS upgrade; refuse plain HTTP POST). Empty = both.
+	// (DESIGN.md §0 D2): "http-only" (default — refuse the WS upgrade so Codex falls
+	// back to stateless HTTP+SSE, which needs no turn affinity and is always correct),
+	// "both" (also accept the WS upgrade), or "ws-only" (require the WS upgrade; refuse
+	// plain HTTP POST). Empty = http-only. Accepting the WS upgrade is opt-in because
+	// its reconnect affinity relies on an x-codex-turn-state header current clients
+	// don't send (audit P2#10).
 	Transport string `yaml:"transport" json:"transport"`
 	// TrustedProxies lists reverse-proxy addresses/networks (IPs or CIDRs) whose
 	// X-Forwarded-For header poolgate will trust when resolving the real client IP

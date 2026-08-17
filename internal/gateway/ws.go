@@ -69,15 +69,22 @@ const (
 )
 
 // normalizeTransport maps a config value to a known mode, defaulting unknown/empty
-// to TransportBoth (lenient — an unrecognized value never disables the proxy).
+// to TransportHTTPOnly. HTTP POST+SSE is stateless — it carries full turn context
+// inline on every request, so it needs no cross-request/cross-connection affinity and
+// is always correct (DESIGN.md §19.1). WS turn affinity across RECONNECTS, by
+// contrast, depends on the client resending an `x-codex-turn-state` UPGRADE header,
+// which current Codex clients do NOT (they carry turn-state inside WS messages) — so a
+// reconnected turn could land on a different backend and lose server-side state.
+// Defaulting to http-only keeps the correct path on by default; accepting the WS
+// upgrade (with that caveat) is an explicit opt-in via "both"/"ws-only" (audit P2#10).
 func normalizeTransport(v string) string {
 	switch v {
-	case TransportHTTPOnly:
-		return TransportHTTPOnly
+	case TransportBoth:
+		return TransportBoth
 	case TransportWSOnly:
 		return TransportWSOnly
 	default:
-		return TransportBoth
+		return TransportHTTPOnly
 	}
 }
 

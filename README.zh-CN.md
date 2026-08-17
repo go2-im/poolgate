@@ -30,7 +30,7 @@ poolgate 是一个**单文件、纯 Go、无 CGO** 的服务：把多个 Codex/C
 - **WebSocket 代理 + 会话粘滞**（PR #46）：接受 Codex 的 WS `/responses` 升级并透明转发到所选上游账号；
   连接级账号粘滞（一次会话固定一个后端 = turn affinity），另支持 `x-codex-turn-state` 升级头做跨重连粘滞（短 TTL）；
   升级前容错、心跳保活（防止死连接占用并发槽）。
-- **传输可配置**（PR #50）：`server.transport` / `POOLGATE_PROXY_TRANSPORT` = `both`（默认）| `http-only`（拒绝 WS，回落 HTTP）| `ws-only`（拒绝普通 POST，返回 426）。**两种传输都不是强制的**。
+- **传输可配置**（PR #50）：`server.transport` / `POOLGATE_PROXY_TRANSPORT` = `http-only`（默认，拒绝 WS，回落无状态 HTTP+SSE）| `both`（额外接受 WS 升级）| `ws-only`（拒绝普通 POST，返回 426）。**两种传输都不是强制的**。
 
 ### 管理后台（Admin API + Web UI）
 - **Passkey / WebAuthn 登录**：首个 passkey 由一次性 bootstrap token 引导，之后凭会话注册更多 passkey，支持一次性恢复码与跨设备（扫码）登录；`admin reset-auth` 为本地锁定逃生通道。

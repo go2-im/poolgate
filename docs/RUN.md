@@ -230,9 +230,11 @@ error on either side closes both. Codex still negotiates WS-first and falls back
 to HTTP POST+SSE when a hop doesn't accept the upgrade.
 
 The transport is configurable via `server.transport` (or `POOLGATE_PROXY_TRANSPORT`):
-`both` (default), `http-only` (refuse the WS upgrade with 501 so Codex uses
-HTTP+SSE), or `ws-only` (refuse plain HTTP POST with 426). Neither transport is
-forced — pick what your clients and hops support.
+`http-only` (default — refuse the WS upgrade with 501 so Codex uses stateless
+HTTP+SSE), `both` (also accept the WS upgrade), or `ws-only` (refuse plain HTTP POST
+with 426). Accepting the WS upgrade is opt-in: its reconnect affinity relies on an
+`x-codex-turn-state` header current Codex clients don't send, so the always-correct
+HTTP+SSE path is the default — pick what your clients and hops support.
 
 ## 5. Admin API (passkey login + management)
 
@@ -338,11 +340,11 @@ server:
     external_origin: "https://admin.example.com"   # browser-facing origin
     rp_id: "example.com"                            # WebAuthn Relying Party ID
   proxy: { host: 127.0.0.1, port: 8787 }
-  # Which /responses transport(s) to offer (default both):
-  #   both       — accept the WS upgrade AND serve HTTP+SSE
-  #   http-only  — refuse the WS upgrade so Codex falls back to HTTP+SSE
+  # Which /responses transport(s) to offer (default http-only):
+  #   http-only  — refuse the WS upgrade so Codex falls back to stateless HTTP+SSE
+  #   both       — also accept the WS upgrade (opt-in; see the transport note above)
   #   ws-only    — require the WS upgrade; refuse plain HTTP POST (426)
-  transport: both
+  transport: http-only
 data_dir: ./poolgate-data
 master_key_source: keyfile          # keyfile | env
 upstream_allowlist: ["chatgpt.com", "api.openai.com"]
