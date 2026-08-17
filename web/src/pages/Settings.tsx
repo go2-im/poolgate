@@ -140,8 +140,10 @@ export function Settings({
       <div className="section">
         <h2>Audit log integrity</h2>
         <p className="muted">
-          The audit log is append-only and hash-chained. Verify recomputes the chain and reports
-          whether the persisted log has been tampered with, truncated, or reordered.
+          The audit log is append-only and hash-chained. Verify recomputes the chain and detects
+          modification or reordering of interior entries. Note: a keyless in-band chain cannot detect
+          tail-truncation, nor tampering by someone who can rewrite the whole chain with DB write
+          access — it is corruption/accidental-tamper evidence, not a defense against a privileged local attacker.
         </p>
         <button onClick={checkAuditLog}>Verify audit log</button>
         {auditNote && <p className="hint">{auditNote}</p>}

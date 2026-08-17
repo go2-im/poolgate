@@ -477,3 +477,29 @@ func TestRunServeDispatch(t *testing.T) {
 		t.Fatal("run serve did not return after cancel")
 	}
 }
+
+func TestLoadConfigBackpressureWait(t *testing.T) {
+	dir := t.TempDir()
+	// Valid duration parses.
+	if err := os.WriteFile(filepath.Join(dir, configFile), []byte("server:\n  backpressure_wait: \"250ms\"\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv(envDataDir, dir)
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig(valid): %v", err)
+	}
+	if got := backpressureWait(cfg); got != 250*time.Millisecond {
+		t.Errorf("backpressureWait = %v, want 250ms", got)
+	}
+
+	// Invalid duration fails fast.
+	dir2 := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir2, configFile), []byte("server:\n  backpressure_wait: \"nope\"\n"), 0o600); err != nil {
+		t.Fatalf("write config2: %v", err)
+	}
+	t.Setenv(envDataDir, dir2)
+	if _, err := loadConfig(); err == nil {
+		t.Errorf("loadConfig with invalid backpressure_wait should error")
+	}
+}

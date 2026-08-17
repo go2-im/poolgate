@@ -298,6 +298,11 @@ type ServerConfig struct {
 	// default) means poolgate is directly exposed: X-Forwarded-For is ignored and
 	// only the direct peer address is used.
 	TrustedProxies []string `yaml:"trusted_proxies,omitempty" json:"trusted_proxies,omitempty"`
+	// BackpressureWait is how long the proxy waits for a per-account concurrency
+	// slot to free before returning 429 when every healthy member is at its cap
+	// (DESIGN.md §23.1). A duration string ("200ms"). Empty/"0" = fail fast
+	// (immediate 429 + Retry-After), which is the default.
+	BackpressureWait string `yaml:"backpressure_wait,omitempty" json:"backpressure_wait,omitempty"`
 }
 
 // ListenConfig is a host:port bind pair. For the admin listener it also carries

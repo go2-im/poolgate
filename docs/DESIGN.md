@@ -360,7 +360,7 @@ Driven by **GoReleaser** + **GitHub Actions**; every channel ships verifiable ar
 
 ## 23. Routing & account additions
 
-- **23.1 Concurrency:** per-account concurrency cap + **least-in-flight** selection (a refinement within `load-balance`, not a separate strategy — see §0 D7); **bounded queue / backpressure** (429 + Retry-After) when no member is free.
+- **23.1 Concurrency:** per-account concurrency cap + **least-in-flight** selection (a refinement within `load-balance`, not a separate strategy — see §0 D7); when no member is free the proxy **fails fast** with 429 + Retry-After by default. Optional bounded-queue backpressure (wait briefly for a slot before 429) is opt-in via `server.backpressure_wait` (a duration; empty/0 = fail fast).
 - **23.2 Match rules:** per-endpoint/key **model allow-deny** in v1. The Surge-style match-rule engine (model / header / path → group) is **deferred** (v1: deferred — see §0 D9).
 - **23.3 Upstream rate limits:** relay upstream rate-limit headers to the client; drive cooldown from `Retry-After`.
 - **23.4 Streamed token accounting:** parse SSE `usage` / `include_usage` to record tokens for streamed responses (feeds §15 + budgets).

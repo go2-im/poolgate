@@ -269,7 +269,27 @@ func loadConfig() (model.Config, error) {
 	if _, err := clientip.ParseCIDRs(cfg.Server.TrustedProxies); err != nil {
 		return model.Config{}, err
 	}
+	// Validate the optional backpressure wait (fail fast on a bad duration).
+	if s := strings.TrimSpace(cfg.Server.BackpressureWait); s != "" {
+		if _, err := time.ParseDuration(s); err != nil {
+			return model.Config{}, fmt.Errorf("server.backpressure_wait %q is not a valid duration: %w", s, err)
+		}
+	}
 	return cfg, nil
+}
+
+// backpressureWait parses the validated server.backpressure_wait duration (0 when
+// empty/invalid — loadConfig already rejected invalid values at startup).
+func backpressureWait(cfg model.Config) time.Duration {
+	s := strings.TrimSpace(cfg.Server.BackpressureWait)
+	if s == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil || d < 0 {
+		return 0
+	}
+	return d
 }
 
 // envValue returns the value of the named env var, honoring the Docker/K8s
@@ -643,9 +663,17 @@ func cmdServe(ctx context.Context, _ []string, stdout io.Writer) error {
 
 	// trusted_proxies were validated in loadConfig; parse is infallible here.
 	trusted, _ := clientip.ParseCIDRs(cfg.Server.TrustedProxies)
-	gw := gateway.New(st, cfg, gateway.WithLogger(logger), gateway.WithHealth(engine),
+	gwOpts := []gateway.Option{
+		gateway.WithLogger(logger), gateway.WithHealth(engine),
 		gateway.WithEventSink(notifier), gateway.WithRecorder(mon),
-		gateway.WithTrustedProxies(trusted))
+		gateway.WithTrustedProxies(trusted),
+	}
+	// Optional bounded-queue backpressure: wait up to backpressure_wait for a slot
+	// before 429. Empty/0 = fail fast (the default). Validated in loadConfig.
+	if wait := backpressureWait(cfg); wait > 0 {
+		gwOpts = append(gwOpts, gateway.WithBackpressure(wait, 0))
+	}
+	gw := gateway.New(st, cfg, gwOpts...)
 
 	// Admin API handler (loopback listener), wired with the same store so the
 	// bootstrap token issued by `init` / `admin reset-auth` registers the first

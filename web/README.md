@@ -6,6 +6,12 @@ the bundle to `../internal/webui/dist`, which `internal/webui` embeds via a Go
 `embed` directive. That built `dist` **is committed**, so `go build` / `go install`
 / `scripts/install.sh` ship the UI with **no npm step**.
 
+> **Keeping `dist` in sync:** because the bundle is committed (and there is no
+> lockfile / CI frontend build by design), any change under `web/src` MUST be
+> followed by `npm run build` and committing the regenerated `internal/webui/dist`
+> in the SAME change — otherwise the shipped UI drifts from the source. Reviewers
+> should reject a `web/src` diff that does not also update `internal/webui/dist`.
+
 ## Develop
 
 ```bash
