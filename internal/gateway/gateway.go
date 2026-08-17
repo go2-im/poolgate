@@ -143,7 +143,23 @@ type Gateway struct {
 	// when resolving the client IP for the API-key IP allowlist. Empty => the
 	// direct peer address is used and X-Forwarded-For is ignored.
 	trustedProxies []*net.IPNet
+
+	// Readiness (/readyz, DESIGN.md §21.1). now/startedAt drive the cold-start grace;
+	// readyzGrace is how long after startup an as-yet-unprobed (unknown) account still
+	// counts toward readiness; readyzRequireHealthy (config) disables that grace and
+	// always requires a proven-healthy (ok) account.
+	now                  func() time.Time
+	startedAt            time.Time
+	readyzGrace          time.Duration
+	readyzRequireHealthy bool
 }
+
+// defaultReadyzGrace is the cold-start window during which /readyz counts a
+// freshly-imported (unknown, not-yet-probed) account as ready, so a fresh process
+// reports ready before the health engine's first probe round (Unknown cadence ~30s)
+// has promoted an account to ok. After it elapses, readiness requires a proven-ok
+// account (unless already satisfied by one).
+const defaultReadyzGrace = 90 * time.Second
 
 // Option customizes a Gateway.
 type Option func(*Gateway)
@@ -159,6 +175,14 @@ func WithUpstreamBase(base string) Option {
 
 // WithLogger sets the structured logger.
 func WithLogger(l *slog.Logger) Option { return func(g *Gateway) { g.logger = l } }
+
+// WithClock injects the clock used for the /readyz cold-start grace (default
+// time.Now). Tests pass a fake for deterministic grace-window behavior.
+func WithClock(now func() time.Time) Option { return func(g *Gateway) { g.now = now } }
+
+// WithReadyzGrace overrides the /readyz cold-start grace window (default
+// defaultReadyzGrace). Tests use a small/zero value to exercise post-grace behavior.
+func WithReadyzGrace(d time.Duration) Option { return func(g *Gateway) { g.readyzGrace = d } }
 
 // WithHealth wires the health passive-hook surface (DESIGN.md §12). When set, the
 // gateway drives account-state transitions on real upstream 401/429/5xx failures
@@ -251,6 +275,16 @@ func New(st *store.Store, cfg model.Config, opts ...Option) *Gateway {
 	for _, o := range opts {
 		o(g)
 	}
+	if g.now == nil {
+		g.now = time.Now
+	}
+	if g.startedAt.IsZero() {
+		g.startedAt = g.now()
+	}
+	if g.readyzGrace == 0 {
+		g.readyzGrace = defaultReadyzGrace
+	}
+	g.readyzRequireHealthy = cfg.Server.ReadyzRequireHealthy
 	return g
 }
 
@@ -739,9 +773,12 @@ func (g *Gateway) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte(`{"status":"ok"}`))
 }
 
-// handleReadyz reports ready when migrations are applied AND at least one
-// endpoint has an eligible account. It is secret-free and leaks no account ids
-// (DESIGN.md §21.1).
+// handleReadyz reports ready when migrations are applied AND the pool can serve.
+// "Can serve" prefers a PROVEN-healthy (ok) account; during a bounded cold-start
+// grace after startup it also accepts a freshly-imported (unknown, not-yet-probed)
+// account so a fresh process reports ready before the first probe round. The
+// readyz_require_healthy config disables the grace (always require ok). It is
+// secret-free and leaks no account ids (DESIGN.md §21.1).
 func (g *Gateway) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	ver, err := g.store.SchemaVersion(r.Context())
 	if err != nil || ver == 0 {
@@ -749,28 +786,46 @@ func (g *Gateway) handleReadyz(w http.ResponseWriter, r *http.Request) {
 			"not_ready", "migrations not applied")
 		return
 	}
-	if !g.anyEndpointReady(r.Context()) {
-		writeError(w, http.StatusServiceUnavailable, "poolgate_not_ready",
-			"not_ready", "no endpoint has a healthy account")
+	if g.anyEndpointMatches(r.Context(), func(s model.AccountState) bool { return s == model.StateOK }) {
+		g.writeReady(w)
 		return
 	}
+	// No proven-healthy account. Accept an unknown (not-yet-probed) one only within
+	// the cold-start grace and only when strict mode is off.
+	withinGrace := !g.readyzRequireHealthy && g.now().Sub(g.startedAt) < g.readyzGrace
+	if withinGrace && g.anyEndpointMatches(r.Context(), routable) {
+		g.writeReady(w)
+		return
+	}
+	msg := "no endpoint has a healthy account"
+	if g.readyzRequireHealthy {
+		msg = "no endpoint has a probe-confirmed healthy account (readyz_require_healthy)"
+	}
+	writeError(w, http.StatusServiceUnavailable, "poolgate_not_ready", "not_ready", msg)
+}
+
+func (g *Gateway) writeReady(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(`{"status":"ready"}`))
 }
 
-func (g *Gateway) anyEndpointReady(ctx context.Context) bool {
+// anyEndpointMatches reports whether any endpoint has at least one member account
+// whose state satisfies pred. Secret-free (never surfaces account ids).
+func (g *Gateway) anyEndpointMatches(ctx context.Context, pred func(model.AccountState) bool) bool {
 	names, err := g.store.ListEndpointNames(ctx)
 	if err != nil {
 		return false
 	}
 	for _, name := range names {
-		_, group, accounts, err := g.store.ResolveEndpoint(ctx, name)
+		_, _, accounts, err := g.store.ResolveEndpoint(ctx, name)
 		if err != nil {
 			continue
 		}
-		if len(eligibleAccounts(group, accounts)) > 0 {
-			return true
+		for _, a := range accounts {
+			if pred(a.State) {
+				return true
+			}
 		}
 	}
 	return false

@@ -459,12 +459,12 @@ func TestReadyzNotReadySchemaError(t *testing.T) {
 	}
 }
 
-func TestAnyEndpointReadyListError(t *testing.T) {
+func TestAnyEndpointMatchesListError(t *testing.T) {
 	st, cfg := newStore(t)
 	_ = st.Close()
 	gw := New(st, cfg)
-	if gw.anyEndpointReady(context.Background()) {
-		t.Errorf("anyEndpointReady = true on closed store, want false")
+	if gw.anyEndpointMatches(context.Background(), routable) {
+		t.Errorf("anyEndpointMatches = true on closed store, want false")
 	}
 }
 
