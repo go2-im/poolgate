@@ -425,6 +425,22 @@ CREATE UNIQUE INDEX idx_accounts_account_id ON accounts(account_id) WHERE accoun
 ALTER TABLE accounts ADD COLUMN credential_version INTEGER NOT NULL DEFAULT 0;
 `,
 	},
+	{
+		// v15 — proactive-refresh timestamp. last_refreshed_at records when an
+		// account's credentials were last exercised (online refresh / login / import /
+		// insert), so the health engine can PROACTIVELY refresh an idle account before
+		// its refresh_token lapses from disuse — even with zero client traffic (DESIGN
+		// §12). It is bumped ONLY by credential-token writes, never by state/timing
+		// updates, so it is a true "last token write" time. Existing rows are seeded
+		// from updated_at (a recent value → not immediately due, avoiding a startup
+		// refresh storm; a genuinely-stale account is correctly due). Append-only:
+		// v1–v14 above are never edited.
+		version: 15,
+		sql: `
+ALTER TABLE accounts ADD COLUMN last_refreshed_at TEXT NOT NULL DEFAULT '';
+UPDATE accounts SET last_refreshed_at = updated_at WHERE updated_at <> '';
+`,
+	},
 }
 
 // Migrate applies any migrations whose version is not yet recorded. It is
@@ -696,7 +712,10 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		// id_token is NOT persisted: the chatgpt_account_id claim is extracted into
 		// account_id at import/login and nothing reads the stored token afterward, so
 		// keeping the raw JWT at rest is needless credential exposure. The column is
-		// retained for schema stability but always written empty.
+		// retained for schema stability but always written empty. last_refreshed_at is
+		// intentionally NOT set here (kept out of the column list, like credential_version,
+		// so this INSERT stays valid on older pinned schemas); it defaults to '' and the
+		// health engine treats a fresh account's created_at as its last-write time.
 		a.ID, a.Label, sealedAccess, sealedRefresh, a.AccountID, "",
 		string(a.State), formatTime(a.CreatedAt), formatTime(a.UpdatedAt),
 	); err != nil {
@@ -774,9 +793,9 @@ func (s *Store) UpsertAccountByAccountID(ctx context.Context, a model.Account) (
 		// read it under the lock); a 0-row result means the invariant broke. id_token is
 		// never persisted; label and concurrency_cap are left untouched (operator-owned).
 		res, err := s.db.ExecContext(ctx, `
-UPDATE accounts SET access_token = ?, refresh_token = ?, id_token = '', state = ?, credential_version = ?, updated_at = ?
+UPDATE accounts SET access_token = ?, refresh_token = ?, id_token = '', state = ?, credential_version = ?, updated_at = ?, last_refreshed_at = ?
 WHERE id = ? AND credential_version = ?`,
-			sealedAccess, sealedRefresh, string(model.StateUnknown), target, formatTime(time.Now().UTC()), existingID, curVer)
+			sealedAccess, sealedRefresh, string(model.StateUnknown), target, formatTime(time.Now().UTC()), formatTime(time.Now().UTC()), existingID, curVer)
 		if err != nil {
 			return fmt.Errorf("store: update account by account_id: %w", err) // journal retained for recovery
 		}
@@ -844,7 +863,7 @@ func isUniqueViolation(err error) bool {
 // GetAccount loads and decrypts a single account by id.
 func (s *Store) GetAccount(ctx context.Context, id string) (model.Account, error) {
 	row := s.db.QueryRowContext(ctx, `
-SELECT id, label, access_token, refresh_token, account_id, id_token, state, concurrency_cap, created_at, updated_at, credential_version
+SELECT id, label, access_token, refresh_token, account_id, id_token, state, concurrency_cap, created_at, updated_at, credential_version, last_refreshed_at
 FROM accounts WHERE id = ?`, id)
 	return s.scanAccount(row)
 }
@@ -852,7 +871,7 @@ FROM accounts WHERE id = ?`, id)
 // ListAccounts returns all accounts ordered by creation time then id.
 func (s *Store) ListAccounts(ctx context.Context) ([]model.Account, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, label, access_token, refresh_token, account_id, id_token, state, concurrency_cap, created_at, updated_at, credential_version
+SELECT id, label, access_token, refresh_token, account_id, id_token, state, concurrency_cap, created_at, updated_at, credential_version, last_refreshed_at
 FROM accounts ORDER BY created_at, id`)
 	if err != nil {
 		return nil, fmt.Errorf("store: list accounts: %w", err)
@@ -891,8 +910,8 @@ func (s *Store) UpdateTokens(ctx context.Context, id, accessToken, refreshToken 
 		return fmt.Errorf("store: begin update tokens: %w", err)
 	}
 	res, err := tx.ExecContext(ctx, `
-UPDATE accounts SET access_token = ?, refresh_token = ?, updated_at = ? WHERE id = ?`,
-		sealedAccess, sealedRefresh, formatTime(time.Now().UTC()), id)
+UPDATE accounts SET access_token = ?, refresh_token = ?, updated_at = ?, last_refreshed_at = ? WHERE id = ?`,
+		sealedAccess, sealedRefresh, formatTime(time.Now().UTC()), formatTime(time.Now().UTC()), id)
 	if err != nil {
 		_ = tx.Rollback()
 		return fmt.Errorf("store: update tokens: %w", err)
@@ -934,9 +953,9 @@ func (s *Store) updateTokensCAS(ctx context.Context, id string, base, target int
 		return false, fmt.Errorf("store: begin update tokens cas: %w", err)
 	}
 	res, err := tx.ExecContext(ctx, `
-UPDATE accounts SET access_token = ?, refresh_token = ?, credential_version = ?, updated_at = ?
+UPDATE accounts SET access_token = ?, refresh_token = ?, credential_version = ?, updated_at = ?, last_refreshed_at = ?
 WHERE id = ? AND credential_version = ?`,
-		sealedAccess, sealedRefresh, target, formatTime(time.Now().UTC()), id, base)
+		sealedAccess, sealedRefresh, target, formatTime(time.Now().UTC()), formatTime(time.Now().UTC()), id, base)
 	if err != nil {
 		_ = tx.Rollback()
 		return false, fmt.Errorf("store: update tokens cas: %w", err)
@@ -1013,9 +1032,10 @@ func (s *Store) scanAccount(sc rowScanner) (model.Account, error) {
 		sealedAccess, refresh string
 		state                 string
 		createdAt, updatedAt  string
+		lastRefreshedAt       string
 	)
 	if err := sc.Scan(&a.ID, &a.Label, &sealedAccess, &refresh, &a.AccountID,
-		&a.IDToken, &state, &a.ConcurrencyCap, &createdAt, &updatedAt, &a.CredentialVersion); err != nil {
+		&a.IDToken, &state, &a.ConcurrencyCap, &createdAt, &updatedAt, &a.CredentialVersion, &lastRefreshedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return model.Account{}, ErrNotFound
 		}
@@ -1034,6 +1054,7 @@ func (s *Store) scanAccount(sc rowScanner) (model.Account, error) {
 	a.State = model.AccountState(state)
 	a.CreatedAt = parseTime(createdAt)
 	a.UpdatedAt = parseTime(updatedAt)
+	a.LastRefreshedAt = parseTime(lastRefreshedAt) // "" -> zero time
 	return a, nil
 }
 

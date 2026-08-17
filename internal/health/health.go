@@ -121,6 +121,11 @@ type Schedule struct {
 	JitterFrac      float64       // additive jitter as a fraction of the interval, in [0,1)
 	MaxBackoffLevel int           // cap on the backoff level counter
 	LiveBudget      int           // max small-live-requests per account per rolling 24h
+	// ProactiveRefresh is how stale an account's last credential write may get before
+	// the engine PROACTIVELY refreshes it (rotating the refresh_token) even with no
+	// client traffic, so an idle account's refresh_token cannot lapse from disuse
+	// (DESIGN.md §12). 0 disables proactive refresh.
+	ProactiveRefresh time.Duration
 }
 
 // DefaultQuotaLowThreshold is the default headroom percentage at/below which the
@@ -132,16 +137,17 @@ const DefaultQuotaLowThreshold = 15.0
 // live probing stays opt-in via AllowLive + a LiveProbe).
 func DefaultSchedule() Schedule {
 	return Schedule{
-		OK:              15 * time.Minute,
-		Degraded:        1 * time.Minute,
-		Expired:         30 * time.Minute,
-		Unknown:         30 * time.Second,
-		BackoffCap:      30 * time.Minute,
-		DefaultCooldown: 60 * time.Second,
-		PollInterval:    30 * time.Second,
-		JitterFrac:      0.2,
-		MaxBackoffLevel: 10,
-		LiveBudget:      5,
+		OK:               15 * time.Minute,
+		Degraded:         1 * time.Minute,
+		Expired:          30 * time.Minute,
+		Unknown:          30 * time.Second,
+		BackoffCap:       30 * time.Minute,
+		DefaultCooldown:  60 * time.Second,
+		PollInterval:     30 * time.Second,
+		JitterFrac:       0.2,
+		MaxBackoffLevel:  10,
+		LiveBudget:       5,
+		ProactiveRefresh: 12 * time.Hour,
 	}
 }
 
@@ -183,6 +189,31 @@ type Engine struct {
 	// the authoritative state+timing under this lock before applying its event.
 	acctLocksMu sync.Mutex
 	acctLocks   map[string]*sync.Mutex
+
+	// proactiveAttempt records the last time a proactive refresh was ATTEMPTED per
+	// account (success or failure), so a FAILED attempt still defers the next one by
+	// the interval — otherwise a persistently-failing account would be retried every
+	// tick (last_refreshed_at only advances on success). Guarded by proactiveMu.
+	proactiveMu      sync.Mutex
+	proactiveAttempt map[string]time.Time
+}
+
+// noteProactiveAttempt records now as the last proactive-refresh attempt for id.
+func (e *Engine) noteProactiveAttempt(id string, now time.Time) {
+	e.proactiveMu.Lock()
+	if e.proactiveAttempt == nil {
+		e.proactiveAttempt = make(map[string]time.Time)
+	}
+	e.proactiveAttempt[id] = now
+	e.proactiveMu.Unlock()
+}
+
+// lastProactiveAttempt returns the last recorded proactive-refresh attempt time for
+// id (zero if none).
+func (e *Engine) lastProactiveAttempt(id string) time.Time {
+	e.proactiveMu.Lock()
+	defer e.proactiveMu.Unlock()
+	return e.proactiveAttempt[id]
 }
 
 // lockAccount returns the per-account mutex, locked. The caller must call the
@@ -215,6 +246,14 @@ func WithRand(fn func() float64) Option { return func(e *Engine) { e.rnd = fn } 
 
 // WithSchedule overrides the scheduling parameters.
 func WithSchedule(s Schedule) Option { return func(e *Engine) { e.sched = s } }
+
+// WithProactiveRefresh overrides the proactive-refresh staleness threshold (default
+// from DefaultSchedule; 0 disables). An idle account whose credentials have not been
+// written within this interval is refreshed on the next tick so its refresh_token
+// cannot lapse from disuse.
+func WithProactiveRefresh(d time.Duration) Option {
+	return func(e *Engine) { e.sched.ProactiveRefresh = d }
+}
 
 // WithAuthProbe sets the zero-spend auth-check prober.
 func WithAuthProbe(p AuthProbe) Option { return func(e *Engine) { e.auth = p } }
@@ -856,6 +895,9 @@ func (e *Engine) Tick(ctx context.Context) error {
 		if a.State.Terminal() {
 			continue
 		}
+		// Proactive refresh (independent of probe scheduling): keep an idle account's
+		// refresh_token warm so it can't lapse from disuse (DESIGN.md §12).
+		e.maybeProactiveRefresh(ctx, a, now)
 		t, err := e.store.GetAccountTiming(ctx, a.ID)
 		if err != nil {
 			e.logger.Warn("health: load timing failed", slog.String("account", a.ID), slog.Any("err", err))
@@ -869,6 +911,49 @@ func (e *Engine) Tick(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// maybeProactiveRefresh refreshes an account whose credentials have not been written
+// within sched.ProactiveRefresh, so an idle account's refresh_token is exercised
+// before it lapses from disuse — even with zero client traffic (DESIGN.md §12). It
+// goes through the SHARED single-flight refresher (coalescing with any concurrent
+// hot-path/probe refresh) and the version-CAS commit (so it is generation-safe).
+//
+// It is bounded and non-hammering:
+//   - Only OK/unknown accounts are eligible. cooldown/quota_exhausted are rate-limited
+//     (refreshing adds no value and could add load) and expired accounts are already
+//     re-checked by the auth-check probe on their own cadence — proactively refreshing
+//     a dead-token expired account every tick would hammer the issuer.
+//   - The next attempt is deferred by the interval whether the last one SUCCEEDED
+//     (last_refreshed_at advanced) OR FAILED (proactiveAttempt advanced), so a
+//     persistently-failing account is retried at most once per interval, not every
+//     tick. A failure is logged but is NOT a state transition — a genuinely-dead token
+//     is caught by the scheduled usage-poll/auth-check via the normal 401→expired path.
+func (e *Engine) maybeProactiveRefresh(ctx context.Context, a model.Account, now time.Time) {
+	if e.sched.ProactiveRefresh <= 0 {
+		return
+	}
+	if a.State != model.StateOK && a.State != model.StateUnknown {
+		return
+	}
+	// "Last exercised" is the most recent of: the last successful credential write
+	// (last_refreshed_at, falling back to created_at for a brand-new account) and the
+	// last proactive ATTEMPT (which advances even on failure, bounding retries).
+	gate := a.LastRefreshedAt
+	if gate.IsZero() {
+		gate = a.CreatedAt
+	}
+	if att := e.lastProactiveAttempt(a.ID); att.After(gate) {
+		gate = att
+	}
+	if !gate.IsZero() && now.Sub(gate) < e.sched.ProactiveRefresh {
+		return
+	}
+	e.noteProactiveAttempt(a.ID, now) // record BEFORE the call so a failure also defers
+	if _, err := e.refresher.RefreshAccount(ctx, a); err != nil {
+		e.logger.Warn("health: proactive refresh failed",
+			slog.String("account", a.ID), slog.Any("err", err))
+	}
 }
 
 // NextDue returns the earliest time any non-terminal account is next due, and

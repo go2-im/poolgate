@@ -67,6 +67,12 @@ type Account struct {
 	// refresh_token string could collide across generations (the issuer may not rotate
 	// it), so the version — not the token string — is what disambiguates who won.
 	CredentialVersion int64 `json:"credential_version"`
+	// LastRefreshedAt is when the account's credentials were last written by a token
+	// operation (online refresh, interactive login, file import, or initial insert) —
+	// NOT bumped by state/timing updates. The health engine uses it to PROACTIVELY
+	// refresh an idle account before its refresh_token lapses from disuse, even with
+	// no client traffic (DESIGN.md §12). Zero = never recorded.
+	LastRefreshedAt time.Time `json:"last_refreshed_at"`
 	// ConcurrencyCap is the max simultaneous in-flight upstream requests routed to
 	// this account (0 = unlimited). It backs least-in-flight selection + bounded
 	// backpressure (DESIGN.md §23.1). Persisted in the accounts.concurrency_cap
@@ -301,6 +307,11 @@ type Config struct {
 	//   - "allow-live"      — additionally permit the opt-in small-live-request
 	//     for degraded/recovery checks, bounded by the per-account daily budget.
 	HealthProbeMode string `yaml:"health_probe_mode" json:"health_probe_mode"`
+	// ProactiveTokenRefresh is how stale an account's credentials may get before the
+	// health engine proactively refreshes them (a Go duration string, e.g. "12h"), so
+	// an idle account's refresh_token cannot lapse from disuse even with no client
+	// traffic (DESIGN.md §12). Empty = the built-in default (12h); "0" disables it.
+	ProactiveTokenRefresh string `yaml:"proactive_token_refresh,omitempty" json:"proactive_token_refresh,omitempty"`
 }
 
 // ServerConfig holds the two listener bindings (admin + proxy).
