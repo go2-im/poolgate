@@ -57,8 +57,8 @@ const (
 
 	// maxHeader / maxSealed bound the sizes read from an untrusted bundle so a
 	// corrupt/hostile length prefix cannot trigger a huge allocation.
-	maxHeader = 4 << 10  // 4 KiB — the header is tiny
-	maxSealed = 2 << 30  // 2 GiB — generous cap for the DB snapshot
+	maxHeader = 4 << 10 // 4 KiB — the header is tiny
+	maxSealed = 2 << 30 // 2 GiB — generous cap for the DB snapshot
 )
 
 // ErrPassphrase is returned when the passphrase is wrong or the bundle has been

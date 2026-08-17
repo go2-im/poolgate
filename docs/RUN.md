@@ -257,14 +257,14 @@ attempt never burns it.
 
 ```sh
 # begin — returns {publicKey:{...creation options...}, challenge_id}
-curl -s http://127.0.0.1:7070/admin/register/begin \
+curl -s http://localhost:7070/admin/register/begin \
   -c cookies.txt -H 'Content-Type: application/json' \
   -d '{"bootstrap_token":"pgbt_...from init...","label":"primary"}'
 
 # finish — send the authenticator's attestation back with the same challenge_id.
 # On success: {"authenticated":true,"recovery_codes":[...]} (codes shown ONCE)
 # and a session cookie is set. The bootstrap token is now consumed.
-curl -s http://127.0.0.1:7070/admin/register/finish \
+curl -s http://localhost:7070/admin/register/finish \
   -c cookies.txt -b cookies.txt -H 'Content-Type: application/json' \
   -d '{"bootstrap_token":"pgbt_...","challenge_id":"<from begin>","credential":{...}}'
 ```
@@ -277,11 +277,11 @@ Store the returned recovery codes now — they are shown only once. Register
 
 ```sh
 # begin — returns {publicKey:{...assertion options...}, challenge_id}
-curl -s http://127.0.0.1:7070/admin/login/begin -c cookies.txt \
+curl -s http://localhost:7070/admin/login/begin -c cookies.txt \
   -H 'Content-Type: application/json' -d '{}'
 
 # finish — {"authenticated":true} + session cookie on success.
-curl -s http://127.0.0.1:7070/admin/login/finish -c cookies.txt -b cookies.txt \
+curl -s http://localhost:7070/admin/login/finish -c cookies.txt -b cookies.txt \
   -H 'Content-Type: application/json' \
   -d '{"challenge_id":"<from begin>","credential":{...}}'
 ```
@@ -296,22 +296,22 @@ CSRF-protected mutations need a token from `GET /admin/csrf` (returns
 `{"csrf_token":"..."}`), sent back in the `X-CSRF-Token` header:
 
 ```sh
-CSRF=$(curl -s http://127.0.0.1:7070/admin/csrf -b cookies.txt | jq -r .csrf_token)
+CSRF=$(curl -s http://localhost:7070/admin/csrf -b cookies.txt | jq -r .csrf_token)
 
 # Import an account via the admin API (same core import routine as the CLI):
 # paste the auth.json contents, or point at a path on the host.
-curl -s http://127.0.0.1:7070/admin/api/accounts/import \
+curl -s http://localhost:7070/admin/api/accounts/import \
   -b cookies.txt -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' \
   -d '{"content":"{\"tokens\":{\"access_token\":\"...\",\"refresh_token\":\"...\",\"account_id\":\"...\"}}"}'
 
 # List accounts / usage / health (read views; GET needs no CSRF token):
-curl -s http://127.0.0.1:7070/admin/api/accounts -b cookies.txt
-curl -s http://127.0.0.1:7070/admin/api/usage    -b cookies.txt
-curl -s http://127.0.0.1:7070/admin/api/health   -b cookies.txt
-curl -s http://127.0.0.1:7070/admin/api/status   -b cookies.txt
+curl -s http://localhost:7070/admin/api/accounts -b cookies.txt
+curl -s http://localhost:7070/admin/api/usage    -b cookies.txt
+curl -s http://localhost:7070/admin/api/health   -b cookies.txt
+curl -s http://localhost:7070/admin/api/status   -b cookies.txt
 
 # Revoke every session (e.g. after suspected compromise):
-curl -s http://127.0.0.1:7070/admin/sessions/revoke-all \
+curl -s http://localhost:7070/admin/sessions/revoke-all \
   -b cookies.txt -H "X-CSRF-Token: $CSRF" -X POST
 ```
 

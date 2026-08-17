@@ -25,6 +25,7 @@ package gateway
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -250,13 +251,23 @@ func (g *Gateway) handleResponsesWS(w http.ResponseWriter, r *http.Request) {
 		}
 		triedAny = true
 
-		uc, status, retryAfter, derr := g.dialUpstreamWS(ctx, r, acct, target)
+		uc, status, retryAfter, body, derr := g.dialUpstreamWS(ctx, r, acct, target)
 		if derr != nil {
 			g.inflight.done(acct.ID)
 			rec.trace = append(rec.trace, traceEntry(acct.ID, status))
 			lastStatus = status
 			g.logger.Warn("account ws dial failed pre-accept",
 				"endpoint", endpoint, "account", acct.ID, "status", status)
+			// Parity with the HTTP path: only fail over on retryable statuses
+			// (401/403/408/425/429/5xx) or a network error (status 0). A
+			// non-retryable client error (400/404/422/…) is not an account problem —
+			// relay the upstream handshake response verbatim and stop, instead of
+			// amplifying one bad request across every account and masking it as 502.
+			if status != 0 && !retryableStatus(status) {
+				rec.finish(status, acct, "upstream_"+strconv.Itoa(status), 0, 0)
+				relayWSHandshakeError(w, status, body)
+				return
+			}
 			g.recordFailure(ctx, eligible, byID, view, acct, status, retryAfter)
 			if turnState != "" && acct.ID == pinnedID {
 				g.wsAff.delete(turnState) // only unpin when the PINNED backend failed
@@ -286,7 +297,21 @@ func (g *Gateway) handleResponsesWS(w http.ResponseWriter, r *http.Request) {
 		"all_exhausted", "all accounts failed the websocket handshake (last upstream status "+strconv.Itoa(lastStatus)+")")
 }
 
-// selectWSCandidate picks the next account to try: the affinity-pinned account
+// relayWSHandshakeError writes a non-retryable upstream handshake error back to
+// the client's (not-yet-upgraded) HTTP request, preserving the upstream status
+// and body so the client sees the real error instead of a misleading 502. The
+// WS upgrade never happens, so a plain HTTP response is correct here.
+func relayWSHandshakeError(w http.ResponseWriter, status int, body []byte) {
+	if len(body) > 0 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write(body)
+		return
+	}
+	writeError(w, status, "poolgate_upstream_error", "upstream_error",
+		"upstream rejected the request (status "+strconv.Itoa(status)+")")
+}
+
 // first (once, if still selectable), then the group strategy over the live view.
 func (g *Gateway) selectWSCandidate(group model.PolicyGroup, eligible []model.Account, view *routeView, turnState string, pinnedTried *bool) (model.Account, bool) {
 	if turnState != "" && !*pinnedTried {
@@ -308,7 +333,7 @@ func (g *Gateway) selectWSCandidate(group model.PolicyGroup, eligible []model.Ac
 // header rewrite (Authorization + ChatGPT-Account-ID together) and preserved Codex
 // identity/correlation headers. On failure it returns the upstream HTTP status (0
 // for a transport error) and Retry-After so the caller can drive health/failover.
-func (g *Gateway) dialUpstreamWS(ctx context.Context, r *http.Request, acct model.Account, httpsTarget string) (*websocket.Conn, int, time.Duration, error) {
+func (g *Gateway) dialUpstreamWS(ctx context.Context, r *http.Request, acct model.Account, httpsTarget string) (*websocket.Conn, int, time.Duration, []byte, error) {
 	hdr := http.Header{}
 	hdr.Set("Authorization", "Bearer "+acct.AccessToken)
 	hdr.Set("ChatGPT-Account-ID", acct.AccountID)
@@ -333,14 +358,18 @@ func (g *Gateway) dialUpstreamWS(ctx context.Context, r *http.Request, acct mode
 	if err != nil {
 		status := 0
 		var ra time.Duration
+		var body []byte
 		if resp != nil {
 			status = resp.StatusCode
 			ra = parseRetryAfter(resp.Header.Get("Retry-After"))
+			// Capture the handshake error body so a non-retryable status can be
+			// relayed to the client verbatim (parity with the HTTP path).
+			body, _ = io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 			_ = resp.Body.Close()
 		}
-		return nil, status, ra, err
+		return nil, status, ra, body, err
 	}
-	return uc, 0, 0, nil
+	return uc, 0, 0, nil, nil
 }
 
 // serveWSPair accepts the client upgrade (negotiating the same subprotocol the
@@ -472,4 +501,3 @@ func accountByID(eligible []model.Account, id string) (model.Account, bool) {
 
 // traceEntry formats an "account:status" trace crumb.
 func traceEntry(id string, status int) string { return id + ":" + strconv.Itoa(status) }
-

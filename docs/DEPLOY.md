@@ -179,5 +179,9 @@ docker compose run --rm \
 ```
 
 Provide the passphrase via `POOLGATE_BACKUP_PASSPHRASE` in your host shell (passed
-through with `-e`) or `--passphrase-file`. Restore is atomic and refuses to
-overwrite a live DB; see `poolgate restore -h`.
+through with `-e`) or `--passphrase-file`. Restore verifies the bundle
+(integrity_check + schema + per-column sample decrypt) before committing, stages
+each artifact via temp+fsync+rename, keeps the previous generation for rollback,
+and writes a restore-in-progress marker that `serve` refuses to start past if a
+restore was interrupted mid-commit. It also refuses to overwrite a live DB
+without `--force`; see `poolgate restore -h`.

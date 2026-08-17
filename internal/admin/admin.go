@@ -31,6 +31,7 @@ import (
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
 
+	"github.com/go2-im/poolgate/internal/config"
 	"github.com/go2-im/poolgate/internal/model"
 	"github.com/go2-im/poolgate/internal/store"
 	"github.com/go2-im/poolgate/internal/webauthnsvc"
@@ -144,14 +145,14 @@ type Server struct {
 	skew     ClockSkewSource
 	spa      http.Handler
 
-	origin   string // canonical admin origin (scheme://host[:port]) for CORS
+	origin    string // canonical admin origin (scheme://host[:port]) for CORS
 	extOrigin string // configured external_origin (may be empty when synthesized)
 	proxyBase string // configured proxy base URL (http://host:port), a hint for the client-config generator
-	secure   bool   // set the Secure cookie flag (origin is https)
-	now      func() time.Time
-	logger   *slog.Logger
-	limiter  *limiter
-	recovery int // number of recovery codes minted with the first passkey
+	secure    bool   // set the Secure cookie flag (origin is https)
+	now       func() time.Time
+	logger    *slog.Logger
+	limiter   *limiter
+	recovery  int // number of recovery codes minted with the first passkey
 
 	// anti-brute-force tunables, applied to the limiter in New.
 	limiterMaxFailures int
@@ -202,7 +203,8 @@ func WithTrustedProxies(nets []*net.IPNet) Option {
 
 // WithRecoveryCodeCount overrides how many one-time recovery codes are minted and
 // returned (once) when the first passkey is registered. 0 keeps the default.
-func WithRecoveryCodeCount(n int) Option {	return func(s *Server) {
+func WithRecoveryCodeCount(n int) Option {
+	return func(s *Server) {
 		if n >= 0 {
 			s.recovery = n
 		}
@@ -366,18 +368,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 // synthesized from Host:Port. It never consults request headers (DESIGN.md §0
 // fixes). secure reports whether the scheme is https (drives the cookie flag).
 func resolveOrigin(admin model.ListenConfig) (origin string, secure bool, err error) {
-	origin = strings.TrimSpace(admin.ExternalOrigin)
-	if origin == "" {
-		host := strings.TrimSpace(admin.Host)
-		if host == "" {
-			host = "127.0.0.1"
-		}
-		port := admin.Port
-		if port == 0 {
-			port = 7070
-		}
-		origin = fmt.Sprintf("http://%s:%d", host, port)
-	}
+	origin = config.SynthesizeAdminOrigin(admin)
 	u, perr := url.Parse(origin)
 	if perr != nil || u.Scheme == "" || u.Host == "" {
 		return "", false, fmt.Errorf("admin: invalid admin origin %q", origin)

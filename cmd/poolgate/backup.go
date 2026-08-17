@@ -187,30 +187,78 @@ func cmdRestore(args []string, stdout io.Writer) error {
 			return fmt.Errorf("stage master key: %w", err)
 		}
 	}
-	// Commit: rename the DB first (a rename never truncates the existing file),
-	// then the keyfile. On the vanishingly rare partial-rename failure, re-running
-	// restore recovers.
-	if err := os.Rename(dbTmp, dbPath); err != nil {
+	// Commit the DB + key as a pair with rollback. A restore-in-progress marker is
+	// written first; `poolgate serve` refuses to start while it exists, so a crash
+	// mid-commit is caught before a mismatched DB/key generation (which would fail
+	// to decrypt) is ever used.
+	marker := filepath.Join(cfg.DataDir, restoreMarkerFile)
+	if err := os.WriteFile(marker, []byte("restore in progress\n"), 0o600); err != nil {
 		_ = os.Remove(dbTmp)
 		if writeKey {
 			_ = os.Remove(keyTmp)
 		}
+		return fmt.Errorf("write restore marker: %w", err)
+	}
+
+	// Move the current generation aside (DB + key + its WAL/SHM sidecars) so we can
+	// roll back on failure AND so a stale sidecar is never applied to the new DB
+	// (the restored image has none). Saved copies are removed on success.
+	prev := map[string]string{}
+	saveAside := func(p string) error {
+		if _, err := os.Stat(p); err == nil {
+			bak := p + ".prev"
+			if err := os.Rename(p, bak); err != nil {
+				return err
+			}
+			prev[p] = bak
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return nil
+	}
+	rollback := func() {
+		_ = os.Remove(dbPath)
+		if writeKey {
+			_ = os.Remove(keyPath)
+		}
+		for orig, bak := range prev {
+			_ = os.Rename(bak, orig)
+		}
+		_ = os.Remove(dbTmp)
+		if writeKey {
+			_ = os.Remove(keyTmp)
+		}
+		_ = os.Remove(marker)
+	}
+	aside := []string{dbPath, dbPath + "-wal", dbPath + "-shm"}
+	if writeKey {
+		aside = append(aside, keyPath)
+	}
+	for _, p := range aside {
+		if err := saveAside(p); err != nil {
+			rollback()
+			return fmt.Errorf("stage old %s aside: %w", p, err)
+		}
+	}
+
+	// Install the new generation.
+	if err := os.Rename(dbTmp, dbPath); err != nil {
+		rollback()
 		return fmt.Errorf("commit database: %w", err)
 	}
 	if writeKey {
 		if err := os.Rename(keyTmp, keyPath); err != nil {
-			_ = os.Remove(keyTmp)
-			return fmt.Errorf("commit master key (database already restored — re-run restore with --force): %w", err)
+			rollback()
+			return fmt.Errorf("commit master key: %w", err)
 		}
 	}
-	// Best-effort durability of the renames.
+
+	// Success: clear the marker, fsync the directory, and drop the saved-aside old
+	// generation.
+	_ = os.Remove(marker)
 	syncDir(cfg.DataDir)
-	// Remove any stale WAL sidecars so the restored file is the single source of
-	// truth on next open.
-	for _, sidecar := range []string{dbPath + "-wal", dbPath + "-shm"} {
-		if err := os.Remove(sidecar); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("remove stale %s: %w", sidecar, err)
-		}
+	for _, bak := range prev {
+		_ = os.Remove(bak)
 	}
 
 	fmt.Fprintf(stdout, "restore complete into %s\n", cfg.DataDir)

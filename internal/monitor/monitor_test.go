@@ -91,7 +91,7 @@ func TestHubUnsubscribe(t *testing.T) {
 	if h.subscriberCount() != 0 {
 		t.Fatalf("count after unsub = %d, want 0", h.subscriberCount())
 	}
-	h.Unsubscribe(nil) // idempotent / nil-safe
+	h.Unsubscribe(nil)                      // idempotent / nil-safe
 	h.Publish(model.RequestLog{Model: "x"}) // no subscribers: must not panic/block
 }
 

@@ -143,7 +143,7 @@ func TestCSRFRequiredOnStateChanging(t *testing.T) {
 }
 
 func TestCORSLoopbackAlias(t *testing.T) {
-	h := newHarness(t) // origin resolves to http://127.0.0.1:7070
+	h := newHarness(t) // origin resolves to http://localhost:7070
 	cookie, _ := h.authed()
 
 	// A loopback alias (localhost) on the same scheme+port is accepted, and the

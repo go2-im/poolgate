@@ -218,17 +218,18 @@ func defaultUpstreamTransport() *http.Transport {
 }
 
 // New builds a Gateway over st using cfg (for the upstream allowlist).
-func New(st *store.Store, cfg model.Config, opts ...Option) *Gateway {	g := &Gateway{
-		store:        st,
-		cfg:          cfg,
-		upstreamBase: DefaultUpstreamBase,
-		allowlist:    cfg.UpstreamAllowlist,
-		logger:       slog.Default(),
-		cursors:      make(map[string]*policy.Cursor),
-		inflight:     newInflight(),
-		wsAff:        newWSAffinity(),
-		authFail:     newFailWindow(authAnomalyThreshold, authAnomalyWindow),
-		transport:    normalizeTransport(cfg.Server.Transport),
+func New(st *store.Store, cfg model.Config, opts ...Option) *Gateway {
+	g := &Gateway{
+		store:          st,
+		cfg:            cfg,
+		upstreamBase:   DefaultUpstreamBase,
+		allowlist:      cfg.UpstreamAllowlist,
+		logger:         slog.Default(),
+		cursors:        make(map[string]*policy.Cursor),
+		inflight:       newInflight(),
+		wsAff:          newWSAffinity(),
+		authFail:       newFailWindow(authAnomalyThreshold, authAnomalyWindow),
+		transport:      normalizeTransport(cfg.Server.Transport),
 		retryAfterSecs: 1,
 		// No client Timeout: SSE streams are long-lived; cancellation rides the
 		// request context instead. We DO bound the pre-first-byte phase with a
@@ -528,6 +529,12 @@ func (g *Gateway) recordFailure(ctx context.Context, accounts []model.Account, b
 			accounts[i] = refreshed // retry with rotated token; still selectable.
 		}
 	case status == http.StatusTooManyRequests:
+		// A live 429 is treated as a transient cooldown (OnRateLimited). Quota
+		// exhaustion (quota=0) is NOT distinguishable from a rate-limit on the wire,
+		// so the dedicated OnQuotaExhausted hook is driven by the zero-spend usage
+		// poller (which reads the actual window headroom), not from live traffic:
+		// the account cools down now and the next usage poll promotes it to
+		// quota_exhausted with the correct reset gate if it is truly out of quota.
 		_ = g.health.OnRateLimited(ctx, acct, retryAfter)
 		view.tried[acct.ID] = true
 	case status >= 500:

@@ -69,17 +69,29 @@ func VerifyRestoreBundle(dbBytes, key []byte) error {
 			ver.Int64, CurrentSchemaVersion())
 	}
 
-	// Sample-decrypt one sealed secret to confirm the key matches the ciphertext.
-	var sealed string
-	switch err := db.QueryRowContext(ctx, `SELECT access_token FROM accounts LIMIT 1`).Scan(&sealed); {
-	case errors.Is(err, sql.ErrNoRows):
-		// No accounts to sample — integrity + schema checks are all we can do.
-		return nil
-	case err != nil:
-		return fmt.Errorf("store: read bundle sample secret: %w", err)
+	// Sample-decrypt one value from EACH field-encrypted column class (accounts
+	// access_token + refresh_token, notify_channels config) so the verify catches
+	// a key mismatch AND localized corruption in any one secret class — not just
+	// the first access_token.
+	samples := []struct {
+		query string
+		label string
+	}{
+		{`SELECT access_token FROM accounts WHERE access_token != '' LIMIT 1`, "accounts.access_token"},
+		{`SELECT refresh_token FROM accounts WHERE refresh_token != '' LIMIT 1`, "accounts.refresh_token"},
+		{`SELECT config FROM notify_channels WHERE config != '' LIMIT 1`, "notify_channels.config"},
 	}
-	if _, err := cipher.Open(sealed); err != nil {
-		return errors.New("store: master key does not match this backup's database (bundle key/ciphertext mismatch)")
+	for _, s := range samples {
+		var sealed string
+		switch err := db.QueryRowContext(ctx, s.query).Scan(&sealed); {
+		case errors.Is(err, sql.ErrNoRows):
+			continue // nothing of this class to sample
+		case err != nil:
+			return fmt.Errorf("store: read bundle sample %s: %w", s.label, err)
+		}
+		if _, err := cipher.Open(sealed); err != nil {
+			return fmt.Errorf("store: master key does not match this backup's database (cannot decrypt %s)", s.label)
+		}
 	}
 	return nil
 }

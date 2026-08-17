@@ -29,7 +29,8 @@ func TestChallengeStoreCapEvictsAndSweeps(t *testing.T) {
 	if cs.Len() != 3 {
 		t.Fatalf("Len = %d, want 3", cs.Len())
 	}
-	// Exceeding the cap evicts the oldest rather than growing unbounded.
+	// Exceeding the cap evicts the oldest rather than growing unbounded, and the
+	// eviction is O(1) amortized (no per-Put O(n) sweep).
 	for i := 0; i < 100; i++ {
 		if _, err := cs.Put(&webauthn.SessionData{Challenge: "c"}); err != nil {
 			t.Fatalf("Put over cap: %v", err)
@@ -39,21 +40,27 @@ func TestChallengeStoreCapEvictsAndSweeps(t *testing.T) {
 		t.Fatalf("Len = %d, want <= 3 (cap enforced)", cs.Len())
 	}
 
-	// Expired entries are swept on Put even below the cap.
+	// Expiry for lookups is enforced lazily by Take (not by a per-Put sweep): an
+	// expired challenge is never returned, and an explicit Sweep reclaims it.
 	cs2 := NewChallengeStore(time.Minute, WithChallengeClock(clk.now), WithChallengeMax(1000))
-	if _, err := cs2.Put(&webauthn.SessionData{Challenge: "old"}); err != nil {
+	id, err := cs2.Put(&webauthn.SessionData{Challenge: "old"})
+	if err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	clk.add(2 * time.Minute) // expire it
+	if _, err := cs2.Take(id); err != ErrChallengeNotFound {
+		t.Fatalf("Take(expired) = %v, want ErrChallengeNotFound", err)
+	}
 	if _, err := cs2.Put(&webauthn.SessionData{Challenge: "new"}); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	if cs2.Len() != 1 {
-		t.Fatalf("Len = %d, want 1 (expired entry swept)", cs2.Len())
+	if n := cs2.Sweep(); n < 0 {
+		t.Fatalf("Sweep returned %d", n)
 	}
 }
 
-func TestChallengeStorePutTake(t *testing.T) {	clk := &fakeClock{t: time.Unix(1_700_000_000, 0).UTC()}
+func TestChallengeStorePutTake(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	cs := NewChallengeStore(time.Minute, WithChallengeClock(clk.now))
 
 	sess := &webauthn.SessionData{Challenge: "abc"}

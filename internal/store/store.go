@@ -323,6 +323,17 @@ ALTER TABLE group_members ADD COLUMN weight INTEGER NOT NULL DEFAULT 1;
 ALTER TABLE audit_log ADD COLUMN hash TEXT NOT NULL DEFAULT '';
 `,
 	},
+	{
+		version: 10,
+		sql: `
+-- Remove historical dangling account members left by older builds that deleted
+-- accounts without cleaning group_members. Prevents a deleted account from
+-- breaking endpoint routing for the whole group.
+DELETE FROM group_members
+WHERE member_type = 'account'
+  AND member_id NOT IN (SELECT id FROM accounts);
+`,
+	},
 }
 
 // Migrate applies any migrations whose version is not yet recorded. It is
@@ -821,16 +832,19 @@ FROM accounts WHERE id = ?`, id,
 }
 
 // SetAccountTiming persists the per-account scheduling/backoff state, bumping
-// updated_at. Zero-valued timestamps are written as SQL NULL.
+// updated_at. Zero-valued timestamps are written as SQL NULL. It deliberately
+// does NOT touch concurrency_cap — that is admin-owned config (UpdateAccountMeta),
+// and writing it back here would clobber an operator's just-changed cap with the
+// value the health engine happened to read earlier.
 func (s *Store) SetAccountTiming(ctx context.Context, id string, t model.AccountTiming) error {
 	res, err := s.db.ExecContext(ctx, `
 UPDATE accounts SET
 	cooldown_until = ?, next_probe_at = ?,
-	consecutive_failures = ?, backoff_level = ?, concurrency_cap = ?,
+	consecutive_failures = ?, backoff_level = ?,
 	updated_at = ?
 WHERE id = ?`,
 		nullableTime(t.CooldownUntil), nullableTime(t.NextProbeAt),
-		t.ConsecutiveFailures, t.BackoffLevel, t.ConcurrencyCap,
+		t.ConsecutiveFailures, t.BackoffLevel,
 		formatTime(time.Now().UTC()), id)
 	if err != nil {
 		return fmt.Errorf("store: set account timing: %w", err)
@@ -864,18 +878,19 @@ func (s *Store) GetAccountState(ctx context.Context, id string) (model.AccountSt
 // timing in ONE UPDATE statement, so the two can never be observed or persisted
 // out of sync (previously they were two separate statements — a crash or error
 // between them left state and cooldown inconsistent). Zero-valued timestamps are
-// written as SQL NULL.
+// written as SQL NULL. Like SetAccountTiming it does NOT write concurrency_cap
+// (admin-owned config), so a health transition can't clobber an operator's cap.
 func (s *Store) UpdateStateAndTiming(ctx context.Context, id string, state model.AccountState, t model.AccountTiming) error {
 	res, err := s.db.ExecContext(ctx, `
 UPDATE accounts SET
 	state = ?,
 	cooldown_until = ?, next_probe_at = ?,
-	consecutive_failures = ?, backoff_level = ?, concurrency_cap = ?,
+	consecutive_failures = ?, backoff_level = ?,
 	updated_at = ?
 WHERE id = ?`,
 		string(state),
 		nullableTime(t.CooldownUntil), nullableTime(t.NextProbeAt),
-		t.ConsecutiveFailures, t.BackoffLevel, t.ConcurrencyCap,
+		t.ConsecutiveFailures, t.BackoffLevel,
 		formatTime(time.Now().UTC()), id)
 	if err != nil {
 		return fmt.Errorf("store: update state and timing: %w", err)
@@ -995,7 +1010,7 @@ func scanApiKey(sc rowScanner) (model.ApiKey, error) {
 	return k, nil
 }
 
-// formatExpiry renders an expiry timestamp for storage ('' when zero = never).
+// formatExpiry renders an expiry timestamp for storage (” when zero = never).
 func formatExpiry(t time.Time) string {
 	if t.IsZero() {
 		return ""
@@ -1023,6 +1038,10 @@ func (s *Store) InsertPolicyGroup(ctx context.Context, g model.PolicyGroup) (mod
 		return model.PolicyGroup{}, fmt.Errorf("store: insert group: %w", err)
 	}
 	for i, accID := range g.MemberAccountIDs {
+		if err := assertAccountExistsTx(ctx, tx, accID); err != nil {
+			_ = tx.Rollback()
+			return model.PolicyGroup{}, err
+		}
 		if _, err := tx.ExecContext(ctx, `
 INSERT INTO group_members (group_id, member_type, member_id, position, weight) VALUES (?, ?, ?, ?, ?)`,
 			g.ID, memberTypeAccount, accID, i, g.Weight(accID)); err != nil {
@@ -1034,6 +1053,21 @@ INSERT INTO group_members (group_id, member_type, member_id, position, weight) V
 		return model.PolicyGroup{}, fmt.Errorf("store: commit insert group: %w", err)
 	}
 	return g, nil
+}
+
+// assertAccountExistsTx returns ErrNotFound (wrapped) when member id does not
+// reference a real account, so policy-group writes can't create a dangling
+// member that would degrade routing.
+func assertAccountExistsTx(ctx context.Context, tx *sql.Tx, id string) error {
+	var one int
+	err := tx.QueryRowContext(ctx, `SELECT 1 FROM accounts WHERE id = ?`, id).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("store: policy group member %q does not exist: %w", id, ErrNotFound)
+	}
+	if err != nil {
+		return fmt.Errorf("store: check member %q: %w", id, err)
+	}
+	return nil
 }
 
 // GetPolicyGroup loads a group and its ordered account member ids. Group-typed
@@ -1142,6 +1176,13 @@ func (s *Store) ResolveEndpoint(ctx context.Context, name string) (model.Endpoin
 	for _, id := range group.MemberAccountIDs {
 		a, err := s.GetAccount(ctx, id)
 		if err != nil {
+			// A dangling member (e.g. an account deleted by an older build that did
+			// not clean group_members) is SKIPPED rather than failing the whole
+			// endpoint — other healthy members must still route. A genuine store
+			// error still propagates.
+			if errors.Is(err, ErrNotFound) {
+				continue
+			}
 			return model.Endpoint{}, model.PolicyGroup{}, nil, fmt.Errorf("store: resolve member %q: %w", id, err)
 		}
 		accounts = append(accounts, a)
@@ -1209,10 +1250,15 @@ func newID(prefix string) string {
 // row ids), the session id is ALSO the admin bearer cookie value and the only
 // secret gating authenticated endpoints, so it uses 256 bits of entropy — far
 // beyond any online guessing budget even without a per-request throttle.
-func newSessionID() string {
+// newSessionID mints an admin session id. Unlike newID (64-bit, fine for opaque
+// row ids), the session id is ALSO the admin bearer cookie value and the only
+// secret gating authenticated endpoints, so it uses 256 bits of entropy and FAILS
+// CLOSED: a CSPRNG error returns an error rather than degrading to a predictable
+// timestamp-derived value.
+func newSessionID() (string, error) {
 	var b [32]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		return fmt.Sprintf("sess_%d", time.Now().UnixNano())
+		return "", fmt.Errorf("store: session id entropy: %w", err)
 	}
-	return "sess_" + hex.EncodeToString(b[:])
+	return "sess_" + hex.EncodeToString(b[:]), nil
 }

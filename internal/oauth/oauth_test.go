@@ -29,10 +29,10 @@ type fakeStore struct {
 	gotAccess  string
 	gotRefresh string
 
-	// getAcct, when set, is returned by GetAccount (used to simulate a token that
-	// was already rotated by a concurrent/earlier refresh). When nil, GetAccount
-	// returns getErr (default: a not-found error) so refresh() falls back to the
-	// caller's snapshot — preserving the pre-existing test behavior.
+	// getAcct, when set, is returned by GetAccount (used to simulate the current
+	// stored account). When nil, GetAccount returns getErr (default: a not-found
+	// error). refresh() fails closed on a GetAccount error, so tests that expect a
+	// successful refresh must seed getAcct with the account under refresh.
 	getAcct *model.Account
 	getErr  error
 }
@@ -211,9 +211,10 @@ func TestWithClientID(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	fs := &fakeStore{}
+	acct := model.Account{ID: "acct-1", RefreshToken: "rt-old", State: model.StateOK}
+	fs := &fakeStore{getAcct: &acct}
 	r := NewRefresher(fs, srv.URL, WithHTTPClient(srv.Client()), WithClientID("custom-client"))
-	_, err := r.RefreshAccount(ctx, model.Account{ID: "acct-1", RefreshToken: "rt-old", State: model.StateOK})
+	_, err := r.RefreshAccount(ctx, acct)
 	if err != nil {
 		t.Fatalf("RefreshAccount: %v", err)
 	}
@@ -282,6 +283,32 @@ func TestSingleflightPanicDoesNotWedgeWaiters(t *testing.T) {
 	}
 }
 
+// TestRefreshFailsClosedWhenReReadFails verifies that if the authoritative
+// GetAccount re-read fails, refresh aborts and never sends the caller's
+// (possibly stale) refresh_token to the issuer.
+func TestRefreshFailsClosedWhenReReadFails(t *testing.T) {
+	ctx := context.Background()
+	var issuerHits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		issuerHits++
+		_ = json.NewEncoder(w).Encode(refreshResponse{AccessToken: "at-new"})
+	}))
+	defer srv.Close()
+
+	fs := &fakeStore{getErr: errors.New("db temporarily unavailable")}
+	r := NewRefresher(fs, srv.URL, WithHTTPClient(srv.Client()))
+	_, err := r.RefreshAccount(ctx, model.Account{ID: "acct-1", AccessToken: "at-old", RefreshToken: "rt-old", State: model.StateOK})
+	if err == nil {
+		t.Fatal("refresh must fail closed when the authoritative re-read fails")
+	}
+	if issuerHits != 0 {
+		t.Errorf("issuer hit %d times; must not send the stale refresh_token when re-read failed", issuerHits)
+	}
+	if fs.calls != 0 {
+		t.Errorf("UpdateTokens called %d times; refresh should have aborted", fs.calls)
+	}
+}
+
 // TestRefreshKeepsOldRefreshTokenWhenNotRotated verifies that when the issuer
 // omits a rotated refresh_token, the existing one is preserved and persisted.
 func TestRefreshKeepsOldRefreshTokenWhenNotRotated(t *testing.T) {
@@ -293,9 +320,9 @@ func TestRefreshKeepsOldRefreshTokenWhenNotRotated(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	fs := &fakeStore{}
-	r := NewRefresher(fs, srv.URL, WithHTTPClient(srv.Client()))
 	acct := model.Account{ID: "acct-1", AccessToken: "at-old", RefreshToken: "rt-keep", IDToken: "id-old", State: model.StateOK}
+	fs := &fakeStore{getAcct: &acct}
+	r := NewRefresher(fs, srv.URL, WithHTTPClient(srv.Client()))
 	updated, err := r.RefreshAccount(ctx, acct)
 	if err != nil {
 		t.Fatalf("RefreshAccount: %v", err)
@@ -391,7 +418,7 @@ func TestRefreshErrorPaths(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := context.Background()
-			fs := &fakeStore{err: tt.storeErr}
+			fs := &fakeStore{err: tt.storeErr, getAcct: &tt.acct}
 
 			issuer := tt.issuer
 			var opts []Option

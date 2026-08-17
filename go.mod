@@ -2,6 +2,11 @@ module github.com/go2-im/poolgate
 
 go 1.25.0
 
+// Require the patched toolchain for source builds (not just CI's 'stable'): Go
+// <1.25.13 ships stdlib CVEs govulncheck flags as reachable. `go build`/`go test`
+// auto-select >= this version.
+toolchain go1.25.13
+
 require (
 	github.com/coder/websocket v1.8.15
 	github.com/fxamacker/cbor/v2 v2.9.2

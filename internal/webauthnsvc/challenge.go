@@ -47,6 +47,10 @@ type pendingChallenge struct {
 type ChallengeStore struct {
 	mu    sync.Mutex
 	items map[string]pendingChallenge
+	// order is the insertion order of ids. Because the TTL is constant, insertion
+	// order == expiry order, so the front is always the oldest entry — enabling
+	// O(1) amortized eviction at the cap instead of an O(n) scan on every Put.
+	order []string
 	ttl   time.Duration
 	max   int
 	now   func() time.Time
@@ -104,10 +108,10 @@ func NewChallengeStore(ttl time.Duration, opts ...ChallengeOption) *ChallengeSto
 }
 
 // Put stores session under a fresh random id with expiry now+ttl and returns the
-// id. The caller hands the id back to the browser (opaque) and presents it again
-// at Finish time. Put opportunistically sweeps expired entries and enforces the
-// size cap (evicting the oldest entry when full) so an unauthenticated flood of
-// begin calls cannot grow the map without bound.
+// id. It enforces the size cap by evicting the OLDEST entry (front of the
+// insertion-order queue) in O(1) amortized time, so an unauthenticated flood of
+// begin calls can neither grow the map without bound nor make each request pay an
+// O(n) sweep/scan. Expiry for lookups is still enforced lazily by Take.
 func (c *ChallengeStore) Put(session *webauthn.SessionData) (string, error) {
 	if session == nil {
 		return "", errors.New("webauthnsvc: nil session data")
@@ -118,13 +122,34 @@ func (c *ChallengeStore) Put(session *webauthn.SessionData) (string, error) {
 	}
 	now := c.now().UTC()
 	c.mu.Lock()
-	c.sweepLocked(now)
-	if len(c.items) >= c.max {
-		c.evictOldestLocked()
+	// Evict oldest live entries until under the cap. Front ids that were already
+	// removed by Take are simply skipped (each id is pushed once and popped once,
+	// so this is amortized O(1)).
+	for c.max > 0 && len(c.items) >= c.max && len(c.order) > 0 {
+		oldest := c.order[0]
+		c.order = c.order[1:]
+		delete(c.items, oldest)
+	}
+	// Bound the order slice against Take-removed ids that were never popped.
+	if len(c.order) > 2*c.max && c.max > 0 {
+		c.compactOrderLocked()
 	}
 	c.items[id] = pendingChallenge{session: session, expiresAt: now.Add(c.ttl)}
+	c.order = append(c.order, id)
 	c.mu.Unlock()
 	return id, nil
+}
+
+// compactOrderLocked rebuilds order to contain only ids still present in items,
+// dropping stale entries left by Take. Caller holds c.mu.
+func (c *ChallengeStore) compactOrderLocked() {
+	kept := c.order[:0]
+	for _, id := range c.order {
+		if _, ok := c.items[id]; ok {
+			kept = append(kept, id)
+		}
+	}
+	c.order = kept
 }
 
 // sweepLocked removes expired entries. The caller must hold c.mu.
@@ -133,24 +158,6 @@ func (c *ChallengeStore) sweepLocked(now time.Time) {
 		if !now.Before(item.expiresAt) {
 			delete(c.items, id)
 		}
-	}
-}
-
-// evictOldestLocked removes the entry with the earliest expiry. The caller must
-// hold c.mu and ensure the map is non-empty.
-func (c *ChallengeStore) evictOldestLocked() {
-	var (
-		oldestID string
-		oldestAt time.Time
-		found    bool
-	)
-	for id, item := range c.items {
-		if !found || item.expiresAt.Before(oldestAt) {
-			oldestID, oldestAt, found = id, item.expiresAt, true
-		}
-	}
-	if found {
-		delete(c.items, oldestID)
 	}
 }
 
@@ -179,14 +186,9 @@ func (c *ChallengeStore) Sweep() int {
 	now := c.now().UTC()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	removed := 0
-	for id, item := range c.items {
-		if !now.Before(item.expiresAt) {
-			delete(c.items, id)
-			removed++
-		}
-	}
-	return removed
+	before := len(c.items)
+	c.sweepLocked(now)
+	return before - len(c.items)
 }
 
 // Len returns the current number of stored (not-yet-swept) entries.

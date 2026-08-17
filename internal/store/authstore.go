@@ -144,7 +144,11 @@ func scanWebAuthnCredential(sc rowScanner) (model.WebAuthnCredential, error) {
 // session (with its final ID/timestamps) is returned.
 func (s *Store) InsertSession(ctx context.Context, sess model.Session) (model.Session, error) {
 	if sess.ID == "" {
-		sess.ID = newSessionID()
+		id, err := newSessionID()
+		if err != nil {
+			return model.Session{}, err
+		}
+		sess.ID = id
 	}
 	now := time.Now().UTC()
 	if sess.CreatedAt.IsZero() {

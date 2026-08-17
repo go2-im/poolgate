@@ -131,4 +131,3 @@ func TestRejectsOversizedKDFParams(t *testing.T) {
 		t.Fatalf("oversized KDF params err = %v, want ErrFormat", err)
 	}
 }
-

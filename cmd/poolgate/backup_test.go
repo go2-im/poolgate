@@ -7,7 +7,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/go2-im/poolgate/internal/model"
 )
 
 // TestBackupRestoreRoundTrip provisions a data dir, backs it up, restores into a
@@ -171,7 +174,8 @@ func TestRestoreEnvSourceRefusesKeyMismatch(t *testing.T) {
 // TestRestoreEnvSourceSkipsKeyfile asserts that under master_key_source=env the
 // restore writes the DB but NOT a plaintext master.key (respecting the operator's
 // choice to keep the key off disk), and the restored DB decrypts with the env key.
-func TestRestoreEnvSourceSkipsKeyfile(t *testing.T) {	ctx := context.Background()
+func TestRestoreEnvSourceSkipsKeyfile(t *testing.T) {
+	ctx := context.Background()
 
 	// A stable 32-byte master key supplied via the environment.
 	rawKey := make([]byte, 32)
@@ -269,5 +273,76 @@ func TestBackupRestoreErrors(t *testing.T) {
 	t.Setenv(envBackupPassphrase, "wrong-passphrase")
 	if err := run(ctx, []string{"restore", bundle}, io.Discard, io.Discard); err == nil {
 		t.Fatal("expected restore to fail with the wrong passphrase")
+	}
+}
+
+// TestServeRefusesWithRestoreMarker asserts serve won't start if a restore was
+// interrupted (marker present), before touching the store.
+func TestServeRefusesWithRestoreMarker(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	t.Setenv(envDataDir, dir)
+	if err := os.WriteFile(filepath.Join(dir, restoreMarkerFile), []byte("x"), 0o600); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+	err := run(ctx, []string{"serve"}, io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "interrupted restore") {
+		t.Fatalf("serve err = %v, want interrupted-restore refusal", err)
+	}
+}
+
+// TestRestoreLeavesNoResidue asserts a successful restore removes the marker and
+// the saved-aside previous generation.
+func TestRestoreLeavesNoResidue(t *testing.T) {
+	ctx := context.Background()
+	dirA := t.TempDir()
+	t.Setenv(envDataDir, dirA)
+	if err := run(ctx, []string{"init"}, io.Discard, io.Discard); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	t.Setenv(envBackupPassphrase, "residue-pass")
+	bundle := filepath.Join(t.TempDir(), "r.pgbak")
+	if err := run(ctx, []string{"backup", "--out", bundle}, io.Discard, io.Discard); err != nil {
+		t.Fatalf("backup: %v", err)
+	}
+	// Restore over the same (existing) install with --force so old files are moved
+	// aside and then cleaned up.
+	if err := run(ctx, []string{"restore", bundle, "--force"}, io.Discard, io.Discard); err != nil {
+		t.Fatalf("restore --force: %v", err)
+	}
+	entries, err := os.ReadDir(dirA)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	for _, e := range entries {
+		n := e.Name()
+		if n == restoreMarkerFile || strings.HasSuffix(n, ".prev") || strings.HasSuffix(n, ".tmp") {
+			t.Errorf("restore left residue file %q", n)
+		}
+	}
+}
+
+func TestLoadMasterKeyExisting(t *testing.T) {
+	// env source: returns the env key and never writes a keyfile.
+	dir := t.TempDir()
+	raw := make([]byte, 32)
+	for i := range raw {
+		raw[i] = byte(i + 5)
+	}
+	t.Setenv(envMasterKey, base64.StdEncoding.EncodeToString(raw))
+	got, err := loadMasterKeyExisting(model.Config{DataDir: dir, MasterKeySource: "env"})
+	if err != nil {
+		t.Fatalf("loadMasterKeyExisting(env): %v", err)
+	}
+	if !bytes.Equal(got, raw) {
+		t.Errorf("env key mismatch")
+	}
+	if _, err := os.Stat(filepath.Join(dir, masterKeyFile)); !os.IsNotExist(err) {
+		t.Errorf("env source must not create a keyfile")
+	}
+
+	// keyfile source with no keyfile: hard error (never mints).
+	if _, err := loadMasterKeyExisting(model.Config{DataDir: t.TempDir()}); err == nil {
+		t.Errorf("keyfile source with missing keyfile should error, not mint")
 	}
 }
