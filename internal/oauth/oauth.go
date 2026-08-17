@@ -28,11 +28,15 @@ import (
 // (verified against openai/codex login/src/auth/manager.rs).
 const DefaultClientID = "app_EMoamEEZ73f0CkXaXp7hrann"
 
-// TokenStore is the persistence surface oauth needs: atomic rotation write.
-// *store.Store satisfies it.
+// TokenStore is the persistence surface oauth needs: authoritative re-read, a
+// durable rotation commit, and reconciliation of a previously-journaled rotation.
+// *store.Store satisfies it. CommitRotatedTokens journals the new token before the
+// DB write so a failed write cannot lose it; FlushPendingRotation applies any such
+// journaled-but-unpersisted rotation before this account's stored token is reused.
 type TokenStore interface {
 	GetAccount(ctx context.Context, id string) (model.Account, error)
-	UpdateTokens(ctx context.Context, id, accessToken, refreshToken string) error
+	CommitRotatedTokens(ctx context.Context, id, accessToken, refreshToken string) error
+	FlushPendingRotation(ctx context.Context, id string) error
 }
 
 // Refresher refreshes account access tokens against a pinned issuer, coalescing
@@ -96,6 +100,14 @@ func (r *Refresher) RefreshAccount(ctx context.Context, acct model.Account) (mod
 }
 
 func (r *Refresher) refresh(ctx context.Context, acct model.Account) (model.Account, error) {
+	// Reconcile any rotation that was journaled but not yet persisted (e.g. a prior
+	// DB write failed or was interrupted) BEFORE we read/reuse this account's stored
+	// refresh token. FAIL CLOSED: if the pending rotation cannot be flushed we abort
+	// rather than fall through and resubmit the older DB token, which may be the
+	// already-consumed one and would trip reuse detection, revoking the family.
+	if err := r.store.FlushPendingRotation(ctx, acct.ID); err != nil {
+		return acct, fmt.Errorf("oauth: flush pending rotation: %w", err)
+	}
 	// Re-read the authoritative tokens before refreshing. A staggered caller may
 	// hold a stale account snapshot whose refresh_token was ALREADY rotated (and
 	// possibly single-use-invalidated) by an earlier refresh. Reusing that
@@ -158,9 +170,11 @@ func (r *Refresher) refresh(ctx context.Context, acct model.Account) (model.Acco
 		newRefresh = acct.RefreshToken
 	}
 
-	// Persist ATOMICALLY before returning so waiters never observe a
-	// half-rotated state (DESIGN.md §19.3 / §0 D6).
-	if err := r.store.UpdateTokens(ctx, acct.ID, rr.AccessToken, newRefresh); err != nil {
+	// Persist DURABLY before returning so waiters never observe a half-rotated state
+	// and a failed DB write can never lose the rotated token (DESIGN.md §19.3 / §0
+	// D6): CommitRotatedTokens journals the new token first, then writes the DB, and
+	// only clears the journal on success.
+	if err := r.store.CommitRotatedTokens(ctx, acct.ID, rr.AccessToken, newRefresh); err != nil {
 		return acct, fmt.Errorf("oauth: persist rotated tokens: %w", err)
 	}
 

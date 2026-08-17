@@ -102,6 +102,10 @@ func Open(cfg model.Config, cipher *crypto.Cipher) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	// Reconcile any refresh-token rotation that was journaled but not persisted
+	// before a prior exit, so no request can trigger a refresh with a stale token
+	// that would revoke the account's token family (DESIGN.md §19.3).
+	s.replayTokenRotations(context.Background())
 	return s, nil
 }
 
@@ -361,6 +365,48 @@ ALTER TABLE api_keys ADD COLUMN key_hint TEXT NOT NULL DEFAULT '';
 UPDATE accounts SET id_token = '' WHERE id_token != '';
 `,
 	},
+	{
+		// v13 — deduplicate accounts that share the same upstream account_id and
+		// enforce uniqueness going forward. Two rows with the same account_id share ONE
+		// access/refresh token family; refreshing them independently reuses a rotated
+		// refresh_token and can trip the issuer's reuse detection, revoking the whole
+		// family (DESIGN.md §19.3). Keep the NEWEST row per account_id (freshest
+		// tokens), make the survivor a member of every group its duplicates belonged to
+		// (INSERT OR IGNORE collapses collisions), drop the duplicates' memberships and
+		// the duplicate accounts (cascading usage/health rows), then add a partial
+		// UNIQUE index. Rows with an empty account_id are left untouched and excluded
+		// from the index (they are not yet identified upstream). Append-only: v1–v12
+		// above are never edited.
+		version: 13,
+		sql: `
+CREATE TEMP TABLE _acct_survivor AS
+SELECT account_id, id AS survivor_id FROM (
+	SELECT account_id, id,
+		ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY updated_at DESC, id DESC) AS rn
+	FROM accounts WHERE account_id <> ''
+) WHERE rn = 1;
+
+CREATE TEMP TABLE _acct_dupmap AS
+SELECT a.id AS dup_id, s.survivor_id
+FROM accounts a JOIN _acct_survivor s ON a.account_id = s.account_id
+WHERE a.account_id <> '' AND a.id <> s.survivor_id;
+
+INSERT OR IGNORE INTO group_members (group_id, member_type, member_id, position, weight)
+SELECT gm.group_id, 'account', d.survivor_id, gm.position, gm.weight
+FROM group_members gm
+JOIN _acct_dupmap d ON gm.member_id = d.dup_id AND gm.member_type = 'account';
+
+DELETE FROM group_members
+WHERE member_type = 'account' AND member_id IN (SELECT dup_id FROM _acct_dupmap);
+
+DELETE FROM accounts WHERE id IN (SELECT dup_id FROM _acct_dupmap);
+
+DROP TABLE _acct_dupmap;
+DROP TABLE _acct_survivor;
+
+CREATE UNIQUE INDEX idx_accounts_account_id ON accounts(account_id) WHERE account_id <> '';
+`,
+	},
 }
 
 // Migrate applies any migrations whose version is not yet recorded. It is
@@ -491,9 +537,11 @@ func (s *Store) removePreMigrationSnapshots() error {
 		removed = true
 	}
 	if removed {
-		if d, derr := os.Open(s.dataDir); derr == nil {
-			_ = d.Sync()
-			_ = d.Close()
+		// Make the unlink durable: a crash could otherwise resurrect the directory
+		// entry of a plaintext shadow image we believe we deleted (fail-closed to
+		// match the removal contract above).
+		if err := syncDirStore(s.dataDir); err != nil {
+			return fmt.Errorf("fsync data dir after snapshot removal: %w", err)
 		}
 	}
 	return nil
@@ -578,9 +626,19 @@ func (s *Store) preMigrationSnapshot(ctx context.Context, fromVersion int) error
 		_ = os.Remove(tmp)
 		return fmt.Errorf("chmod snapshot: %w", err)
 	}
+	// fsync the snapshot file and (after rename) the directory entry so the recovery
+	// image is durably on disk BEFORE migrations start mutating the DB — a crash
+	// mid-migration must not leave the "safety net" only in the OS page cache.
+	if err := fsyncFile(tmp); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("fsync snapshot: %w", err)
+	}
 	if err := os.Rename(tmp, final); err != nil {
 		_ = os.Remove(tmp)
 		return err
+	}
+	if err := syncDirStore(s.dataDir); err != nil {
+		return fmt.Errorf("fsync data dir for snapshot: %w", err)
 	}
 	return nil
 }
@@ -627,6 +685,48 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		return model.Account{}, fmt.Errorf("store: insert account: %w", err)
 	}
 	return a, nil
+}
+
+// UpsertAccountByAccountID inserts a, or — when an account with the same non-empty
+// account_id already exists — refreshes THAT row's credentials in place instead of
+// creating a duplicate. Re-importing/re-logging-in the same Codex account thus
+// updates its tokens rather than creating a second row that would share (and
+// independently rotate) the same refresh-token family and eventually revoke it
+// (DESIGN.md §19.3). Accounts with an empty account_id always insert (they are not
+// yet identified upstream). It returns the stored account and whether an existing
+// row was updated (true) vs a new row inserted (false).
+func (s *Store) UpsertAccountByAccountID(ctx context.Context, a model.Account) (model.Account, bool, error) {
+	if a.AccountID == "" {
+		acct, err := s.InsertAccount(ctx, a)
+		return acct, false, err
+	}
+	var existingID string
+	err := s.db.QueryRowContext(ctx, `SELECT id FROM accounts WHERE account_id = ?`, a.AccountID).Scan(&existingID)
+	if errors.Is(err, sql.ErrNoRows) {
+		acct, ierr := s.InsertAccount(ctx, a)
+		return acct, false, ierr
+	}
+	if err != nil {
+		return model.Account{}, false, fmt.Errorf("store: lookup account by account_id: %w", err)
+	}
+	sealedAccess, err := s.cipher.Seal(a.AccessToken)
+	if err != nil {
+		return model.Account{}, false, fmt.Errorf("store: seal access token: %w", err)
+	}
+	sealedRefresh, err := s.cipher.Seal(a.RefreshToken)
+	if err != nil {
+		return model.Account{}, false, fmt.Errorf("store: seal refresh token: %w", err)
+	}
+	// Refresh the existing row's credentials in place, resetting state to unknown so
+	// the health engine re-probes with the new tokens. id_token is never persisted;
+	// label and concurrency_cap are left untouched (operator-owned).
+	if _, err := s.db.ExecContext(ctx, `
+UPDATE accounts SET access_token = ?, refresh_token = ?, id_token = '', state = ?, updated_at = ? WHERE id = ?`,
+		sealedAccess, sealedRefresh, string(model.StateUnknown), formatTime(time.Now().UTC()), existingID); err != nil {
+		return model.Account{}, false, fmt.Errorf("store: update account by account_id: %w", err)
+	}
+	updated, err := s.GetAccount(ctx, existingID)
+	return updated, true, err
 }
 
 // GetAccount loads and decrypts a single account by id.
@@ -1205,6 +1305,73 @@ INSERT INTO group_members (group_id, member_type, member_id, position, weight) V
 		return model.PolicyGroup{}, fmt.Errorf("store: commit insert group: %w", err)
 	}
 	return g, nil
+}
+
+// CreateDefaultResources creates the first-run default policy group (over the given
+// member accounts), the default endpoint bound to it, and one inbound api key — all
+// in a SINGLE transaction, so a partial first-import can never leave an orphaned
+// group or endpoint (which would then block a retry on the group's UNIQUE name).
+// It returns the stored group and key; k.Key keeps the one-time plaintext for the
+// caller to display. The insert SQL mirrors InsertPolicyGroup/InsertEndpoint/
+// InsertApiKey but shares one transaction.
+func (s *Store) CreateDefaultResources(ctx context.Context, g model.PolicyGroup, endpointName string, k model.ApiKey) (model.PolicyGroup, model.ApiKey, error) {
+	if g.ID == "" {
+		g.ID = newID("grp")
+	}
+	if k.ID == "" {
+		k.ID = newID("key")
+	}
+	if k.Endpoints == nil {
+		k.Endpoints = []string{}
+	}
+	if k.IPAllowlist == nil {
+		k.IPAllowlist = []string{}
+	}
+	scopes, err := json.Marshal(k.Endpoints)
+	if err != nil {
+		return model.PolicyGroup{}, model.ApiKey{}, fmt.Errorf("store: marshal key scopes: %w", err)
+	}
+	allow, err := json.Marshal(k.IPAllowlist)
+	if err != nil {
+		return model.PolicyGroup{}, model.ApiKey{}, fmt.Errorf("store: marshal key ip allowlist: %w", err)
+	}
+	k.KeyHash = hashAPIKey(k.Key)
+	k.KeyHint = apiKeyHint(k.Key)
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return model.PolicyGroup{}, model.ApiKey{}, fmt.Errorf("store: begin bootstrap: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO policy_groups (id, name, strategy) VALUES (?, ?, ?)`,
+		g.ID, g.Name, string(g.Strategy)); err != nil {
+		return model.PolicyGroup{}, model.ApiKey{}, fmt.Errorf("store: insert group: %w", err)
+	}
+	for i, accID := range g.MemberAccountIDs {
+		if err := assertAccountExistsTx(ctx, tx, accID); err != nil {
+			return model.PolicyGroup{}, model.ApiKey{}, err
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO group_members (group_id, member_type, member_id, position, weight) VALUES (?, ?, ?, ?, ?)`,
+			g.ID, memberTypeAccount, accID, i, g.Weight(accID)); err != nil {
+			return model.PolicyGroup{}, model.ApiKey{}, fmt.Errorf("store: insert group member: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO endpoints (name, group_id) VALUES (?, ?)`, endpointName, g.ID); err != nil {
+		return model.PolicyGroup{}, model.ApiKey{}, fmt.Errorf("store: insert endpoint: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO api_keys (id, key, key_hint, label, endpoints, expires_at, ip_allowlist) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		k.ID, k.KeyHash, k.KeyHint, k.Label, string(scopes), formatExpiry(k.ExpiresAt), string(allow)); err != nil {
+		return model.PolicyGroup{}, model.ApiKey{}, fmt.Errorf("store: insert api key: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return model.PolicyGroup{}, model.ApiKey{}, fmt.Errorf("store: commit bootstrap: %w", err)
+	}
+	return g, k, nil
 }
 
 // assertAccountExistsTx returns ErrNotFound (wrapped) when member id does not

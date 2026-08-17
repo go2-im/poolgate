@@ -95,3 +95,48 @@ func TestRotateKeyRefusesWhileServing(t *testing.T) {
 		t.Fatalf("rotate aborted at the lock must not write a snapshot, got %d", len(snaps))
 	}
 }
+
+// TestImportRefusedWhileMaintenanceLockHeld asserts import fails fast when another
+// maintenance operation holds the maintenance lock (so it cannot race a rotate-key).
+func TestImportRefusedWhileMaintenanceLockHeld(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	t.Setenv(envDataDir, dir)
+	t.Setenv(envMasterKey, "")
+	if err := run(ctx, []string{"init"}, io.Discard, io.Discard); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	held, err := lock.Acquire(filepath.Join(dir, maintenanceLockFile))
+	if err != nil {
+		t.Fatalf("hold maintenance lock: %v", err)
+	}
+	defer held.Release()
+
+	authPath := writeAuthJSON(t)
+	err = run(ctx, []string{"import", authPath}, io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "maintenance operation") {
+		t.Fatalf("import-while-maintenance error = %v, want a 'maintenance operation' message", err)
+	}
+}
+
+// TestRotateKeyRefusedWhileMaintenanceLockHeld asserts rotate-key fails fast while
+// an import/login/backup (maintenance lock) is in progress — the core race fix.
+func TestRotateKeyRefusedWhileMaintenanceLockHeld(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	t.Setenv(envDataDir, dir)
+	t.Setenv(envMasterKey, "")
+	if err := run(ctx, []string{"init"}, io.Discard, io.Discard); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	held, err := lock.Acquire(filepath.Join(dir, maintenanceLockFile))
+	if err != nil {
+		t.Fatalf("hold maintenance lock: %v", err)
+	}
+	defer held.Release()
+
+	err = run(ctx, []string{"rotate-key"}, io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "maintenance operation") {
+		t.Fatalf("rotate-while-maintenance error = %v, want a 'maintenance operation' message", err)
+	}
+}

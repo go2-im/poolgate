@@ -53,6 +53,16 @@ func cmdRotateKey(_ []string, stdout io.Writer) error {
 	}
 	defer lk.Release()
 
+	// Also take the maintenance lock: import/login/backup do NOT take the
+	// single-instance lock above, so without this a rotate-key could race an
+	// in-flight login/import (sealing a new account under the OLD cipher) or a
+	// backup (pairing an old key with a new-key snapshot).
+	mlk, err := acquireMaintenanceLock(cfg)
+	if err != nil {
+		return err
+	}
+	defer mlk.Release()
+
 	// Open the store with the CURRENT (old) key.
 	oldKey, err := loadMasterKey(cfg)
 	if err != nil {

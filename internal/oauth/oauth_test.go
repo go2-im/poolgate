@@ -19,8 +19,8 @@ import (
 	"github.com/go2-im/poolgate/internal/store"
 )
 
-// fakeStore is a minimal TokenStore that records the last UpdateTokens call and
-// can be programmed to fail, so the persist-error path is exercised without the
+// fakeStore is a minimal TokenStore that records the last CommitRotatedTokens call
+// and can be programmed to fail, so the persist-error path is exercised without the
 // real SQLite store.
 type fakeStore struct {
 	err        error
@@ -28,6 +28,11 @@ type fakeStore struct {
 	gotID      string
 	gotAccess  string
 	gotRefresh string
+
+	// flushErr, when set, is returned by FlushPendingRotation so the fail-closed
+	// pending-flush path can be exercised.
+	flushErr   error
+	flushCalls int
 
 	// getAcct, when set, is returned by GetAccount (used to simulate the current
 	// stored account). When nil, GetAccount returns getErr (default: a not-found
@@ -47,12 +52,17 @@ func (f *fakeStore) GetAccount(_ context.Context, id string) (model.Account, err
 	return model.Account{}, errors.New("not found")
 }
 
-func (f *fakeStore) UpdateTokens(_ context.Context, id, accessToken, refreshToken string) error {
+func (f *fakeStore) CommitRotatedTokens(_ context.Context, id, accessToken, refreshToken string) error {
 	f.calls++
 	f.gotID = id
 	f.gotAccess = accessToken
 	f.gotRefresh = refreshToken
 	return f.err
+}
+
+func (f *fakeStore) FlushPendingRotation(_ context.Context, id string) error {
+	f.flushCalls++
+	return f.flushErr
 }
 
 // newTestStore builds an on-disk store in a temp dir with a random key.
@@ -280,6 +290,36 @@ func TestSingleflightPanicDoesNotWedgeWaiters(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("second Do wedged after a prior panic")
+	}
+}
+
+// TestRefreshFailsClosedWhenPendingFlushFails verifies that if a previously
+// journaled rotation cannot be flushed, refresh aborts BEFORE contacting the issuer
+// and never persists — so it can't resubmit a stale token behind an unresolved
+// pending rotation.
+func TestRefreshFailsClosedWhenPendingFlushFails(t *testing.T) {
+	ctx := context.Background()
+	var issuerHits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		issuerHits++
+		_ = json.NewEncoder(w).Encode(refreshResponse{AccessToken: "at-new", RefreshToken: "rt-new"})
+	}))
+	defer srv.Close()
+
+	acct := model.Account{ID: "acct-1", AccessToken: "at-old", RefreshToken: "rt-old", State: model.StateOK}
+	fs := &fakeStore{getAcct: &acct, flushErr: errors.New("pending rotation stuck")}
+	r := NewRefresher(fs, srv.URL, WithHTTPClient(srv.Client()))
+	if _, err := r.RefreshAccount(ctx, acct); err == nil {
+		t.Fatal("refresh must fail closed when a pending rotation cannot be flushed")
+	}
+	if fs.flushCalls != 1 {
+		t.Errorf("FlushPendingRotation called %d times, want 1", fs.flushCalls)
+	}
+	if issuerHits != 0 {
+		t.Errorf("issuer hit %d times; must not refresh while a pending rotation is unresolved", issuerHits)
+	}
+	if fs.calls != 0 {
+		t.Errorf("CommitRotatedTokens called %d times; refresh should have aborted", fs.calls)
 	}
 }
 

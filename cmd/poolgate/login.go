@@ -47,11 +47,15 @@ func cmdLogin(ctx context.Context, args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	st, err := openStore(cfg)
+	// Hold the maintenance lock for the whole login so a concurrent rotate-key
+	// cannot re-encrypt the DB under us. Open the store only AFTER the (up-to-5-min)
+	// OAuth flow completes, so the cipher/master key we seal the new account with is
+	// the freshest one — never a snapshot captured before a rotation.
+	mlk, err := acquireMaintenanceLock(cfg)
 	if err != nil {
 		return err
 	}
-	defer st.Close()
+	defer mlk.Release()
 
 	ctx, cancel := context.WithTimeout(ctx, loginTimeout)
 	defer cancel()
@@ -64,12 +68,22 @@ func cmdLogin(ctx context.Context, args []string, stdout io.Writer) error {
 		return fmt.Errorf("login: %w", err)
 	}
 
-	acct.Label = "login-" + time.Now().UTC().Format("20060102-150405")
-	acct, err = st.InsertAccount(ctx, acct)
+	st, err := openStore(cfg)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "\nsigned in: account %s (label %q, state %s)\n", acct.ID, acct.Label, acct.State)
+	defer st.Close()
+
+	acct.Label = "login-" + time.Now().UTC().Format("20060102-150405")
+	acct, updated, err := st.UpsertAccountByAccountID(ctx, acct)
+	if err != nil {
+		return err
+	}
+	if updated {
+		fmt.Fprintf(stdout, "\nsigned in: refreshed existing account %s (state %s)\n", acct.ID, acct.State)
+	} else {
+		fmt.Fprintf(stdout, "\nsigned in: account %s (label %q, state %s)\n", acct.ID, acct.Label, acct.State)
+	}
 	if acct.AccountID == "" {
 		fmt.Fprintf(stdout, "warning: the sign-in returned no ChatGPT account id; "+
 			"proxy requests for this account may be rejected until it is set.\n")

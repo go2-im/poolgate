@@ -72,6 +72,14 @@ const (
 	masterKeyFile = "master.key"
 	// lockFile is the single-instance advisory lockfile under the data dir.
 	lockFile = "poolgate.lock"
+	// maintenanceLockFile serializes credential-touching one-shot commands
+	// (import/login/backup/rotate-key/restore) so master-key rotation can never run
+	// concurrently with an in-flight import/login (which would seal a new account
+	// with the OLD cipher) or backup (which would pair an old key with a new-key DB
+	// snapshot). serve deliberately does NOT take it — imports/logins alongside a
+	// running server stay allowed (rotate/restore are already gated off serve by the
+	// single-instance lock above).
+	maintenanceLockFile = ".poolgate.maintenance.lock"
 	// restoreMarkerFile marks an in-progress `poolgate restore`. serve refuses to
 	// start while it exists (a restore was interrupted mid-commit).
 	restoreMarkerFile = ".restore-incomplete"
@@ -472,6 +480,25 @@ func cmdAdminResetAuth(_ []string, stdout io.Writer) error {
 	return nil
 }
 
+// acquireMaintenanceLock takes the maintenance lock (non-blocking) for a
+// credential-touching one-shot command (import/login/backup/rotate-key/restore).
+// It returns a friendly error when another maintenance operation already holds it,
+// so master-key rotation can never overlap an in-flight import/login/backup. The
+// caller must Release() the returned lock.
+func acquireMaintenanceLock(cfg model.Config) (*lock.Lock, error) {
+	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
+		return nil, fmt.Errorf("create data dir: %w", err)
+	}
+	lk, err := lock.Acquire(filepath.Join(cfg.DataDir, maintenanceLockFile))
+	if err != nil {
+		if errors.Is(err, lock.ErrLocked) {
+			return nil, fmt.Errorf("another maintenance operation (import/login/backup/rotate-key/restore) is in progress for %s — retry once it finishes", cfg.DataDir)
+		}
+		return nil, fmt.Errorf("acquire maintenance lock: %w", err)
+	}
+	return lk, nil
+}
+
 // cmdImport parses a Codex auth.json and stores the account. If the store has no
 // policy group / endpoint / key yet, it creates a default group over the imported
 // account (strategy from --strategy, default fallback), a `default` endpoint, and
@@ -486,6 +513,13 @@ func cmdImport(args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
+	// Hold the maintenance lock so a concurrent rotate-key cannot re-encrypt the DB
+	// between opening the store (old cipher) and sealing the imported account.
+	mlk, err := acquireMaintenanceLock(cfg)
+	if err != nil {
+		return err
+	}
+	defer mlk.Release()
 	st, err := openStore(cfg)
 	if err != nil {
 		return err
@@ -498,11 +532,15 @@ func cmdImport(args []string, stdout io.Writer) error {
 		return err
 	}
 	acct.Label = "imported-" + time.Now().UTC().Format("20060102-150405")
-	acct, err = st.InsertAccount(ctx, acct)
+	acct, updated, err := st.UpsertAccountByAccountID(ctx, acct)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "imported account %s (label %q, state %s)\n", acct.ID, acct.Label, acct.State)
+	if updated {
+		fmt.Fprintf(stdout, "updated existing account %s (account_id already present; credentials refreshed)\n", acct.ID)
+	} else {
+		fmt.Fprintf(stdout, "imported account %s (label %q, state %s)\n", acct.ID, acct.Label, acct.State)
+	}
 
 	return bootstrapDefaults(ctx, st, cfg, acct, strategy, stdout)
 }
@@ -519,22 +557,19 @@ func bootstrapDefaults(ctx context.Context, st *store.Store, cfg model.Config, a
 		return err
 	}
 
-	group, err := st.InsertPolicyGroup(ctx, model.PolicyGroup{
+	group := model.PolicyGroup{
 		Name:             defaultGroupName,
 		Strategy:         strategy,
 		MemberAccountIDs: []string{acct.ID},
-	})
-	if err != nil {
-		return err
-	}
-	if _, err := st.InsertEndpoint(ctx, model.Endpoint{Name: defaultEndpointName, GroupID: group.ID}); err != nil {
-		return err
 	}
 	skKey, err := randSKKey()
 	if err != nil {
 		return err
 	}
-	if _, err := st.InsertApiKey(ctx, model.ApiKey{Key: skKey, Label: "default", Endpoints: []string{defaultEndpointName}}); err != nil {
+	// Create the group + endpoint + key atomically so a mid-bootstrap failure can't
+	// leave an orphaned group/endpoint that blocks a retry.
+	if _, _, err = st.CreateDefaultResources(ctx, group, defaultEndpointName,
+		model.ApiKey{Key: skKey, Label: "default", Endpoints: []string{defaultEndpointName}}); err != nil {
 		return err
 	}
 
