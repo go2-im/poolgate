@@ -23,17 +23,50 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/go2-im/poolgate/internal/lock"
 )
 
 // rotationJournalDir is the per-account rotation-journal subdirectory of DataDir.
 const rotationJournalDir = "rotations"
 
+// credentialLockFile is a per-data-dir advisory lock serializing ALL account
+// credential mutations (online refresh commit, login/import replace, delete)
+// ACROSS processes — a live `serve` refresh and a CLI `login` would otherwise
+// clobber the same journal file / interleave DB writes (the in-process OAuth
+// single-flight cannot span separate processes).
+const credentialLockFile = ".credentials.lock"
+
 // rotationJournalEntry is the on-disk journal record. Access/Refresh are SEALED
-// (field-encrypted) exactly like the accounts token columns.
+// (field-encrypted) exactly like the accounts token columns. Seq is a per-account
+// monotonic counter so recovery can pick the NEWEST entry when both a committed
+// <id>.json and a mid-write <id>.json.tmp survive a crash (an older .json must never
+// shadow a newer .tmp — that would restore a stale, already-consumed token).
 type rotationJournalEntry struct {
 	Access  string `json:"access"`
 	Refresh string `json:"refresh"`
 	At      string `json:"at"`
+	Seq     int64  `json:"seq"`
+}
+
+// withCredentialLock runs fn while holding the cross-process credential lock. For an
+// in-memory/test store (no data dir) it just runs fn. The lock is BLOCKING so a
+// concurrent holder is waited out rather than failing the caller. It is NOT
+// reentrant — callers must not nest it (the credential mutators call only lock-free
+// internal helpers underneath).
+func (s *Store) withCredentialLock(fn func() error) error {
+	if s.dataDir == "" {
+		return fn()
+	}
+	if err := os.MkdirAll(s.dataDir, 0o700); err != nil {
+		return fmt.Errorf("store: credential lock dir: %w", err)
+	}
+	lk, err := lock.AcquireBlocking(filepath.Join(s.dataDir, credentialLockFile))
+	if err != nil {
+		return fmt.Errorf("store: acquire credential lock: %w", err)
+	}
+	defer func() { _ = lk.Release() }()
+	return fn()
 }
 
 func (s *Store) rotationsDir() string { return filepath.Join(s.dataDir, rotationJournalDir) }
@@ -54,37 +87,64 @@ func (s *Store) rotationJournalPath(id string) (string, error) {
 }
 
 // CommitRotatedTokens durably persists a rotated (access, refresh) pair for an
-// account: it first writes the fsync'd, encrypted journal entry, then writes the
-// tokens to the DB (with bounded retry on transient contention), and only removes
-// the journal once the DB write succeeds. If the DB write fails the journal is
-// RETAINED so the new token is recoverable (flushed on the next refresh or at the
-// next Open) rather than lost — which would force a reuse of the now-stale token.
-func (s *Store) CommitRotatedTokens(ctx context.Context, id, accessToken, refreshToken string) error {
+// account under the cross-process credential lock. expectedRefresh is the refresh
+// token the caller USED for the upstream rotation; before overwriting, it CAS-checks
+// that the account's current DB refresh token still equals it — if a concurrent
+// login/rotation changed it in the meantime, this commit is SKIPPED (the newer write
+// wins and our now-stale rotation is dropped) rather than clobbering fresh creds.
+// Otherwise it writes the fsync'd journal, writes the DB (bounded retry), and removes
+// the journal only on success; a failed DB write RETAINS the journal for recovery.
+func (s *Store) CommitRotatedTokens(ctx context.Context, id, expectedRefresh, accessToken, refreshToken string) error {
 	if s.dataDir == "" {
 		// No place to journal (in-memory/test store): fall back to a retrying write.
 		return s.updateTokensWithRetry(ctx, id, accessToken, refreshToken)
 	}
-	if err := s.writeRotationJournal(id, accessToken, refreshToken); err != nil {
-		return fmt.Errorf("store: write rotation journal: %w", err)
-	}
-	if err := s.updateTokensWithRetry(ctx, id, accessToken, refreshToken); err != nil {
-		// Journal retained on purpose — the rotated token is durable and will be
-		// flushed later; do NOT remove it.
-		return fmt.Errorf("store: persist rotated tokens (journaled for retry): %w", err)
-	}
-	_ = s.removeRotationJournal(id)
-	return nil
+	return s.withCredentialLock(func() error {
+		// CAS: only overwrite if the DB still holds the token we rotated from. A
+		// concurrent login/import may have replaced it — in that case the fresh creds
+		// win and this rotation (derived from a now-superseded token) is discarded.
+		cur, err := s.GetAccount(ctx, id)
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				_ = s.removeRotationJournal(id)
+				return ErrNotFound
+			}
+			return fmt.Errorf("store: re-read before rotation commit: %w", err)
+		}
+		if cur.RefreshToken != expectedRefresh {
+			// Superseded: drop any journal we may hold and skip the write.
+			_ = s.removeRotationJournal(id)
+			return nil
+		}
+		if err := s.writeRotationJournal(id, accessToken, refreshToken); err != nil {
+			return fmt.Errorf("store: write rotation journal: %w", err)
+		}
+		if err := s.updateTokensWithRetry(ctx, id, accessToken, refreshToken); err != nil {
+			// Journal retained on purpose — the rotated token is durable and will be
+			// flushed later; do NOT remove it.
+			return fmt.Errorf("store: persist rotated tokens (journaled for retry): %w", err)
+		}
+		_ = s.removeRotationJournal(id)
+		return nil
+	})
 }
 
 // FlushPendingRotation applies any pending journaled rotation for an account to the
-// DB and removes the journal on success. It is a no-op when no journal exists. If
-// the account no longer exists (deleted) the moot journal is dropped. Callers must
-// run this BEFORE using an account's DB refresh_token, so a rotation that failed to
-// persist is reconciled instead of resubmitting a stale token.
+// DB and removes the journal on success, under the cross-process credential lock. It
+// is a no-op when no journal exists. If the account no longer exists (deleted) the
+// moot journal is dropped. Callers must run this BEFORE using an account's DB
+// refresh_token, so a rotation that failed to persist is reconciled instead of
+// resubmitting a stale token.
 func (s *Store) FlushPendingRotation(ctx context.Context, id string) error {
 	if s.dataDir == "" {
 		return nil
 	}
+	return s.withCredentialLock(func() error { return s.flushPendingRotationLocked(ctx, id) })
+}
+
+// flushPendingRotationLocked is the body of FlushPendingRotation; the caller holds
+// the credential lock.
+func (s *Store) flushPendingRotationLocked(ctx context.Context, id string) error {
 	entry, ok, err := s.readRotationJournal(id)
 	if err != nil {
 		return err
@@ -123,7 +183,10 @@ func (s *Store) replayTokenRotations(ctx context.Context) {
 
 // writeRotationJournal seals the tokens and writes the journal entry atomically:
 // temp file (write + fsync) -> rename -> fsync dir, so an interrupted write never
-// publishes a partial/plaintext entry.
+// publishes a partial/plaintext entry. The entry gets a per-account monotonic Seq
+// (max of any existing .json/.tmp + 1) so recovery can pick the newest survivor.
+// Callers that mutate credentials hold the credential lock, so the read-then-bump of
+// Seq is race-free across processes.
 func (s *Store) writeRotationJournal(id, accessToken, refreshToken string) error {
 	path, err := s.rotationJournalPath(id)
 	if err != nil {
@@ -142,6 +205,7 @@ func (s *Store) writeRotationJournal(id, accessToken, refreshToken string) error
 	}
 	data, err := json.Marshal(rotationJournalEntry{
 		Access: sealedAccess, Refresh: sealedRefresh, At: formatTime(time.Now().UTC()),
+		Seq: s.nextJournalSeq(path),
 	})
 	if err != nil {
 		return err
@@ -172,25 +236,56 @@ func (s *Store) writeRotationJournal(id, accessToken, refreshToken string) error
 	return syncDirStore(s.rotationsDir())
 }
 
+// nextJournalSeq returns one more than the highest Seq among any existing committed
+// (<id>.json) or mid-write (<id>.json.tmp) entry — best-effort: an unreadable/corrupt
+// candidate contributes 0, so a fresh entry always outranks it.
+func (s *Store) nextJournalSeq(path string) int64 {
+	var maxSeq int64
+	for _, p := range []string{path, path + ".tmp"} {
+		if raw, err := os.ReadFile(p); err == nil {
+			var e rotationJournalEntry
+			if json.Unmarshal(raw, &e) == nil && e.Seq > maxSeq {
+				maxSeq = e.Seq
+			}
+		}
+	}
+	return maxSeq + 1
+}
+
 // readRotationJournal loads and decrypts the pending journal for an account, if any.
-// It prefers the committed <id>.json but falls back to a complete-but-unrenamed
-// <id>.json.tmp — a crash between fsync and rename leaves the ONLY copy of the new
-// token there, so ignoring it would lose the rotation and force a reuse of the stale
-// DB token. A partial/corrupt .tmp surfaces a decode error (the caller leaves it in
-// place, keeping the account blocked rather than silently reusing the old token).
+// When both a committed <id>.json and a mid-write <id>.json.tmp survive a crash it
+// returns the one with the HIGHER Seq (the newest) — an older .json must never shadow
+// a newer .tmp (which would restore a stale, already-consumed token). A candidate
+// that cannot be decoded/decrypted is skipped; if the ONLY candidate is corrupt its
+// error is surfaced so the caller leaves it in place (keeping the account blocked)
+// rather than silently reusing the old DB token.
 func (s *Store) readRotationJournal(id string) (rotationJournalEntry, bool, error) {
 	path, err := s.rotationJournalPath(id)
 	if err != nil {
 		return rotationJournalEntry{}, false, err
 	}
+	var (
+		best     rotationJournalEntry
+		haveBest bool
+		firstErr error
+	)
 	for _, p := range []string{path, path + ".tmp"} {
 		e, ok, rerr := s.readJournalFile(p)
 		if rerr != nil {
-			return rotationJournalEntry{}, false, rerr
+			if firstErr == nil {
+				firstErr = rerr
+			}
+			continue
 		}
-		if ok {
-			return e, true, nil
+		if ok && (!haveBest || e.Seq > best.Seq) {
+			best, haveBest = e, true
 		}
+	}
+	if haveBest {
+		return best, true, nil
+	}
+	if firstErr != nil {
+		return rotationJournalEntry{}, false, firstErr
 	}
 	return rotationJournalEntry{}, false, nil
 }
@@ -217,7 +312,7 @@ func (s *Store) readJournalFile(path string) (rotationJournalEntry, bool, error)
 	if err != nil {
 		return rotationJournalEntry{}, false, fmt.Errorf("store: open journaled refresh: %w", err)
 	}
-	return rotationJournalEntry{Access: access, Refresh: refresh, At: e.At}, true, nil
+	return rotationJournalEntry{Access: access, Refresh: refresh, At: e.At, Seq: e.Seq}, true, nil
 }
 
 // removeRotationJournal deletes an account's journal file(s) — both the committed

@@ -11,5 +11,10 @@ func Acquire(path string) (*Lock, error) {
 	return nil, ErrUnsupported
 }
 
+// AcquireBlocking always returns ErrUnsupported off unix (see Acquire).
+func AcquireBlocking(path string) (*Lock, error) {
+	return nil, ErrUnsupported
+}
+
 // Release is a no-op.
 func (l *Lock) Release() error { return nil }

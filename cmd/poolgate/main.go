@@ -362,7 +362,24 @@ func loadMasterKeyExisting(cfg model.Config) ([]byte, error) {
 
 // openStore loads the master key per cfg.MasterKeySource, builds the cipher, and
 // opens the store (running migrations). Used by import and serve.
+// guardRestoreMarker refuses to proceed while a restore is mid-commit (its marker
+// exists), so no command EXCEPT `restore` opens or CREATES the DB / master key over
+// a half-committed generation (openStore mints a key + DB when absent). restore does
+// its own marker handling and does not route through here.
+func guardRestoreMarker(cfg model.Config) error {
+	if _, err := os.Stat(filepath.Join(cfg.DataDir, restoreMarkerFile)); err == nil {
+		return fmt.Errorf("an interrupted restore is present in %s (%s) — recover it manually (inspect the *.prev files, put the intended DB/master.key/rotations back, delete the marker) before running other commands",
+			cfg.DataDir, restoreMarkerFile)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("check restore marker: %w", err)
+	}
+	return nil
+}
+
 func openStore(cfg model.Config) (*store.Store, error) {
+	if err := guardRestoreMarker(cfg); err != nil {
+		return nil, err
+	}
 	key, err := loadMasterKey(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("load master key: %w", err)

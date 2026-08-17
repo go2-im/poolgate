@@ -5,6 +5,7 @@ package lock
 import (
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // TestAcquireReleaseReacquire covers the core flock lifecycle: acquire succeeds,
@@ -53,5 +54,53 @@ func TestReleaseNil(t *testing.T) {
 	var l *Lock
 	if err := l.Release(); err != nil {
 		t.Fatalf("nil Release: %v", err)
+	}
+}
+
+// TestAcquireBlockingWaitsThenAcquires proves AcquireBlocking waits for a held lock
+// to release rather than failing, then takes it.
+func TestAcquireBlockingWaitsThenAcquires(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cred.lock")
+	held, err := AcquireBlocking(path)
+	if err != nil {
+		t.Fatalf("first AcquireBlocking: %v", err)
+	}
+
+	got := make(chan *Lock, 1)
+	go func() {
+		l, aerr := AcquireBlocking(path) // must block until `held` is released
+		if aerr != nil {
+			t.Errorf("blocking AcquireBlocking: %v", aerr)
+			got <- nil
+			return
+		}
+		got <- l
+	}()
+
+	// The waiter must still be blocked while we hold the lock.
+	select {
+	case <-got:
+		t.Fatal("AcquireBlocking returned while the lock was still held")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := held.Release(); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	select {
+	case l := <-got:
+		if l == nil {
+			t.Fatal("waiter failed to acquire after release")
+		}
+		_ = l.Release()
+	case <-time.After(2 * time.Second):
+		t.Fatal("AcquireBlocking did not acquire after the holder released")
+	}
+}
+
+// TestAcquireBlockingOpenError surfaces an error for an uncreatable path.
+func TestAcquireBlockingOpenError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "no-such-dir", "cred.lock")
+	if _, err := AcquireBlocking(path); err == nil {
+		t.Fatal("expected an error for an uncreatable lockfile path")
 	}
 }

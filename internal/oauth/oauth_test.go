@@ -23,11 +23,12 @@ import (
 // and can be programmed to fail, so the persist-error path is exercised without the
 // real SQLite store.
 type fakeStore struct {
-	err        error
-	calls      int
-	gotID      string
-	gotAccess  string
-	gotRefresh string
+	err         error
+	calls       int
+	gotID       string
+	gotExpected string
+	gotAccess   string
+	gotRefresh  string
 
 	// flushErr, when set, is returned by FlushPendingRotation so the fail-closed
 	// pending-flush path can be exercised.
@@ -52,9 +53,10 @@ func (f *fakeStore) GetAccount(_ context.Context, id string) (model.Account, err
 	return model.Account{}, errors.New("not found")
 }
 
-func (f *fakeStore) CommitRotatedTokens(_ context.Context, id, accessToken, refreshToken string) error {
+func (f *fakeStore) CommitRotatedTokens(_ context.Context, id, expectedRefresh, accessToken, refreshToken string) error {
 	f.calls++
 	f.gotID = id
+	f.gotExpected = expectedRefresh
 	f.gotAccess = accessToken
 	f.gotRefresh = refreshToken
 	return f.err

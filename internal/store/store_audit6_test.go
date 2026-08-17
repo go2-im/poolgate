@@ -142,7 +142,7 @@ func TestCommitRotatedTokensAndFlush(t *testing.T) {
 		t.Fatalf("InsertAccount: %v", err)
 	}
 
-	if err := s.CommitRotatedTokens(ctx, acct.ID, "a1", "r1"); err != nil {
+	if err := s.CommitRotatedTokens(ctx, acct.ID, "r0", "a1", "r1"); err != nil {
 		t.Fatalf("CommitRotatedTokens: %v", err)
 	}
 	got, _ := s.GetAccount(ctx, acct.ID)
@@ -355,24 +355,36 @@ func TestCommitRotatedTokensErrorPaths(t *testing.T) {
 	s := openStoreDir(t, dir)
 	ctx := context.Background()
 
-	// DB write fails for a missing account → error returned AND journal retained.
-	if err := s.CommitRotatedTokens(ctx, "acct_none", "a", "r"); err == nil {
-		t.Fatal("commit for a missing account should error")
-	}
-	if _, ok, _ := s.readRotationJournal("acct_none"); !ok {
-		t.Fatal("journal must be RETAINED when the DB write fails")
-	}
-
-	// A dataDir-less store cannot journal; it falls back to a direct retrying write.
-	acct, err := s.InsertAccount(ctx, model.Account{AccessToken: "a0", RefreshToken: "r0", State: model.StateOK})
+	// Seed a real account. A CAS MISS (expectedRefresh != current) is a no-op: it
+	// must NOT overwrite the row and must leave no journal (a concurrent login won).
+	acct0, err := s.InsertAccount(ctx, model.Account{AccessToken: "a0", RefreshToken: "r0", State: model.StateOK})
 	if err != nil {
 		t.Fatalf("InsertAccount: %v", err)
 	}
+	if err := s.CommitRotatedTokens(ctx, acct0.ID, "STALE", "aX", "rX"); err != nil {
+		t.Fatalf("CAS-miss commit should be a no-op, got %v", err)
+	}
+	if got, _ := s.GetAccount(ctx, acct0.ID); got.RefreshToken != "r0" {
+		t.Fatalf("CAS-miss must not overwrite tokens: %+v", got)
+	}
+	if _, ok, _ := s.readRotationJournal(acct0.ID); ok {
+		t.Fatal("CAS-miss must not leave a journal")
+	}
+	// A missing account → ErrNotFound and no journal created.
+	if err := s.CommitRotatedTokens(ctx, "acct_none", "whatever", "a", "r"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("commit for a missing account = %v, want ErrNotFound", err)
+	}
+	if _, ok, _ := s.readRotationJournal("acct_none"); ok {
+		t.Fatal("missing-account commit must not create a journal")
+	}
+
+	// A dataDir-less store cannot journal; it falls back to a direct retrying write
+	// (no CAS, no journal). expectedRefresh is ignored on this path.
 	bare := &Store{db: s.DB(), cipher: s.cipher, dataDir: ""}
-	if err := bare.CommitRotatedTokens(ctx, acct.ID, "a5", "r5"); err != nil {
+	if err := bare.CommitRotatedTokens(ctx, acct0.ID, "r0", "a5", "r5"); err != nil {
 		t.Fatalf("dataDir-less commit: %v", err)
 	}
-	if got, _ := s.GetAccount(ctx, acct.ID); got.RefreshToken != "r5" {
+	if got, _ := s.GetAccount(ctx, acct0.ID); got.RefreshToken != "r5" {
 		t.Fatalf("dataDir-less commit did not persist: %+v", got)
 	}
 
@@ -419,7 +431,7 @@ func TestRotationJournalMoreErrorBranches(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InsertAccount: %v", err)
 	}
-	if err := s2.CommitRotatedTokens(ctx, acct.ID, "a2", "r2"); err == nil {
+	if err := s2.CommitRotatedTokens(ctx, acct.ID, "r", "a2", "r2"); err == nil {
 		t.Fatal("commit should fail when the journal cannot be written")
 	}
 
@@ -550,7 +562,7 @@ func TestRotationDataDirlessBranches(t *testing.T) {
 		t.Fatalf("bare flush = %v, want nil", err)
 	}
 	// A bare-store commit still surfaces the DB error for a missing account.
-	if err := bare.CommitRotatedTokens(ctx, "acct_missing", "a", "r"); err == nil {
+	if err := bare.CommitRotatedTokens(ctx, "acct_missing", "old", "a", "r"); err == nil {
 		t.Fatal("bare commit for a missing account should error")
 	}
 }

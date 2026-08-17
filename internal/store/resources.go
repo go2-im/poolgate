@@ -18,37 +18,40 @@ import (
 // DeleteAccount removes one account by id. ErrNotFound if it does not exist.
 // Foreign keys ON DELETE CASCADE clean up usage_snapshots / health_checks; the
 // account's group_members rows are removed in the SAME transaction so a deleted
-// account never leaves a dangling member id that would break endpoint routing.
+// account never leaves a dangling member id that would break endpoint routing. The
+// whole delete runs under the credential lock and removes the account's rotation
+// journal FIRST (fail-closed): if the journal can't be dropped we abort BEFORE the
+// irreversible DB delete, so we never report failure on an already-committed delete
+// and never leave an orphan journal blocking backup/rotate.
 func (s *Store) DeleteAccount(ctx context.Context, id string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("store: begin delete account: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM group_members WHERE member_type = ? AND member_id = ?`,
-		memberTypeAccount, id); err != nil {
-		_ = tx.Rollback()
-		return fmt.Errorf("store: clear account group memberships: %w", err)
-	}
-	res, err := tx.ExecContext(ctx, `DELETE FROM accounts WHERE id = ?`, id)
-	if err != nil {
-		_ = tx.Rollback()
-		return fmt.Errorf("store: delete account: %w", err)
-	}
-	if err := oneRow(res, "delete account"); err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("store: commit delete account: %w", err)
-	}
-	// Remove any pending rotation journal for the now-deleted account, fail-closed:
-	// a leftover journal (encrypted for a gone account) would otherwise permanently
-	// block backup / key rotation, which refuse while any journal is pending.
-	if err := s.removeRotationJournal(id); err != nil {
-		return fmt.Errorf("store: remove rotation journal for deleted account: %w", err)
-	}
-	return nil
+	return s.withCredentialLock(func() error {
+		if err := s.removeRotationJournal(id); err != nil {
+			return fmt.Errorf("store: remove rotation journal before delete: %w", err)
+		}
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("store: begin delete account: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM group_members WHERE member_type = ? AND member_id = ?`,
+			memberTypeAccount, id); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("store: clear account group memberships: %w", err)
+		}
+		res, err := tx.ExecContext(ctx, `DELETE FROM accounts WHERE id = ?`, id)
+		if err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("store: delete account: %w", err)
+		}
+		if err := oneRow(res, "delete account"); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("store: commit delete account: %w", err)
+		}
+		return nil
+	})
 }
 
 // ---- api keys -------------------------------------------------------------

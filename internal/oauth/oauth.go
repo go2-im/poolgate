@@ -35,7 +35,7 @@ const DefaultClientID = "app_EMoamEEZ73f0CkXaXp7hrann"
 // journaled-but-unpersisted rotation before this account's stored token is reused.
 type TokenStore interface {
 	GetAccount(ctx context.Context, id string) (model.Account, error)
-	CommitRotatedTokens(ctx context.Context, id, accessToken, refreshToken string) error
+	CommitRotatedTokens(ctx context.Context, id, expectedRefresh, accessToken, refreshToken string) error
 	FlushPendingRotation(ctx context.Context, id string) error
 }
 
@@ -173,8 +173,10 @@ func (r *Refresher) refresh(ctx context.Context, acct model.Account) (model.Acco
 	// Persist DURABLY before returning so waiters never observe a half-rotated state
 	// and a failed DB write can never lose the rotated token (DESIGN.md §19.3 / §0
 	// D6): CommitRotatedTokens journals the new token first, then writes the DB, and
-	// only clears the journal on success.
-	if err := r.store.CommitRotatedTokens(ctx, acct.ID, rr.AccessToken, newRefresh); err != nil {
+	// only clears the journal on success. It also CAS-checks that the account's DB
+	// refresh token is STILL the one we rotated from (acct.RefreshToken) — if a
+	// concurrent login replaced it, the commit is skipped and the fresh creds win.
+	if err := r.store.CommitRotatedTokens(ctx, acct.ID, acct.RefreshToken, rr.AccessToken, newRefresh); err != nil {
 		return acct, fmt.Errorf("oauth: persist rotated tokens: %w", err)
 	}
 

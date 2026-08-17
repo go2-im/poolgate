@@ -335,7 +335,7 @@ Driven by **GoReleaser** + **GitHub Actions**; every channel ships verifiable ar
 
 - **20.1 Portable encrypted bundle:** `poolgate backup` → one self-describing encrypted bundle (accounts+tokens, policies/endpoints/keys, and the master key **re-wrapped under a user passphrase**, not the machine keychain). `poolgate restore` re-wraps into the new host's keychain and verifies a decrypt round-trip.
 - **20.2 Master-key portability:** restore never relies on the machine-bound keychain/DPAPI key; the passphrase-wrapped key in the bundle is the portable root. Naive file-copy backups are documented as non-portable (they only fail at restore time).
-- **20.3 Consistent hot backup:** SQLite `VACUUM INTO` / online-backup API with WAL checkpoint → consistent snapshots under live load.
+- **20.3 Consistent snapshot:** SQLite `VACUUM INTO` / online-backup API with WAL checkpoint → consistent DB snapshots. **v1 backup is OFFLINE:** `poolgate backup` takes the single-instance lock, so `serve` must be stopped — this is deliberate, because the out-of-DB rotation journal (§19.3) is not part of the snapshot and a live refresh could otherwise write a journal between the pending-check and the snapshot (capturing an already-consumed token). **Live/hot backup is deferred** pending a cross-process lock (or journal-carrying bundle) that consistently captures the rotation-journal generation alongside the DB.
 - **20.4 Migration safety:** persisted schema version; **refuse to start** (clear message) when the binary is older than the DB (downgrade guard); **pre-migration auto-snapshot** for rollback; defined seed-from-YAML ↔ DB-of-record reconciliation.
 - **20.5 Scheduled backups (optional):** periodic encrypted snapshots to a configured dir, with retention.
 
