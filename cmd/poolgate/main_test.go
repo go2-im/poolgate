@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -322,4 +323,76 @@ func TestCmdRotateKeyKeyfile(t *testing.T) {
 	if got.AccessToken != "tok-access" || got.RefreshToken != "tok-refresh" {
 		t.Errorf("tokens after rotate = %q/%q, want originals", got.AccessToken, got.RefreshToken)
 	}
+}
+
+// TestCmdRotateKeyEnv covers the master_key_source=env rotate path: it prints the
+// new key + an un-startable-until-updated warning, prunes snapshots, and the DB
+// re-encrypts to the NEW env key.
+func TestCmdRotateKeyEnv(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(envDataDir, dir)
+	if err := os.WriteFile(filepath.Join(dir, configFile), []byte("master_key_source: env\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	k1 := make([]byte, 32)
+	for i := range k1 {
+		k1[i] = byte(i + 2)
+	}
+	t.Setenv(envMasterKey, base64.StdEncoding.EncodeToString(k1))
+	if err := cmdInit(nil, io.Discard); err != nil {
+		t.Fatalf("cmdInit: %v", err)
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	ctx := context.Background()
+	st, err := openStore(cfg)
+	if err != nil {
+		t.Fatalf("openStore: %v", err)
+	}
+	acct, err := st.InsertAccount(ctx, model.Account{AccessToken: "at", RefreshToken: "rt", State: model.StateOK})
+	if err != nil {
+		t.Fatalf("InsertAccount: %v", err)
+	}
+	_ = st.Close()
+
+	var out bytes.Buffer
+	if err := cmdRotateKey(nil, &out); err != nil {
+		t.Fatalf("cmdRotateKey(env): %v", err)
+	}
+	if !strings.Contains(out.String(), "FAIL to start") {
+		t.Errorf("env rotate output missing the un-startable warning: %s", out.String())
+	}
+	// env source must NOT write a keyfile.
+	if _, err := os.Stat(filepath.Join(dir, masterKeyFile)); !os.IsNotExist(err) {
+		t.Errorf("env rotate unexpectedly wrote a keyfile")
+	}
+	// Extract the printed NEW key and confirm the DB decrypts under it.
+	newKey := parseRotatedKey(t, out.String())
+	t.Setenv(envMasterKey, newKey)
+	cfg2, _ := loadConfig()
+	st2, err := openStore(cfg2)
+	if err != nil {
+		t.Fatalf("openStore under new env key: %v", err)
+	}
+	defer st2.Close()
+	got, err := st2.GetAccount(ctx, acct.ID)
+	if err != nil || got.AccessToken != "at" {
+		t.Fatalf("GetAccount under new key = %+v, err %v", got, err)
+	}
+}
+
+// parseRotatedKey extracts the base64 key printed on its own indented line by the
+// env-source rotate output.
+func parseRotatedKey(t *testing.T, out string) string {
+	t.Helper()
+	for _, ln := range strings.Split(out, "\n") {
+		s := strings.TrimSpace(ln)
+		if len(s) >= 40 && !strings.Contains(s, " ") {
+			return s
+		}
+	}
+	t.Fatalf("no key line found in output:\n%s", out)
+	return ""
 }

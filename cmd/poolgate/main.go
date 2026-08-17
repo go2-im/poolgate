@@ -72,6 +72,9 @@ const (
 	masterKeyFile = "master.key"
 	// lockFile is the single-instance advisory lockfile under the data dir.
 	lockFile = "poolgate.lock"
+	// restoreMarkerFile marks an in-progress `poolgate restore`. serve refuses to
+	// start while it exists (a restore was interrupted mid-commit).
+	restoreMarkerFile = ".restore-incomplete"
 	// configFile is the YAML config name under the data dir.
 	configFile = "config.yaml"
 	// envMasterKey is the env var read when master_key_source=env.
@@ -578,6 +581,15 @@ func cmdServe(ctx context.Context, _ []string, stdout io.Writer) error {
 	// it is never left stale).
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		return fmt.Errorf("create data dir: %w", err)
+	}
+	// Refuse to start if a restore was interrupted mid-commit: the DB and keyfile
+	// could belong to different generations. The operator recovers by re-running
+	// `poolgate restore` (the previous generation is preserved as *.prev files).
+	if _, err := os.Stat(filepath.Join(cfg.DataDir, restoreMarkerFile)); err == nil {
+		return fmt.Errorf("an interrupted restore was detected in %s (%s present) — re-run `poolgate restore` to finish; the previous generation is kept as *.prev files",
+			cfg.DataDir, restoreMarkerFile)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("check restore marker: %w", err)
 	}
 	lk, err := lock.Acquire(filepath.Join(cfg.DataDir, lockFile))
 	if err != nil {
