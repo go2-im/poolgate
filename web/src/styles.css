@@ -237,6 +237,11 @@ th.sortable:hover {
   margin: 0 0 4px;
 }
 
+.section h4 {
+  font-size: 13px;
+  margin: 18px 0 4px;
+}
+
 .divider {
   display: flex;
   align-items: center;

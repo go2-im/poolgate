@@ -149,11 +149,15 @@ type Server struct {
 
 	// oauthLogin drives the optional admin-UI "sign in with ChatGPT" account
 	// import. When nil, the /admin/api/accounts/login/* endpoints return 503.
-	// oauthMu guards oauthState, the single in-flight/most-recent login (the
-	// loopback callback port is exclusive, so only one runs at a time).
-	oauthLogin OAuthLogin
-	oauthMu    sync.Mutex
-	oauthState *oauthLoginState
+	// oauthMu guards oauthState, the single in-flight/most-recent loopback login
+	// (the loopback callback port is exclusive, so only one runs at a time).
+	// manualMu guards manualLogins, the bounded set of pending headless (paste)
+	// logins keyed by login id — these bind no port, so several may be outstanding.
+	oauthLogin   OAuthLogin
+	oauthMu      sync.Mutex
+	oauthState   *oauthLoginState
+	manualMu     sync.Mutex
+	manualLogins map[string]manualLoginEntry
 
 	origin    string // canonical admin origin (scheme://host[:port]) for CORS
 	extOrigin string // configured external_origin (may be empty when synthesized)
@@ -337,6 +341,8 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /admin/api/accounts/import", s.guard(s.handleAccountImport))
 	mux.HandleFunc("POST /admin/api/accounts/login/begin", s.guard(s.handleAccountLoginBegin))
 	mux.HandleFunc("GET /admin/api/accounts/login/status", s.guard(s.handleAccountLoginStatus))
+	mux.HandleFunc("POST /admin/api/accounts/login/manual/begin", s.guard(s.handleAccountLoginManualBegin))
+	mux.HandleFunc("POST /admin/api/accounts/login/manual/complete", s.guard(s.handleAccountLoginManualComplete))
 	mux.HandleFunc("GET /admin/api/accounts", s.guard(s.handleAccountsList))
 	mux.HandleFunc("GET /admin/api/accounts/{id}", s.guard(s.handleAccountGet))
 	mux.HandleFunc("PATCH /admin/api/accounts/{id}", s.guard(s.handleAccountPatch))

@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
 import {
   beginOAuthLogin,
+  beginOAuthLoginManual,
+  completeOAuthLoginManual,
   deleteAccount,
   importAccount,
   listAccounts,
@@ -31,6 +33,12 @@ export function Accounts() {
   const [oauthLabel, setOauthLabel] = useState('')
   const [oauthBusy, setOauthBusy] = useState(false)
   const [oauthMsg, setOauthMsg] = useState('')
+  // Headless (paste) flow state, for a browser not on the poolgate host.
+  const [manualId, setManualId] = useState('')
+  const [manualUrl, setManualUrl] = useState('')
+  const [manualPaste, setManualPaste] = useState('')
+  const [manualBusy, setManualBusy] = useState(false)
+  const [manualMsg, setManualMsg] = useState('')
 
   async function load() {
     setErr('')
@@ -130,6 +138,42 @@ export function Accounts() {
     }
   }
 
+  // doManualBegin starts the headless flow: it fetches an authorize URL and opens
+  // it, then the operator pastes back the redirect URL to complete.
+  async function doManualBegin() {
+    setErr('')
+    setManualBusy(true)
+    setManualMsg('')
+    try {
+      const { login_id, authorize_url } = await beginOAuthLoginManual(oauthLabel.trim())
+      setManualId(login_id)
+      setManualUrl(authorize_url)
+      window.open(authorize_url, '_blank', 'noopener,noreferrer')
+      setManualMsg('Signed in? Paste the redirected URL below.')
+    } catch (e) {
+      setErr(errMessage(e))
+    } finally {
+      setManualBusy(false)
+    }
+  }
+
+  async function doManualComplete() {
+    setErr('')
+    setManualBusy(true)
+    try {
+      await completeOAuthLoginManual(manualId, manualPaste.trim())
+      setManualId('')
+      setManualUrl('')
+      setManualPaste('')
+      setManualMsg('')
+      await load()
+    } catch (e) {
+      setErr(errMessage(e))
+    } finally {
+      setManualBusy(false)
+    }
+  }
+
   async function doDelete(id: string) {
     if (!confirm(`Delete account ${id}? This cannot be undone.`)) return
     setErr('')
@@ -202,9 +246,7 @@ export function Accounts() {
         <h3>Sign in with ChatGPT</h3>
         <p className="muted">
           Add an account by signing in through the browser (OAuth) instead of pasting a{' '}
-          <code>auth.json</code>. This opens a ChatGPT sign-in tab and completes on a loopback
-          callback, so it only works when this browser is on the poolgate host (or you tunnel
-          ports&nbsp;1455/1457).
+          <code>auth.json</code>.
         </p>
         <label htmlFor="oauth-label">Label (optional)</label>
         <input
@@ -214,12 +256,53 @@ export function Accounts() {
           onChange={(e) => setOauthLabel(e.target.value)}
           placeholder="e.g. pro-account-2"
           autoComplete="off"
-          disabled={oauthBusy}
+          disabled={oauthBusy || manualBusy}
         />
-        <button disabled={oauthBusy} onClick={doOAuthLogin}>
+
+        <h4>On this machine</h4>
+        <p className="muted">
+          Use this when the browser is on the poolgate host. It opens a sign-in tab and completes
+          automatically on a loopback callback.
+        </p>
+        <button disabled={oauthBusy || manualBusy} onClick={doOAuthLogin}>
           {oauthBusy ? 'Signing in…' : 'Sign in with ChatGPT'}
         </button>
         {oauthMsg && <p className="hint">{oauthMsg}</p>}
+
+        <h4>On another machine (remote)</h4>
+        <p className="muted">
+          Use this over a reverse proxy / SSH when the browser is not on the poolgate host. After
+          you sign in, the browser is sent to a <code>http://localhost:1455/…</code> page that
+          won&rsquo;t load — copy that full address from the address bar and paste it below.
+        </p>
+        {!manualUrl ? (
+          <button disabled={oauthBusy || manualBusy} onClick={doManualBegin}>
+            {manualBusy ? 'Starting…' : 'Get sign-in link'}
+          </button>
+        ) : (
+          <>
+            <p className="hint">
+              A sign-in tab was opened. If it didn&rsquo;t,{' '}
+              <a href={manualUrl} target="_blank" rel="noopener noreferrer">
+                use this link
+              </a>
+              .
+            </p>
+            <label htmlFor="oauth-paste">Redirected URL</label>
+            <textarea
+              id="oauth-paste"
+              className="mono"
+              rows={3}
+              value={manualPaste}
+              onChange={(e) => setManualPaste(e.target.value)}
+              placeholder="http://localhost:1455/auth/callback?code=…&state=…"
+            />
+            <button disabled={manualBusy || manualPaste.trim() === ''} onClick={doManualComplete}>
+              {manualBusy ? 'Completing…' : 'Complete sign-in'}
+            </button>
+          </>
+        )}
+        {manualMsg && <p className="hint">{manualMsg}</p>}
       </div>
 
       <div className="section">
