@@ -930,6 +930,10 @@ func buildAdminHandler(cfg model.Config, st *store.Store, logger *slog.Logger, n
 		return nil, fmt.Errorf("webauthn: %w", err)
 	}
 	opts := []admin.Option{admin.WithNotifier(notifier), admin.WithMonitor(mon), admin.WithLogger(logger)}
+	// Interactive "sign in with ChatGPT" account import from the admin UI. Uses the
+	// same pinned OAuth flow as the `poolgate login` CLI; the loopback callback
+	// (127.0.0.1:1455/1457) requires the operator's browser to be on this host.
+	opts = append(opts, admin.WithOAuthLogin(oauth.NewLogin()))
 	if skew != nil {
 		opts = append(opts, admin.WithClockSkew(skew))
 	}
