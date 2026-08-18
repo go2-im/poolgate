@@ -29,6 +29,7 @@ func TestWebAuthnCredentialCRUD(t *testing.T) {
 		SignCount:  5,
 		AAGUID:     []byte{0xff},
 		Transports: []string{"usb", "hybrid"},
+		Flags:      0x1d, // UP|UV|BE|BS (a synced/backup-eligible passkey)
 		Label:      "phone",
 	}
 	got, err := s.InsertWebAuthnCredential(ctx, c)
@@ -49,6 +50,9 @@ func TestWebAuthnCredentialCRUD(t *testing.T) {
 	}
 	if loaded.ID != got.ID || loaded.SignCount != 5 || loaded.Label != "phone" {
 		t.Fatalf("loaded mismatch: %+v", loaded)
+	}
+	if loaded.Flags != 0x1d {
+		t.Fatalf("loaded Flags = %#x, want 0x1d (round-trip of BE/BS flags)", loaded.Flags)
 	}
 	if len(loaded.Transports) != 2 || loaded.Transports[0] != "usb" {
 		t.Fatalf("transports mismatch: %+v", loaded.Transports)
@@ -79,6 +83,9 @@ func TestWebAuthnCredentialCRUD(t *testing.T) {
 	list, err := s.ListWebAuthnCredentials(ctx)
 	if err != nil || len(list) != 1 {
 		t.Fatalf("ListWebAuthnCredentials = %d, %v; want 1, nil", len(list), err)
+	}
+	if list[0].Flags != 0x1d {
+		t.Fatalf("listed Flags = %#x, want 0x1d", list[0].Flags)
 	}
 
 	// Duplicate cred_id is rejected by the UNIQUE constraint.

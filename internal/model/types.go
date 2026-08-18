@@ -281,7 +281,11 @@ func (t BootstrapToken) Used() bool { return !t.UsedAt.IsZero() }
 // WebAuthnCredential is a registered passkey (DESIGN.md §8 / §16). CredID and
 // PublicKey are opaque WebAuthn byte blobs; SignCount guards against cloned
 // authenticators; Transports is the authenticator's advertised transport list.
-// The WebAuthn ceremony logic lands in a later stage — this stage only persists.
+// Flags is the raw authenticator-data flags byte recorded at registration (UP /
+// UV / BE / BS); it MUST be persisted so login can enforce go-webauthn's
+// Backup-Eligible consistency check — a synced passkey (iCloud Keychain, password
+// managers) asserts BE=1, and a stored BE=0 (the pre-flags default) makes every
+// login fail with a BE-flag inconsistency.
 type WebAuthnCredential struct {
 	ID         string    `json:"id"`
 	CredID     []byte    `json:"cred_id"`
@@ -289,6 +293,7 @@ type WebAuthnCredential struct {
 	SignCount  uint32    `json:"sign_count"`
 	AAGUID     []byte    `json:"aaguid"`
 	Transports []string  `json:"transports"`
+	Flags      byte      `json:"flags"`
 	Label      string    `json:"label"`
 	CreatedAt  time.Time `json:"created_at"`
 }
