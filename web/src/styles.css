@@ -232,6 +232,35 @@ th.sortable:hover {
   margin: 0 0 4px;
 }
 
+.section h3 {
+  font-size: 14px;
+  margin: 0 0 4px;
+}
+
+.divider {
+  display: flex;
+  align-items: center;
+  text-align: center;
+  color: var(--muted);
+  font-size: 12px;
+  margin: 22px 0 16px;
+}
+
+.divider::before,
+.divider::after {
+  content: '';
+  flex: 1;
+  border-top: 1px solid var(--border);
+}
+
+.divider::before {
+  margin-right: 12px;
+}
+
+.divider::after {
+  margin-left: 12px;
+}
+
 .pill {
   display: inline-block;
   padding: 2px 8px;

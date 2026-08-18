@@ -217,6 +217,25 @@ export interface Account {
 export const listAccounts = () => get<{ accounts: Account[] }>('/admin/api/accounts')
 export const importAccount = (content: string, label: string) =>
   mutate<Account>('POST', '/admin/api/accounts/import', { content, label })
+
+// ---- interactive OAuth login ("sign in with ChatGPT") ----
+//
+// begin starts the browser OAuth flow and returns an authorize URL to open plus a
+// login id; the SPA opens the URL, then polls oauthLoginStatus until the callback
+// completes. The loopback callback (127.0.0.1:1455/1457) requires the browser to
+// be on the poolgate host.
+export interface OAuthLoginBegin {
+  login_id: string
+  authorize_url: string
+}
+export type OAuthLoginStatus =
+  | { status: 'pending' }
+  | { status: 'success'; account: Account }
+  | { status: 'error'; error: string }
+export const beginOAuthLogin = (label: string) =>
+  mutate<OAuthLoginBegin>('POST', '/admin/api/accounts/login/begin', { label })
+export const oauthLoginStatus = (id: string) =>
+  get<OAuthLoginStatus>('/admin/api/accounts/login/status?id=' + encodeURIComponent(id))
 export const patchAccount = (id: string, patch: { label?: string; concurrency_cap?: number }) =>
   mutate<Account>('PATCH', `/admin/api/accounts/${encodeURIComponent(id)}`, patch)
 export const deleteAccount = (id: string) =>

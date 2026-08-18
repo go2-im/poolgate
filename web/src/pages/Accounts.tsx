@@ -1,6 +1,16 @@
 import { useEffect, useMemo, useState } from 'react'
-import { deleteAccount, importAccount, listAccounts, patchAccount, type Account } from '../api'
+import {
+  beginOAuthLogin,
+  deleteAccount,
+  importAccount,
+  listAccounts,
+  oauthLoginStatus,
+  patchAccount,
+  type Account,
+} from '../api'
 import { errMessage, stateClass } from './ui'
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 type SortKey = 'label' | 'state' | 'account_id' | 'created_at'
 
@@ -17,6 +27,10 @@ export function Accounts() {
   const [editId, setEditId] = useState('')
   const [editLabel, setEditLabel] = useState('')
   const [editCap, setEditCap] = useState('')
+  // Interactive "sign in with ChatGPT" (OAuth) state.
+  const [oauthLabel, setOauthLabel] = useState('')
+  const [oauthBusy, setOauthBusy] = useState(false)
+  const [oauthMsg, setOauthMsg] = useState('')
 
   async function load() {
     setErr('')
@@ -76,6 +90,43 @@ export function Accounts() {
       setErr(errMessage(e))
     } finally {
       setBusy(false)
+    }
+  }
+
+  // doOAuthLogin starts the interactive browser sign-in, opens the authorize URL
+  // in a new tab, then polls until the loopback callback completes. Only works
+  // when this browser is on the poolgate host (the callback lands on 127.0.0.1).
+  async function doOAuthLogin() {
+    setErr('')
+    setOauthBusy(true)
+    setOauthMsg('Starting sign-in…')
+    try {
+      const { login_id, authorize_url } = await beginOAuthLogin(oauthLabel.trim())
+      window.open(authorize_url, '_blank', 'noopener,noreferrer')
+      setOauthMsg('A sign-in tab was opened — complete it there. Waiting…')
+      const deadline = Date.now() + 5 * 60 * 1000
+      while (Date.now() < deadline) {
+        await sleep(1500)
+        const st = await oauthLoginStatus(login_id)
+        if (st.status === 'success') {
+          setOauthMsg('')
+          setOauthLabel('')
+          await load()
+          return
+        }
+        if (st.status === 'error') {
+          setErr(st.error)
+          setOauthMsg('')
+          return
+        }
+      }
+      setErr('sign-in timed out')
+      setOauthMsg('')
+    } catch (e) {
+      setErr(errMessage(e))
+      setOauthMsg('')
+    } finally {
+      setOauthBusy(false)
     }
   }
 
@@ -145,6 +196,30 @@ export function Accounts() {
         <button disabled={busy || content.trim() === ''} onClick={doImport}>
           {busy ? 'Importing…' : 'Import account'}
         </button>
+
+        <div className="divider">or</div>
+
+        <h3>Sign in with ChatGPT</h3>
+        <p className="muted">
+          Add an account by signing in through the browser (OAuth) instead of pasting a{' '}
+          <code>auth.json</code>. This opens a ChatGPT sign-in tab and completes on a loopback
+          callback, so it only works when this browser is on the poolgate host (or you tunnel
+          ports&nbsp;1455/1457).
+        </p>
+        <label htmlFor="oauth-label">Label (optional)</label>
+        <input
+          id="oauth-label"
+          type="text"
+          value={oauthLabel}
+          onChange={(e) => setOauthLabel(e.target.value)}
+          placeholder="e.g. pro-account-2"
+          autoComplete="off"
+          disabled={oauthBusy}
+        />
+        <button disabled={oauthBusy} onClick={doOAuthLogin}>
+          {oauthBusy ? 'Signing in…' : 'Sign in with ChatGPT'}
+        </button>
+        {oauthMsg && <p className="hint">{oauthMsg}</p>}
       </div>
 
       <div className="section">

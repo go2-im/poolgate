@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-webauthn/webauthn/protocol"
@@ -146,6 +147,14 @@ type Server struct {
 	skew     ClockSkewSource
 	spa      http.Handler
 
+	// oauthLogin drives the optional admin-UI "sign in with ChatGPT" account
+	// import. When nil, the /admin/api/accounts/login/* endpoints return 503.
+	// oauthMu guards oauthState, the single in-flight/most-recent login (the
+	// loopback callback port is exclusive, so only one runs at a time).
+	oauthLogin OAuthLogin
+	oauthMu    sync.Mutex
+	oauthState *oauthLoginState
+
 	origin    string // canonical admin origin (scheme://host[:port]) for CORS
 	extOrigin string // configured external_origin (may be empty when synthesized)
 	proxyBase string // configured proxy base URL (http://host:port), a hint for the client-config generator
@@ -232,6 +241,17 @@ func WithClockSkew(src ClockSkewSource) Option {
 	return func(s *Server) { s.skew = src }
 }
 
+// WithOAuthLogin wires the optional interactive OAuth login used by the admin-UI
+// "sign in with ChatGPT" account import. When unset, POST/GET
+// /admin/api/accounts/login/* return 503.
+func WithOAuthLogin(l OAuthLogin) Option {
+	return func(s *Server) {
+		if l != nil {
+			s.oauthLogin = l
+		}
+	}
+}
+
 // WithLogger injects the structured logger (default slog.Default()). It is used
 // only for best-effort diagnostics such as a failed audit-log write; it never
 // carries request bodies or secrets.
@@ -315,6 +335,8 @@ func (s *Server) routes(mux *http.ServeMux) {
 
 	// ---- resources (guarded) ----
 	mux.HandleFunc("POST /admin/api/accounts/import", s.guard(s.handleAccountImport))
+	mux.HandleFunc("POST /admin/api/accounts/login/begin", s.guard(s.handleAccountLoginBegin))
+	mux.HandleFunc("GET /admin/api/accounts/login/status", s.guard(s.handleAccountLoginStatus))
 	mux.HandleFunc("GET /admin/api/accounts", s.guard(s.handleAccountsList))
 	mux.HandleFunc("GET /admin/api/accounts/{id}", s.guard(s.handleAccountGet))
 	mux.HandleFunc("PATCH /admin/api/accounts/{id}", s.guard(s.handleAccountPatch))
