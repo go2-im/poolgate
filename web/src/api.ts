@@ -236,6 +236,17 @@ export const beginOAuthLogin = (label: string) =>
   mutate<OAuthLoginBegin>('POST', '/admin/api/accounts/login/begin', { label })
 export const oauthLoginStatus = (id: string) =>
   get<OAuthLoginStatus>('/admin/api/accounts/login/status?id=' + encodeURIComponent(id))
+
+// Headless (paste) flow for a browser that is NOT on the poolgate host: begin
+// returns an authorize URL to open; after signing in the operator pastes the
+// redirect URL (which the loopback listener never received) back to complete.
+export const beginOAuthLoginManual = (label: string) =>
+  mutate<OAuthLoginBegin>('POST', '/admin/api/accounts/login/manual/begin', { label })
+export const completeOAuthLoginManual = (loginId: string, redirected: string) =>
+  mutate<Account>('POST', '/admin/api/accounts/login/manual/complete', {
+    login_id: loginId,
+    redirected,
+  })
 export const patchAccount = (id: string, patch: { label?: string; concurrency_cap?: number }) =>
   mutate<Account>('PATCH', `/admin/api/accounts/${encodeURIComponent(id)}`, patch)
 export const deleteAccount = (id: string) =>

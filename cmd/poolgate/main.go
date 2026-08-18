@@ -932,8 +932,9 @@ func buildAdminHandler(cfg model.Config, st *store.Store, logger *slog.Logger, n
 	opts := []admin.Option{admin.WithNotifier(notifier), admin.WithMonitor(mon), admin.WithLogger(logger)}
 	// Interactive "sign in with ChatGPT" account import from the admin UI. Uses the
 	// same pinned OAuth flow as the `poolgate login` CLI; the loopback callback
-	// (127.0.0.1:1455/1457) requires the operator's browser to be on this host.
-	opts = append(opts, admin.WithOAuthLogin(oauth.NewLogin()))
+	// (127.0.0.1:1455/1457) requires the operator's browser to be on this host for
+	// the co-located flow, or the headless paste flow for a remote browser.
+	opts = append(opts, admin.WithOAuthLogin(oauthLoginAdapter{oauth.NewLogin()}))
 	if skew != nil {
 		opts = append(opts, admin.WithClockSkew(skew))
 	}
@@ -954,6 +955,27 @@ func buildAdminHandler(cfg model.Config, st *store.Store, logger *slog.Logger, n
 	logger.Info("admin API configured",
 		slog.String("origin", srv.Origin()), slog.String("rp_id", wa.RPID()))
 	return srv.Handler(), nil
+}
+
+// oauthLoginAdapter adapts *oauth.Login to admin.OAuthLogin: Run is promoted from
+// the embedded value, and the headless flow is exposed through an opaque handle
+// so the admin package need not import internal/oauth.
+type oauthLoginAdapter struct{ *oauth.Login }
+
+func (a oauthLoginAdapter) BeginManual() (string, any, error) {
+	m, err := a.Login.BeginManual()
+	if err != nil {
+		return "", nil, err
+	}
+	return m.AuthorizeURL(), m, nil
+}
+
+func (a oauthLoginAdapter) CompleteManual(ctx context.Context, handle any, redirected string) (model.Account, error) {
+	m, ok := handle.(*oauth.ManualLogin)
+	if !ok {
+		return model.Account{}, errors.New("invalid manual-login handle")
+	}
+	return a.Login.CompleteManual(ctx, m, redirected)
 }
 
 // serveBoth runs the proxy and admin listeners concurrently and blocks until ctx

@@ -172,17 +172,123 @@ func (l *Login) Run(ctx context.Context, prompt func(authorizeURL string)) (mode
 	if err != nil {
 		return model.Account{}, err
 	}
+	return l.accountFromToken(tok), nil
+}
 
-	acct := model.Account{
+// accountFromToken builds the pooled account carrying the freshly issued tokens.
+// State starts Unknown so the health engine converges it on the first probe.
+// Shared by the loopback (Run) and headless (CompleteManual) flows.
+func (l *Login) accountFromToken(tok tokenResponse) model.Account {
+	now := l.now().UTC()
+	return model.Account{
 		AccessToken:  tok.AccessToken,
 		RefreshToken: tok.RefreshToken,
 		IDToken:      tok.IDToken,
 		AccountID:    accountIDFromIDToken(tok.IDToken),
 		State:        model.StateUnknown,
+		CreatedAt:    now,
+		UpdatedAt:    now,
 	}
-	now := l.now().UTC()
-	acct.CreatedAt, acct.UpdatedAt = now, now
-	return acct, nil
+}
+
+// ManualLogin is a headless (no-listener) login in progress. It holds the PKCE
+// verifier, the single-use state, and the redirect_uri used to build the
+// authorize URL so CompleteManual can validate the returned state and exchange
+// the code. Treat it as opaque: obtain it from BeginManual and hand it back to
+// CompleteManual.
+type ManualLogin struct {
+	verifier     string
+	state        string
+	redirectURI  string
+	authorizeURL string
+}
+
+// AuthorizeURL is the URL the operator opens in a browser to sign in.
+func (m *ManualLogin) AuthorizeURL() string { return m.authorizeURL }
+
+// BeginManual starts a headless login: it builds the PKCE material + authorize
+// URL against the first registered loopback redirect_uri (127.0.0.1:1455) WITHOUT
+// binding a listener. Because nothing answers the loopback redirect on the
+// operator's machine, they copy the resulting redirect URL (which carries
+// ?code=&state=) back to CompleteManual — the "headless handoff" that works when
+// the browser is NOT on the poolgate host (DESIGN §23.6). No port is bound, so
+// multiple manual logins may be outstanding.
+func (l *Login) BeginManual() (*ManualLogin, error) {
+	verifier, err := l.randomURLSafe(64)
+	if err != nil {
+		return nil, fmt.Errorf("oauth: generate PKCE verifier: %w", err)
+	}
+	state, err := l.randomURLSafe(32)
+	if err != nil {
+		return nil, fmt.Errorf("oauth: generate state: %w", err)
+	}
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+	redirectURI := fmt.Sprintf("http://localhost:%d/auth/callback", l.ports[0])
+	return &ManualLogin{
+		verifier:     verifier,
+		state:        state,
+		redirectURI:  redirectURI,
+		authorizeURL: l.authorizeURL(redirectURI, challenge, state),
+	}, nil
+}
+
+// CompleteManual validates the operator-pasted redirect (the full URL the browser
+// was sent to, carrying code+state) against the pending login and exchanges the
+// authorization code for tokens. The state MUST match (single-use CSRF guard); an
+// OAuth error in the redirect, a state mismatch, or a missing code is rejected
+// without an exchange.
+func (l *Login) CompleteManual(ctx context.Context, m *ManualLogin, redirected string) (model.Account, error) {
+	if m == nil {
+		return model.Account{}, errors.New("oauth: nil manual login")
+	}
+	code, err := extractCallbackCode(redirected, m.state)
+	if err != nil {
+		return model.Account{}, err
+	}
+	tok, err := l.exchange(ctx, code, m.redirectURI, m.verifier)
+	if err != nil {
+		return model.Account{}, err
+	}
+	return l.accountFromToken(tok), nil
+}
+
+// extractCallbackCode parses the operator-pasted OAuth redirect and returns the
+// authorization code after checking its state against wantState. It accepts the
+// full redirect URL, a bare query string, or "?code=…&state=…", and requires a
+// matching state — a bare code with no state is rejected so the CSRF guard is
+// never silently skipped.
+func extractCallbackCode(pasted, wantState string) (string, error) {
+	pasted = strings.TrimSpace(pasted)
+	if pasted == "" {
+		return "", errors.New("oauth: empty callback")
+	}
+	var rawQuery string
+	if u, err := url.Parse(pasted); err == nil && u.RawQuery != "" {
+		rawQuery = u.RawQuery
+	} else if i := strings.IndexByte(pasted, '?'); i >= 0 {
+		rawQuery = pasted[i+1:]
+	} else {
+		rawQuery = pasted
+	}
+	if i := strings.IndexByte(rawQuery, '#'); i >= 0 {
+		rawQuery = rawQuery[:i]
+	}
+	values, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return "", fmt.Errorf("oauth: parse callback: %w", err)
+	}
+	if e := values.Get("error"); e != "" {
+		return "", fmt.Errorf("oauth: authorization denied: %s", e)
+	}
+	if values.Get("state") != wantState {
+		return "", errors.New("oauth: state mismatch")
+	}
+	code := values.Get("code")
+	if code == "" {
+		return "", errors.New("oauth: callback missing authorization code")
+	}
+	return code, nil
 }
 
 // listen binds the first available loopback port from l.ports.
