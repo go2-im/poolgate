@@ -8,6 +8,9 @@ coverage.*
 
 # ---- data & secrets (never commit) ----
 /data/
+# Default DataDir (config.DefaultDataDir); a local run in the repo root creates
+# ./poolgate-data holding the SQLite DB, master.key (keyfile mode) & rotation journals.
+/poolgate-data/
 *.db
 *.db-wal
 *.db-shm
