@@ -31,6 +31,11 @@ type softwareAuthenticator struct {
 	credID  []byte
 	priv    *ecdsa.PrivateKey
 	signCnt uint32
+	// backupEligible drives the BE/BS authenticator-data flags. Real synced
+	// passkeys (iCloud Keychain, password managers) set these; go-webauthn's login
+	// validation rejects an assertion whose BE flag disagrees with the stored
+	// credential, so this exercises the flags-persistence path.
+	backupEligible bool
 }
 
 func newSoftwareAuthenticator(t *testing.T, rpID, origin string) *softwareAuthenticator {
@@ -73,6 +78,9 @@ func (a *softwareAuthenticator) authData(t *testing.T, attested bool) []byte {
 	var buf bytes.Buffer
 	buf.Write(rpIDHash[:])
 	flags := byte(0x01 | 0x04) // UP | UV
+	if a.backupEligible {
+		flags |= 0x08 | 0x10 // BE | BS (a synced/backed-up passkey)
+	}
 	if attested {
 		flags |= 0x40 // AT
 	}
@@ -265,6 +273,46 @@ func TestRegisterFirstPasskeyAndLogin(t *testing.T) {
 	// Sign count bumped 0 -> 1 and persisted against the stored row id.
 	if got := st.updates[stored.ID]; got != 1 {
 		t.Errorf("persisted sign count = %d, want 1", got)
+	}
+}
+
+// TestRegisterAndLoginBackupEligiblePasskey is the regression guard for the
+// synced-passkey login failure: an iCloud Keychain / password-manager passkey
+// asserts BackupEligible=1, and go-webauthn's login validation rejects the
+// assertion unless the STORED credential carries the same BE flag. Before flags
+// were persisted, credentialFromModel rebuilt BE=0 and every such login failed
+// with "Backup Eligible flag inconsistency". This drives a full BE=1
+// register->login round-trip and asserts the flags survive the model round-trip.
+func TestRegisterAndLoginBackupEligiblePasskey(t *testing.T) {
+	ctx := context.Background()
+	st := &fakeStore{}
+	az := &fakeAuthorizer{}
+	svc := newCeremonyService(t, st, az)
+	auth := newAuthenticatorFor(t, svc)
+	auth.backupEligible = true // synced passkey
+
+	creation, chID, err := svc.BeginRegistration(ctx, RegisterGate{BootstrapToken: "pgbt_x", Label: "icloud"})
+	if err != nil {
+		t.Fatalf("BeginRegistration: %v", err)
+	}
+	stored, _, err := svc.FinishRegistration(ctx, RegisterGate{BootstrapToken: "pgbt_x", Label: "icloud"},
+		chID, auth.register(t, creation.Response.Challenge.String()))
+	if err != nil {
+		t.Fatalf("FinishRegistration: %v", err)
+	}
+	// The BE (0x08) and BS (0x10) flag bits must be persisted.
+	if stored.Flags&0x08 == 0 || stored.Flags&0x10 == 0 {
+		t.Fatalf("stored Flags = %#x, want BE|BS bits set", stored.Flags)
+	}
+
+	assertion, loginID, err := svc.BeginLogin(ctx)
+	if err != nil {
+		t.Fatalf("BeginLogin: %v", err)
+	}
+	// This FinishLogin fails with a BE-flag inconsistency if flags are not
+	// persisted+restored across the model round-trip.
+	if _, err := svc.FinishLogin(ctx, loginID, auth.login(t, assertion.Response.Challenge.String())); err != nil {
+		t.Fatalf("FinishLogin (synced passkey): %v", err)
 	}
 }
 

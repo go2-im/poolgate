@@ -275,8 +275,12 @@ func (u *operatorUser) WebAuthnCredentials() []webauthn.Credential { return u.cr
 // ---- credential (de)serialization -----------------------------------------
 
 // credentialToModel maps a go-webauthn credential to the persisted model,
-// carrying only the columns Stage 1 defined (cred_id, public_key, sign_count,
-// aaguid, transports). Flags/attestation are not persisted in v1.
+// carrying the columns Stage 1 defined (cred_id, public_key, sign_count, aaguid,
+// transports) plus the authenticator-data flags byte (UP/UV/BE/BS). Flags MUST be
+// persisted: go-webauthn's login validation rejects an assertion whose
+// Backup-Eligible flag disagrees with the stored credential, so a synced passkey
+// (BE=1) would fail every login if the stored flags defaulted to 0. Attestation
+// is not persisted in v1.
 func credentialToModel(c webauthn.Credential) model.WebAuthnCredential {
 	transports := make([]string, 0, len(c.Transport))
 	for _, t := range c.Transport {
@@ -288,11 +292,15 @@ func credentialToModel(c webauthn.Credential) model.WebAuthnCredential {
 		SignCount:  c.Authenticator.SignCount,
 		AAGUID:     append([]byte(nil), c.Authenticator.AAGUID...),
 		Transports: transports,
+		Flags:      byte(c.Flags.ProtocolValue()),
 	}
 }
 
 // credentialFromModel reconstructs a go-webauthn credential from a stored row.
-// It is the inverse of credentialToModel for the persisted columns.
+// It is the inverse of credentialToModel for the persisted columns. The flags
+// byte is restored via NewCredentialFlags so the login-time Backup-Eligible
+// consistency check sees the same BE/BS the authenticator advertised at
+// registration.
 func credentialFromModel(m model.WebAuthnCredential) webauthn.Credential {
 	transports := make([]protocol.AuthenticatorTransport, 0, len(m.Transports))
 	for _, t := range m.Transports {
@@ -302,6 +310,7 @@ func credentialFromModel(m model.WebAuthnCredential) webauthn.Credential {
 		ID:        append([]byte(nil), m.CredID...),
 		PublicKey: append([]byte(nil), m.PublicKey...),
 		Transport: transports,
+		Flags:     webauthn.NewCredentialFlags(protocol.AuthenticatorFlags(m.Flags)),
 		Authenticator: webauthn.Authenticator{
 			AAGUID:    append([]byte(nil), m.AAGUID...),
 			SignCount: m.SignCount,

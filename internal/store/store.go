@@ -441,6 +441,21 @@ ALTER TABLE accounts ADD COLUMN last_refreshed_at TEXT NOT NULL DEFAULT '';
 UPDATE accounts SET last_refreshed_at = updated_at WHERE updated_at <> '';
 `,
 	},
+	{
+		// v16 — persist the WebAuthn authenticator-data flags byte (UP/UV/BE/BS)
+		// recorded at registration. go-webauthn's login validation rejects an
+		// assertion whose Backup-Eligible flag disagrees with the stored credential;
+		// a synced passkey (iCloud Keychain, password managers) asserts BE=1, so the
+		// previous absent-flags default of 0 broke EVERY login for such passkeys.
+		// Existing rows default to 0: their true BE is unknowable retroactively, so a
+		// passkey registered before this migration must be re-registered to log in
+		// (delete + re-add, or `poolgate admin reset-auth`). Append-only: v1–v15
+		// above are never edited.
+		version: 16,
+		sql: `
+ALTER TABLE webauthn_credentials ADD COLUMN flags INTEGER NOT NULL DEFAULT 0;
+`,
+	},
 }
 
 // Migrate applies any migrations whose version is not yet recorded. It is

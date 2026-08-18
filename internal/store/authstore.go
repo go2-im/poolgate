@@ -56,9 +56,9 @@ func insertWebAuthnCredentialExec(ctx context.Context, ex sqlExecer, c model.Web
 	}
 	if _, err := ex.ExecContext(ctx, `
 INSERT INTO webauthn_credentials
-	(id, cred_id, public_key, sign_count, aaguid, transports, label, created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		c.ID, c.CredID, c.PublicKey, c.SignCount, c.AAGUID, string(transports), c.Label, formatTime(c.CreatedAt),
+	(id, cred_id, public_key, sign_count, aaguid, transports, flags, label, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		c.ID, c.CredID, c.PublicKey, c.SignCount, c.AAGUID, string(transports), c.Flags, c.Label, formatTime(c.CreatedAt),
 	); err != nil {
 		return model.WebAuthnCredential{}, fmt.Errorf("store: insert webauthn credential: %w", err)
 	}
@@ -165,7 +165,7 @@ func (s *Store) ConsumeBootstrapAndInsertCredential(ctx context.Context, tokenHa
 // time then id.
 func (s *Store) ListWebAuthnCredentials(ctx context.Context) ([]model.WebAuthnCredential, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, cred_id, public_key, sign_count, aaguid, transports, label, created_at
+SELECT id, cred_id, public_key, sign_count, aaguid, transports, flags, label, created_at
 FROM webauthn_credentials ORDER BY created_at, id`)
 	if err != nil {
 		return nil, fmt.Errorf("store: list webauthn credentials: %w", err)
@@ -187,7 +187,7 @@ FROM webauthn_credentials ORDER BY created_at, id`)
 // credential id (the value the authenticator returns during assertion).
 func (s *Store) GetWebAuthnCredentialByCredID(ctx context.Context, credID []byte) (model.WebAuthnCredential, error) {
 	row := s.db.QueryRowContext(ctx, `
-SELECT id, cred_id, public_key, sign_count, aaguid, transports, label, created_at
+SELECT id, cred_id, public_key, sign_count, aaguid, transports, flags, label, created_at
 FROM webauthn_credentials WHERE cred_id = ?`, credID)
 	return scanWebAuthnCredential(row)
 }
@@ -231,7 +231,7 @@ func scanWebAuthnCredential(sc rowScanner) (model.WebAuthnCredential, error) {
 		createdAt  string
 	)
 	if err := sc.Scan(&c.ID, &c.CredID, &c.PublicKey, &c.SignCount, &c.AAGUID,
-		&transports, &c.Label, &createdAt); err != nil {
+		&transports, &c.Flags, &c.Label, &createdAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return model.WebAuthnCredential{}, ErrNotFound
 		}
