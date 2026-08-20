@@ -38,64 +38,122 @@ export function Dashboard() {
   }, [])
 
   const usageByID = new Map(usage.map((u) => [u.account_id, u]))
+  const healthyCount = health.filter((account) => account.state === 'ok').length
+  const degradedCount = health.length - healthyCount
+  const knownHeadroom = health
+    .map((account) => usageByID.get(account.account_id))
+    .filter((accountUsage): accountUsage is AccountUsage => accountUsage !== undefined)
+    .map(minHeadroom)
+  const poolHeadroom = knownHeadroom.length > 0 ? Math.min(...knownHeadroom) : null
+  const bannerState =
+    status === null ? 'loading' : health.length === 0 ? 'empty' : degradedCount === 0 ? 'ready' : 'warn'
+  const bannerClass = bannerState === 'warn' ? 'health-banner warn' : bannerState === 'ready' ? 'health-banner' : 'health-banner neutral'
 
   return (
     <>
-      {err && <p className="err">{err}</p>}
+      {err && <p className="err notice">{err}</p>}
 
-      <div className="grid">
+      <div className={bannerClass}>
+        <span className="health-beacon" />
+        <strong>
+          {bannerState === 'loading'
+            ? 'Loading pool status…'
+            : bannerState === 'empty'
+              ? 'Add an account to start routing'
+              : bannerState === 'ready'
+                ? 'Pool is ready for traffic'
+                : 'Pool is operating with reduced capacity'}
+        </strong>
+        <span>
+          {bannerState === 'loading'
+            ? 'Checking account health and routing readiness.'
+            : health.length === 0
+            ? 'Account health will appear after the first account is imported.'
+            : `${healthyCount} of ${health.length} accounts are currently eligible for routing.`}
+        </span>
+      </div>
+
+      <div className="grid metric-grid">
         <div className="tile">
-          <div className="n">{status?.accounts ?? '—'}</div>
           <div className="k">Accounts</div>
+          <div className="n">{status?.accounts ?? '—'}</div>
+          <div className="tile-meta">{healthyCount} healthy</div>
         </div>
         <div className="tile">
-          <div className="n">{status?.endpoints ?? '—'}</div>
           <div className="k">Endpoints</div>
+          <div className="n">{status?.endpoints ?? '—'}</div>
+          <div className="tile-meta">Client-facing routes</div>
         </div>
         <div className="tile">
+          <div className="k">Routing policies</div>
           <div className="n">{status?.policy_groups ?? '—'}</div>
-          <div className="k">Policy groups</div>
+          <div className="tile-meta">Reusable account groups</div>
         </div>
         <div className="tile">
-          <div className="n">{status?.schema_version ?? '—'}</div>
-          <div className="k">Schema version</div>
+          <div className="k">Pool headroom</div>
+          <div className="n">{poolHeadroom === null ? '—' : `${poolHeadroom.toFixed(0)}%`}</div>
+          <div className="tile-meta">Lowest known window</div>
         </div>
       </div>
 
-      <div className="section">
-        <h2>Accounts</h2>
-        <p className="muted">Per-account state and remaining quota headroom.</p>
+      <div className="section dashboard-accounts">
+        <div className="section-heading">
+          <div>
+            <h2>Account health</h2>
+            <p className="muted">State, plan, and remaining quota headroom for every pooled account.</p>
+          </div>
+          <span className="schema-badge">schema {status?.schema_version ?? '—'}</span>
+        </div>
         {health.length === 0 ? (
-          <p className="muted">
-            No accounts imported yet — run <code>poolgate import &lt;auth.json&gt;</code> or use the
-            Accounts tab.
-          </p>
+          <div className="empty-state">
+            <strong>No accounts imported yet</strong>
+            <span>
+              Run <code>poolgate import &lt;auth.json&gt;</code> or add one from the Accounts page.
+            </span>
+          </div>
         ) : (
-          <table>
-            <thead>
-              <tr>
-                <th>Account</th>
-                <th>State</th>
-                <th>Plan</th>
-                <th>Min headroom</th>
-              </tr>
-            </thead>
-            <tbody>
-              {health.map((h) => {
-                const u = usageByID.get(h.account_id)
-                return (
-                  <tr key={h.account_id}>
-                    <td>{h.account_id}</td>
-                    <td>
-                      <span className={stateClass(h.state)}>{h.state}</span>
-                    </td>
-                    <td>{u?.plan_type || '—'}</td>
-                    <td>{u ? `${minHeadroom(u).toFixed(0)}%` : '—'}</td>
-                  </tr>
-                )
-              })}
-            </tbody>
-          </table>
+          <div className="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>Account</th>
+                  <th>State</th>
+                  <th>Plan</th>
+                  <th>Min headroom</th>
+                </tr>
+              </thead>
+              <tbody>
+                {health.map((account) => {
+                  const accountUsage = usageByID.get(account.account_id)
+                  const headroom = accountUsage ? minHeadroom(accountUsage) : null
+                  return (
+                    <tr key={account.account_id}>
+                      <td>
+                        <span className="account-name">
+                          <span className="account-avatar">{account.account_id.slice(0, 2).toUpperCase()}</span>
+                          <span className="mono">{account.account_id}</span>
+                        </span>
+                      </td>
+                      <td>
+                        <span className={stateClass(account.state)}>{account.state}</span>
+                      </td>
+                      <td>{accountUsage?.plan_type || '—'}</td>
+                      <td>
+                        {headroom === null ? (
+                          '—'
+                        ) : (
+                          <span className="headroom-cell">
+                            <progress max="100" value={headroom} />
+                            <span>{headroom.toFixed(0)}%</span>
+                          </span>
+                        )}
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
         )}
       </div>
     </>

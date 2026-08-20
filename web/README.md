@@ -36,6 +36,6 @@ Then rebuild the Go binary so it embeds the new bundle.
   scripts/styles). The build is configured accordingly: only external, same-origin
   JS/CSS, and the Vite module-preload polyfill (which injects an inline script) is
   disabled. Components must not use inline `style={{}}` props — use CSS classes.
-- **Single UI language + dark mode only** in v1 (i18n / a11y / mobile deferred).
+- **Single UI language + light mode only** in v1 (i18n / a11y / mobile deferred).
 - The lockfile and `.npmrc` are intentionally not committed; dependency versions
   are pinned in `package.json`.
