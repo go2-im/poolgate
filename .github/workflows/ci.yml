@@ -22,9 +22,10 @@ jobs:
       # actions/setup-go@v5
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
-          # 'stable' installs the latest patched toolchain (>= go.mod's 1.25.0),
-          # so govulncheck doesn't flag already-fixed stdlib CVEs.
-          go-version: 'stable'
+          # Keep the compiler and analysis tools on the exact patched toolchain
+          # required by go.mod. Using 'stable' can move CI to a newer Go export
+          # data format before staticcheck supports it.
+          go-version: '1.25.13'
           cache: true
 
       - name: build
@@ -73,7 +74,7 @@ jobs:
 
       - name: govulncheck
         # Blocking: stdlib CVEs are addressed by the pinned `toolchain` directive
-        # in go.mod (>= go1.25.13) plus setup-go 'stable', so a clean run is
+        # in go.mod (>= go1.25.13) plus setup-go's exact version, so a clean run is
         # expected. If Go discloses a new CVE, bump the toolchain directive.
         run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
